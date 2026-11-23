@@ -298,6 +298,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               textureTransforms: true, alphaMaps: true,
               // ShaderMaterial programs (WebGLRenderer semantics) on the WebGL surface.
               program: owner._shaderEncodedOutput && (destination !== owner || !owner._hdr) ? destination._programSupport ??= createThreeProgramSupport({three: THREE, pmrem: createThreeProgramPMREM, shadows: createThreeProgramShadows, transmission: createThreeProgramTransmission,
+                instanceMorphTexture: texture => owner._registerInstanceMorphTexture(texture),
                 state: () => ({toneMapping: owner.toneMapping, toneMappingExposure: owner.toneMappingExposure, outputColorSpace: owner.outputColorSpace,
                   canvasOutput: destination === owner,
                   pixelRatio: owner._pixelRatio, height: owner._height, shadowMap: owner.shadowMap, shadowMapType: owner.shadowMap.type, renderer: owner,
@@ -895,10 +896,24 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (target) return this._targets.capture(target).shape.format;
       return this._wantsHdr(this._toneMapping()) ? this._outputBufferFormat() : this._preferredFormat ?? 'bgra8unorm';
     }
-    _capturePMREMTexture(texture, pendingSources = null) {
-      if (texture?.onUpdate !== null) fail('UNSUPPORTED', 'PMREM input upload callbacks require their explicit source texture owner');
+    _registerInstanceMorphTexture(texture) {
+      // Private accepted views already have a detached lease. Live instance
+      // weights use this same owner from their first ordinary draw so a later
+      // queued pass observes the source's existing upload history.
+      if (PMREM_INPUTS.get(this)?.has(texture)) return texture;
+      // Existing live inputs keep their ordinary owner and admission boundary.
+      // Required snapshots separately refuse those histories.
+      if (Object.getOwnPropertyDescriptor(texture, 'onUpdate')?.value !== null ||
+          hasThreeWebGLTextureResidency(this._device, texture)) return texture;
+      let sources = PMREM_SOURCES.get(this);
+      if (!sources) PMREM_SOURCES.set(this, sources = new WeakSet());
+      sources.add(texture.source);
+      return texture;
+    }
+    _capturePMREMTexture(texture, pendingSources = null, purpose = 'PMREM') {
+      if (texture?.onUpdate !== null) fail('UNSUPPORTED', `${purpose} input upload callbacks require their explicit source texture owner`);
       if (hasThreeWebGLTextureResidency(this._device, texture))
-        fail('UNSUPPORTED', 'PMREM input is already resident in a separate scene texture owner');
+        fail('UNSUPPORTED', `${purpose} input is already resident in a separate scene texture owner`);
       const owner = this._getSampledTextureInputs();
       const lease = owner.captureDetachedBinding(texture, {webglVersioning: true});
       if (pendingSources) pendingSources.add(texture.source);
@@ -1484,7 +1499,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           cameraSource ??= camera;
           camera = captureThreeCamera(THREE, camera);
           materialFrame.instanceFrame = this._passInstances.capture(scene, camera, materialFrame, {
-            maxValues: MAX_MATERIAL_CAPTURE_VALUES - this._materialCaptureValues, sortObjects: this.sortObjects, required: passCameraRequired});
+            maxValues: MAX_MATERIAL_CAPTURE_VALUES - this._materialCaptureValues, sortObjects: this.sortObjects, required: passCameraRequired,
+            captureTexture: texture => this._capturePMREMTexture(texture, null, 'Instance morph')});
           if (materialFrame.instanceFrame) {
             materialFrame.values += materialFrame.instanceFrame.values;
             this._materialCaptureValues += materialFrame.instanceFrame.values;
@@ -1639,17 +1655,24 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       lifecycle.scene.onAfterRender(this, lifecycle.root, lifecycle.camera, lifecycle.target);
     }
     _renderFrame(scene, camera, clearOnly = null) {
-      const lifecycle = clearOnly ? null : this._sceneLifecycle(scene, camera);
-      const requests = this._makeOutputRequests(scene, camera, clearOnly, true, lifecycle);
-      if (lifecycle) lifecycle.lastRequest = requests.at(-1);
-      for (let i = 0; i < requests.length; i++) {
-        try { this._dispatchRequest(requests[i]); }
-        catch (error) {
-          for (const pending of requests.slice(i + 1)) this._releaseRequest(pending);
-          throw error;
+      const capture = () => {
+        const lifecycle = clearOnly ? null : this._sceneLifecycle(scene, camera);
+        const requests = this._makeOutputRequests(scene, camera, clearOnly, true, lifecycle);
+        if (lifecycle) lifecycle.lastRequest = requests.at(-1);
+        for (let i = 0; i < requests.length; i++) {
+          try { this._dispatchRequest(requests[i]); }
+          catch (error) {
+            for (const pending of requests.slice(i + 1)) this._releaseRequest(pending);
+            throw error;
+          }
         }
-      }
-      this._finishSceneLifecycle(lifecycle);
+        this._finishSceneLifecycle(lifecycle);
+      };
+      // A rejected required pass must not seed a new influence upload version.
+      // Include FIFO admission, not just snapshot construction, in the same
+      // transaction already used by detached PMREM and sampled compute inputs.
+      return this._shaderEncodedOutput && requiresThreePassCamera(this) && this._device
+        ? this._getSampledTextureInputs().captureDispatch(capture) : capture();
     }
     _outputQuad(target, layer = 0) {
       let cache = this._outputQuads.get(target);

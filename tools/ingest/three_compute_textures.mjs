@@ -757,6 +757,10 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         const accepted = captured.record;
         if (accepted.privateDestination) fail('SOURCE', 'Detached baking of copied sampled storage requires a GPU input target');
         const privateTexture = privateDescriptor(accepted.texture), callback = texture.onUpdate;
+        // A shared Source refresh can borrow another alias's descriptor while
+        // retaining this Texture's version gate. Detached bindings must carry
+        // that accepted gate too, not the uploading sibling's version number.
+        privateTexture.version = accepted.version;
         privateTexture.source = accepted.texture.source; privateTexture.mipmaps = accepted.texture.mipmaps;
         // Freeze this accepted upload's callback without changing the ordinary
         // descriptor used by later versions. Both descriptors share one pool.

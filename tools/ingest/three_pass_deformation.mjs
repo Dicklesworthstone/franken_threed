@@ -39,10 +39,37 @@ function ordinaryAttribute(T, attribute, widths, vertexCount) {
     count * stride <= array.length && ordinaryComponents(T, attribute);
 }
 
+// setMorphAt stores one base influence followed by the target weights in each
+// row. The shared sampled owner retains its versioned bytes; this guard only
+// admits ordinary source descriptors and never calls texture/application code.
+export function isOrdinaryPassMorphTexture(T, texture) {
+  const source = data(texture, 'source'), image = data(source, 'data');
+  return Object.getPrototypeOf(texture ?? {}) === T.DataTexture.prototype && dataOnly(texture) && dataOnly(source) && dataOnly(image) &&
+    data(texture, 'onUpdate') === null && data(texture, 'addEventListener') === T.EventDispatcher.prototype.addEventListener &&
+    data(texture, 'removeEventListener') === T.EventDispatcher.prototype.removeEventListener &&
+    data(texture, 'clearUpdateRanges') === T.Texture.prototype.clearUpdateRanges && ordinaryArray(data(texture, 'updateRanges'), 1048576);
+}
+function ordinaryInstanceMorph(T, object, morphCount) {
+  const texture = data(object, 'morphTexture'), source = data(texture, 'source'), image = data(source, 'data');
+  if (!isOrdinaryPassMorphTexture(T, texture)) return false;
+  const pixels = data(image, 'data'), width = data(image, 'width'), height = data(image, 'height');
+  return morphCount > 0 && width === morphCount + 1 && Number.isSafeInteger(height) && height > 0 && height >= data(object, 'count') &&
+    fixedArray(pixels) && Object.getPrototypeOf(pixels) === Float32Array.prototype && pixels.length === width * height &&
+    data(texture, 'format') === T.RedFormat && data(texture, 'type') === T.FloatType && data(texture, 'internalFormat') === null &&
+    data(texture, 'minFilter') === T.NearestFilter && data(texture, 'magFilter') === T.NearestFilter &&
+    data(texture, 'wrapS') === T.ClampToEdgeWrapping && data(texture, 'wrapT') === T.ClampToEdgeWrapping && data(texture, 'anisotropy') === 1 &&
+    ordinaryArray(data(texture, 'updateRanges'), 0) &&
+    ordinaryArray(data(texture, 'mipmaps'), 0) && !data(texture, 'generateMipmaps') && !data(texture, 'flipY') &&
+    !data(texture, 'premultiplyAlpha') && data(texture, 'unpackAlignment') === 1 && data(texture, 'colorSpace') === T.NoColorSpace &&
+    data(source, 'dataReady') === true && Number.isSafeInteger(data(source, 'version')) && data(source, 'version') >= 0 &&
+    Number.isSafeInteger(data(texture, 'version')) && data(texture, 'version') >= 0;
+}
+
 /** Descriptor-only admission: do not run an application getter, component
  * reader or Skeleton.update merely to decide whether capture is possible. */
 export function isOrdinaryPassDeformation(T, object, {maxValues = 1048576} = {}) {
   const geometry = data(object, 'geometry'), skinned = data(object, 'isSkinnedMesh') === true;
+  const instanced = data(object, 'isInstancedMesh') === true;
   if (geometry === undefined) return !skinned;
   const attributes = data(geometry, 'attributes'), morphs = data(geometry, 'morphAttributes');
   if (!dataOnly(attributes) || !dataOnly(morphs)) return false;
@@ -50,11 +77,11 @@ export function isOrdinaryPassDeformation(T, object, {maxValues = 1048576} = {})
   const vertexCount = data(positionOwner, 'count');
   const morphList = data(morphs, 'position') ?? data(morphs, 'normal') ?? data(morphs, 'color');
   const morphCount = morphList === undefined ? 0 : data(morphList, 'length');
+  if (instanced && (morphCount || data(object, 'morphTexture') !== null) && !ordinaryInstanceMorph(T, object, morphCount)) return false;
   if (morphCount) {
     const influences = data(object, 'morphTargetInfluences');
-    if (data(object, 'isInstancedMesh') || !Number.isSafeInteger(vertexCount) || vertexCount < 1 ||
-        !ordinaryArray(morphList, maxValues) || !ordinaryArray(influences, maxValues) || influences.length !== morphCount ||
-        influences.some(value => typeof value !== 'number') ||
+    if (!Number.isSafeInteger(vertexCount) || vertexCount < 1 || !ordinaryArray(morphList, maxValues) ||
+        !instanced && (!ordinaryArray(influences, maxValues) || influences.length !== morphCount || influences.some(value => typeof value !== 'number')) ||
         Object.keys(morphs).some(name => !['position', 'normal', 'color'].includes(name))) return false;
     // Match the PMREM capture's ordinary source position-target contract.
     if (!ordinaryArray(data(morphs, 'position'), maxValues) || data(morphs, 'position').length !== morphCount) return false;

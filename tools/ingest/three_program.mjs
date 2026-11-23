@@ -326,7 +326,8 @@ function write(view, node, value, name, base = 0) {
  * owns one WebGLLights state (setLights/setLightsView per frame, as
  * WebGLRenderer.render does) and per-material ShaderLib uniform clones.
  * Compiled programs are cached by their exact assembled source text (bounded). */
-export function createThreeProgramSupport({three: T, state, maxPrograms = 256, maxPointSize = 1024, pmrem = null, shadows = null, transmission = null}) {
+export function createThreeProgramSupport({three: T, state, maxPrograms = 256, maxPointSize = 1024, pmrem = null, shadows = null, transmission = null,
+  instanceMorphTexture = texture => texture}) {
   const compiled = new Map(), lights = webglLights(T, {floatLinear: () => state().floatLinear === true});
   let clones = new WeakMap();
   const uniformBlocks = createUniformBlocks();
@@ -441,7 +442,7 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     if (object?.isBatchedMesh) out = {...out, batchingTexture: object._matricesTexture, batchingIdTexture: object._indirectTexture,
       ...(object._colorsTexture !== null ? {batchingColorTexture: object._colorsTexture} : {})};
     // WebGLMorphtargets.update: an InstancedMesh's per-instance influence texture.
-    if (object?.isInstancedMesh && object.morphTexture) out = {...out, morphTexture: object.morphTexture};
+    if (object?.isInstancedMesh && object.morphTexture) out = {...out, morphTexture: instanceMorphTexture(object.morphTexture)};
     return out;
   }
   /** setProgram's refreshMaterial work: lights, fog and material values. */

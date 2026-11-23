@@ -31,7 +31,7 @@ const SSAARenderPass = await pinnedPass('SSAARenderPass');
 const TAARenderPass = await pinnedPass('TAARenderPass');
 const OutlinePass = await pinnedPass('OutlinePass');
 
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const device = geometryDevice(); device.features = new Set(['float32-filterable']);
   Object.assign(device.limits, {maxTextureDimension2D: 8192, maxTextureDimension3D: 2048,
     maxTextureArrayLayers: 256, maxBindingsPerBindGroup: 1000});
@@ -62,7 +62,7 @@ async function fixture(t) {
     configure(value) { configuration = value; }, unconfigure() {},
     getCurrentTexture: () => device.createTexture({size: [32, 32], format: configuration.format, usage: 16}),
   })};
-  const Renderer = createWebGLRendererClass(T, {maxDraws: 64, maxBindings: 64, maxPendingRenders: 128});
+  const Renderer = createWebGLRendererClass(T, {maxDraws: 64, maxBindings: 64, maxPendingRenders: 128, ...options});
   const renderer = new Renderer({canvas, device}); await renderer.init();
   const scene = new T.Scene(), camera = new T.PerspectiveCamera(50, 1, .1, 30); camera.position.z = 5;
   const read = new T.WebGLRenderTarget(32, 32, {type: T.HalfFloatType}), write = read.clone();
@@ -104,6 +104,20 @@ function animatedMesh(t, {skin = false, morph = false, relative = false} = {}) {
   return {mesh, geometry, material, root, tip, skeleton, target};
 }
 
+function animatedInstances(t, relative = false) {
+  const source = animatedMesh(t, {morph: true, relative});
+  const mesh = new T.InstancedMesh(source.geometry, source.material, 3); mesh.frustumCulled = false;
+  const weights = values => {
+    values.forEach((value, index) => {
+      source.mesh.morphTargetInfluences = Array.isArray(value) ? value : [value];
+      mesh.setMorphAt(index, source.mesh);
+    });
+  };
+  weights([.125, .5, .875]); mesh.morphTexture.needsUpdate = true;
+  t.after(() => mesh.dispose());
+  return {...source, mesh, weights};
+}
+
 const drain = renderer => renderer.waitForGPU();
 const programDraws = device => device.snapshots.flat().filter(draw =>
   /boneTexture|morphTargetInfluences/.test(draw.pipeline.vertex.module.code));
@@ -114,6 +128,7 @@ function textureFloats(draw, predicate) {
 }
 const palette = draw => textureFloats(draw, texture => texture.format === 'rgba32float' && texture.width === 4 && texture.height === 4);
 const atlas = draw => textureFloats(draw, texture => texture.format === 'rgba32float' && texture.height === 1);
+const instanceWeights = draw => textureFloats(draw, texture => texture.format === 'r32float');
 function uniformFloats(draw, reflection, name, count = 1) {
   const uniform = reflection.uniforms.find(value => value.name === name); assert.ok(uniform, `source uniform ${name}`);
   const {group, offsets} = draw.groups.get(0), resource = group.entries.find(entry => entry.binding === 0).resource;
@@ -131,9 +146,234 @@ function morphOracle() {
   return object => {
     source.update(object, object.geometry, {getUniforms: () => ({setValue(_gl, name, value) { values.set(name, value); }})});
     return {pixels: values.get('morphTargetsTexture').image.data.slice(),
-      base: values.get('morphTargetBaseInfluence'), influences: [...values.get('morphTargetInfluences')]};
+      base: values.get('morphTargetBaseInfluence'), influences: [...values.get('morphTargetInfluences') ?? []],
+      weights: values.get('morphTexture')?.image.data.slice()};
   };
 }
+
+for (const relative of [false, true]) test(`SSAA retains ${relative ? 'relative' : 'absolute'} per-instance morph uploads from ordinary draws through queued animation and disposal`, async t => {
+  const f = await fixture(t), a = animatedInstances(t, relative), reference = morphOracle(); f.scene.add(a.mesh);
+  const initial = reference(a.mesh);
+  assert.deepEqual([...initial.weights], relative ? [1, .125, 1, .5, 1, .875] : [.875, .125, .5, .5, .125, .875]);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(instanceWeights(programDraws(f.device).at(-1)), initial.weights);
+  const start = f.device.snapshots.length;
+  const pass = new SSAARenderPass(f.scene, f.camera); pass.sampleLevel = 1; t.after(() => pass.dispose());
+  a.weights([.25, .75, .5]); // setMorphAt alone does not request a source upload.
+  pass.render(f.renderer, f.write, f.read);
+  a.mesh.count = 2; a.mesh.setMatrixAt(0, new T.Matrix4().makeTranslation(.75, 0, 0));
+  a.mesh.instanceMatrix.needsUpdate = true; a.mesh.morphTexture.needsUpdate = true;
+  const changed = reference(a.mesh); pass.render(f.renderer, f.write, f.read);
+  a.weights([.875, .125, .25]); a.target.array.fill(99); a.mesh.instanceMatrix.array.fill(99); a.mesh.count = 1;
+  a.mesh.dispose(); a.geometry.dispose(); a.material.dispose(); f.scene.clear();
+  assert.equal(a.mesh.morphTexture, null);
+  await drain(f.renderer);
+  const draws = f.device.snapshots.slice(start).flat().filter(draw => draw.pipeline.vertex.module.code.includes('morphTexture'));
+  assert.equal(draws.length, 4);
+  for (const [index, draw] of draws.entries()) {
+    assert.deepEqual(instanceWeights(draw), index < 2 ? initial.weights : changed.weights);
+    assert.deepEqual(atlas(draw), initial.pixels);
+    assert.equal(draw.args[1], index < 2 ? 3 : 2);
+    const slot = draw.pipeline.vertex.buffers.findIndex(layout => layout.stepMode === 'instance' && layout.arrayStride === 64);
+    assert.ok(slot >= 0);
+    const matrix = new Float32Array(draw.contents.get(draw.streams.get(slot)).buffer);
+    assert.equal(matrix[12], index < 2 ? 0 : .75, 'each sample keeps the matrices accepted alongside its influence rows');
+  }
+  assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
+test('Outline retains per-instance morph depth beside source-supported ordinary morph masks', async t => {
+  const f = await fixture(t), a = animatedInstances(t), b = animatedMesh(t, {morph: true});
+  b.mesh.position.x = .75; b.mesh.morphTargetInfluences[0] = .25; f.scene.add(a.mesh, b.mesh);
+  const first = a.mesh.morphTexture.image.data.slice();
+  // r186's mask shader omits morphinstance_vertex, so it cannot compile for a
+  // selected instanced morph. Keep that source limitation explicit; its depth
+  // material supports the source instance shader and captured influence rows.
+  const pass = new OutlinePass(new T.Vector2(32, 32), f.scene, f.camera, [b.mesh]); t.after(() => pass.dispose());
+  const mask = f.reflection(b.mesh, pass.prepareMaskMaterial);
+  pass.render(f.renderer, f.write, f.read);
+  a.weights([.75, .25, .125]); a.mesh.morphTexture.needsUpdate = true;
+  const changed = a.mesh.morphTexture.image.data.slice(); b.mesh.morphTargetInfluences[0] = .625;
+  pass.render(f.renderer, f.write, f.read);
+  a.mesh.dispose(); a.geometry.dispose(); b.geometry.dispose(); f.scene.clear(); await drain(f.renderer);
+  const draws = programDraws(f.device); assert.equal(draws.length, 4);
+  assert.deepEqual(draws.map(draw => draw.pipeline.fragment.module.code.includes('depthTest')), [false, true, false, true]);
+  assert.deepEqual(instanceWeights(draws[0]), first); assert.deepEqual(instanceWeights(draws[2]), changed);
+  assert.deepEqual(uniformFloats(draws[1], mask, 'morphTargetInfluences'), [.25]);
+  assert.deepEqual(uniformFloats(draws[3], mask, 'morphTargetInfluences'), [.625]);
+  assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
+test('TAA retains accepted per-instance morph rows across hold and accumulation renders', async t => {
+  const f = await fixture(t), a = animatedInstances(t, true); f.scene.add(a.mesh);
+  const pass = new TAARenderPass(f.scene, f.camera); pass.sampleLevel = 0; pass.accumulate = true; t.after(() => pass.dispose());
+  const first = a.mesh.morphTexture.image.data.slice(); pass.render(f.renderer, f.write, f.read);
+  a.weights([.75, .25, .625]); a.mesh.morphTexture.needsUpdate = true;
+  const second = a.mesh.morphTexture.image.data.slice(); pass.render(f.renderer, f.write, f.read);
+  a.mesh.dispose(); a.geometry.dispose(); f.scene.clear(); await drain(f.renderer);
+  const draws = programDraws(f.device); assert.equal(draws.length, 3);
+  [first, first, second].forEach((expected, index) => assert.deepEqual(instanceWeights(draws[index]), expected));
+  assert.equal(pass.accumulateIndex, 2); assert.equal(f.renderer._passInstances.pendingBytes, 0);
+});
+
+test('instance morph weights keep one upload history across required passes, ordinary draws and target-count changes', async t => {
+  const f = await fixture(t), a = animatedInstances(t), reference = morphOracle(); f.scene.add(a.mesh); f.renderer.setRenderTarget(f.write);
+  const initial = reference(a.mesh); renderThreePassScene(f.renderer, f.scene, f.camera); await drain(f.renderer);
+  a.weights([.75, .25, .5]); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(instanceWeights(programDraws(f.device).at(-1)), initial.weights,
+    'ordinary rendering sees the version captured by the preceding pass');
+  a.mesh.morphTexture.needsUpdate = true; const next = reference(a.mesh);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(instanceWeights(programDraws(f.device).at(-1)), next.weights);
+  a.weights([.25, .875, .125]); renderThreePassScene(f.renderer, f.scene, f.camera);
+  const oldTexture = a.mesh.morphTexture;
+  for (const targets of Object.values(a.geometry.morphAttributes)) targets.push(targets[0].clone());
+  a.geometry.morphAttributes.position[1].array[0] = 7;
+  a.mesh.morphTexture = null; a.weights([[.25, .5], [.125, .75], [.5, .125]]); a.mesh.morphTexture.needsUpdate = true;
+  const expanded = reference(a.mesh); renderThreePassScene(f.renderer, f.scene, f.camera);
+  oldTexture.dispose(); a.mesh.dispose(); a.geometry.dispose(); f.scene.clear(); await drain(f.renderer);
+  const draws = programDraws(f.device);
+  assert.equal(draws.length, 5);
+  assert.deepEqual(instanceWeights(draws[3]), next.weights); assert.deepEqual(atlas(draws[3]), initial.pixels);
+  assert.deepEqual(instanceWeights(draws[4]), expanded.weights); assert.deepEqual(atlas(draws[4]), expanded.pixels);
+  assert.equal(f.renderer._passInstances.pendingBytes, 0);
+  assert.equal(f.renderer._sampledTextureInputs.diagnostics.snapshotBytes, 0, 'disposed original textures and drained snapshots release all CPU inputs');
+});
+
+test('rejected instance morph FIFO capture does not become the next source upload baseline', async t => {
+  const f = await fixture(t, {maxPendingRenders: 1}), a = animatedInstances(t); f.scene.add(a.mesh); f.renderer.setRenderTarget(f.write);
+  const first = a.mesh.morphTexture.image.data.slice(); renderThreePassScene(f.renderer, f.scene, f.camera);
+  const before = {...f.renderer._sampledTextureInputs.diagnostics};
+  a.weights([.25, .75, .5]); a.mesh.morphTexture.needsUpdate = true;
+  assert.throws(() => renderThreePassScene(f.renderer, f.scene, f.camera), {code: 'F3D_RENDERER_LIMIT'});
+  assert.deepEqual(f.renderer._sampledTextureInputs.diagnostics, before);
+  a.weights([.875, .125, .375]); const accepted = a.mesh.morphTexture.image.data.slice();
+  await drain(f.renderer); renderThreePassScene(f.renderer, f.scene, f.camera); await drain(f.renderer);
+  const draws = programDraws(f.device); assert.equal(draws.length, 2);
+  assert.deepEqual(instanceWeights(draws[0]), first); assert.deepEqual(instanceWeights(draws[1]), accepted);
+  assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
+test('one instance morph texture can be shared by multiple captured meshes', async t => {
+  const f = await fixture(t), a = animatedInstances(t), b = new T.InstancedMesh(a.geometry, a.material, 3);
+  b.frustumCulled = false; b.morphTexture = a.mesh.morphTexture; t.after(() => b.dispose());
+  f.scene.add(a.mesh, b); f.renderer.setRenderTarget(f.write);
+  const first = a.mesh.morphTexture.image.data.slice(); renderThreePassScene(f.renderer, f.scene, f.camera);
+  a.weights([.25, .875, .625]); b.morphTexture.needsUpdate = true;
+  const second = a.mesh.morphTexture.image.data.slice(); renderThreePassScene(f.renderer, f.scene, f.camera);
+  a.weights([.75, .125, .5]); renderThreePassScene(f.renderer, f.scene, f.camera);
+  a.mesh.dispose(); b.dispose(); f.scene.clear(); await drain(f.renderer);
+  const draws = programDraws(f.device); assert.equal(draws.length, 6);
+  [first, first, second, second, second, second].forEach((expected, index) => assert.deepEqual(instanceWeights(draws[index]), expected));
+  assert.equal(f.renderer._sampledTextureInputs.diagnostics.snapshotBytes, 0);
+});
+
+test('a previously uploaded morph alias keeps its own version gate while capturing the shared Source history', async t => {
+  const f = await fixture(t), a = animatedInstances(t), b = new T.InstancedMesh(a.geometry, a.material, 3);
+  b.frustumCulled = false; b.morphTexture = a.mesh.morphTexture.clone(); t.after(() => b.dispose());
+  f.scene.add(a.mesh); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  a.weights([.25, .875, .625]); b.morphTexture.needsUpdate = true;
+  const expected = b.morphTexture.image.data.slice();
+  f.scene.remove(a.mesh); f.scene.add(b); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.notEqual(a.mesh.morphTexture.version, b.morphTexture.version);
+  a.weights([.75, .125, .5]); f.scene.remove(b); f.scene.add(a.mesh);
+  renderThreePassScene(f.renderer, f.scene, f.camera);
+  a.mesh.dispose(); b.dispose(); f.scene.clear(); await drain(f.renderer);
+  assert.deepEqual(instanceWeights(programDraws(f.device).at(-1)), expected);
+});
+
+test('distinct simultaneous morph aliases refuse source draw-order effects before capture', async t => {
+  const f = await fixture(t), a = animatedInstances(t), b = new T.InstancedMesh(a.geometry, a.material, 3);
+  b.frustumCulled = false; b.morphTexture = a.mesh.morphTexture.clone(); b.renderOrder = -1; t.after(() => b.dispose());
+  f.scene.add(a.mesh, b);
+  assert.throws(() => renderThreePassScene(f.renderer, f.scene, f.camera), /Distinct instance morph aliases/);
+  f.scene.remove(b);
+  const material = new T.ShaderMaterial({uniforms: {otherTexture: {value: b.morphTexture}}});
+  const probe = new T.Mesh(new T.PlaneGeometry(), material); f.scene.add(probe);
+  t.after(() => { probe.geometry.dispose(); material.dispose(); });
+  assert.throws(() => renderThreePassScene(f.renderer, f.scene, f.camera), /Instance morph material\/background aliases/);
+  f.scene.remove(probe); f.scene.background = a.mesh.morphTexture;
+  assert.throws(() => renderThreePassScene(f.renderer, f.scene, f.camera), /Instance morph material\/background aliases/);
+  f.scene.background = null;
+  assert.equal(f.renderer._pending.length, 0); assert.equal(f.renderer._sampledTextureInputs.diagnostics.snapshotBytes, 0);
+  assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
+test('ordinary instance morph inputs keep the automatic texture owner callback boundary', async t => {
+  const f = await fixture(t), a = animatedInstances(t); f.scene.add(a.mesh);
+  let calls = 0; a.mesh.morphTexture.onUpdate = () => { calls++; };
+  f.renderer.render(f.scene, f.camera);
+  await assert.rejects(() => drain(f.renderer), {code: 'THREE_SCENE_HOOK'});
+  assert.equal(calls, 0);
+});
+
+test('ordinary instance morph draws retain separately resident material inputs and required capture refuses that ownership', async t => {
+  const f = await fixture(t), a = animatedInstances(t);
+  const material = new T.ShaderMaterial({uniforms: {weights: {value: a.mesh.morphTexture}},
+    vertexShader: 'void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: 'uniform sampler2D weights; void main() { gl_FragColor = texture2D(weights, vec2(0.5)); }'});
+  const geometry = new T.PlaneGeometry(), probe = new T.Mesh(geometry, material); probe.frustumCulled = false;
+  t.after(() => { material.dispose(); geometry.dispose(); });
+  f.scene.add(probe); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  f.scene.add(a.mesh); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(programDraws(f.device).length, 1, 'ordinary reuse keeps the existing sampled owner');
+  assert.throws(() => renderThreePassScene(f.renderer, f.scene, f.camera), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
+test('hidden, layered, culled and invisible-material instances do not seed influence uploads', async t => {
+  const f = await fixture(t), a = animatedInstances(t); f.scene.add(a.mesh); f.renderer.setRenderTarget(f.write);
+  a.mesh.visible = false; renderThreePassScene(f.renderer, f.scene, f.camera);
+  a.mesh.visible = true; a.mesh.layers.set(1); renderThreePassScene(f.renderer, f.scene, f.camera);
+  a.mesh.layers.set(0); a.mesh.frustumCulled = true; a.mesh.boundingSphere = new T.Sphere(new T.Vector3(), 1);
+  a.mesh.position.x = 1000; renderThreePassScene(f.renderer, f.scene, f.camera);
+  a.mesh.position.x = 0; a.material.visible = false; renderThreePassScene(f.renderer, f.scene, f.camera);
+  assert.equal(f.renderer._sampledTextureInputs.diagnostics.snapshotBytes, 0);
+  await drain(f.renderer); assert.equal(programDraws(f.device).length, 0);
+  a.weights([.25, .875, .625]); a.material.visible = true;
+  const first = a.mesh.morphTexture.image.data.slice(); renderThreePassScene(f.renderer, f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(instanceWeights(programDraws(f.device).at(-1)), first,
+    'the first selected draw reads current bytes even without a second needsUpdate');
+});
+
+test('instance morph captures refuse effectful descriptors and shader collisions before application callbacks', async t => {
+  const f = await fixture(t), a = animatedInstances(t); f.scene.add(a.mesh); f.renderer.setRenderTarget(f.write);
+  const texture = a.mesh.morphTexture; let calls = 0;
+  for (const [object, key] of [[texture, 'onUpdate'], [texture, 'addEventListener'], [texture.image, 'data']]) {
+    const previous = Object.getOwnPropertyDescriptor(object, key);
+    Object.defineProperty(object, key, key === 'data' ? {get() { calls++; return new Float32Array(6); }, configurable: true} :
+      {value() { calls++; }, writable: true, configurable: true});
+    assert.throws(() => renderThreePassScene(f.renderer, f.scene, f.camera), {code: 'F3D_RENDERER_UNSUPPORTED'});
+    if (previous) Object.defineProperty(object, key, previous); else delete object[key];
+  }
+  texture.image.width = 1;
+  assert.throws(() => renderThreePassScene(f.renderer, f.scene, f.camera), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  texture.image.width = 2;
+  const override = new T.ShaderMaterial({uniforms: {morphTexture: {value: texture}}}); t.after(() => override.dispose());
+  f.scene.overrideMaterial = override;
+  assert.throws(() => renderThreePassScene(f.renderer, f.scene, f.camera), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  f.scene.overrideMaterial = null;
+  assert.equal(calls, 0); assert.equal(f.renderer._pending.length, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+  assert.equal(f.renderer._sampledTextureInputs.diagnostics.snapshotBytes, 0);
+  renderThreePassScene(f.renderer, f.scene, f.camera);
+  assert.ok(f.renderer._passInstances.pendingBytes > 0);
+  f.renderer.dispose(); await f.renderer._disposePromise;
+  assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+  assert.equal(f.renderer._sampledTextureInputs.diagnostics.snapshotBytes, 0);
+});
+
+for (const accessor of [false, true]) test(`queued instance morph capture refuses a later ${accessor ? 'image accessor' : 'upload helper'} without invoking it`, async t => {
+  const f = await fixture(t), a = animatedInstances(t); f.scene.add(a.mesh);
+  renderThreePassScene(f.renderer, f.scene, f.camera);
+  const object = accessor ? a.mesh.morphTexture.source : a.mesh.morphTexture, key = accessor ? 'data' : 'clearUpdateRanges';
+  const previous = Object.getOwnPropertyDescriptor(object, key); let calls = 0;
+  Object.defineProperty(object, key, accessor ? {get() { calls++; return previous.value; }, configurable: true} :
+    {value() { calls++; }, writable: true, configurable: true});
+  try { await assert.rejects(() => drain(f.renderer), {code: 'F3D_RENDERER_UNSUPPORTED'}); }
+  finally { if (previous) Object.defineProperty(object, key, previous); else delete object[key]; }
+  assert.equal(calls, 0); assert.equal(programDraws(f.device).length, 0);
+  assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+});
 
 for (const morph of [false, true]) test(`SSAA retains queued ${morph ? 'morphed ' : ''}skinned poses, binds and shared-skeleton timing after disposal`, async t => {
   const f = await fixture(t), a = animatedMesh(t, {skin: true, morph}); f.scene.add(a.mesh);

@@ -1341,6 +1341,27 @@ source replacement and disposal. Accepted material visibility and jittered
 camera projections also remain independent of later calls. Submission updates
 private poses without rewriting later public bind-matrix state.
 
+`InstancedMesh.setMorphAt()` animation also participates in required captures.
+SSAA samples, TAA hold/accumulation draws and Outline depth draws retain the
+accepted per-instance influence rows together with their instance counts,
+matrices and morph-atlas generations. The pinned source supplies both absolute
+and relative base weights. Ordinary draws and captured passes use one sampled
+texture history from first use, preserving `Texture.version` and `needsUpdate`:
+editing rows without requesting an upload leaves the acknowledged bytes stale.
+Hidden, layered, culled and invisible-material instances do not establish a new
+influence history. Refused FIFO admissions roll back unuploaded versions;
+accepted leases survive source disposal and release when drained or cancelled.
+
+This influence profile requires ordinary fixed Float32 `RedFormat`/`FloatType`
+data textures with default sampling and upload helpers. Multiple meshes may
+share one influence texture. Distinct simultaneous texture aliases sharing its
+`Source`, and influence sources also used by material/background samplers,
+require per-draw upload ordering and are explicitly refused. An input already
+resident in a separate scene texture owner keeps its ordinary rendering route
+but cannot enter detached capture. The pinned r186 Outline mask shader omits
+`morphinstance_vertex`, so selected instanced morph masks retain that source
+compilation limitation; its depth material supports these captured inputs.
+
 `three_renderer_postprocessing_deformation.test.mjs` exercises the actual pinned
 SSAA, TAA and Outline passes, comparing atlas bytes and morph weights with
 `WebGLMorphtargets` and palettes with source skeleton math. It covers shared
@@ -1348,7 +1369,7 @@ skeletons, attached/detached binds, combined skinning/morphs, queued disposal an
 renderer cancellation. The checks use a recording device; rasterized pixel
 equivalence and hardware performance remain unmeasured. Private bone textures
 retire after their final pending use, so later drained batches may need fresh
-residency. Instanced morph textures, custom deformation hooks,
+residency. Custom deformation hooks,
 renderer-uniform overrides and palette aliases into geometry/material inputs
 remain explicit boundaries for this capture profile.
 

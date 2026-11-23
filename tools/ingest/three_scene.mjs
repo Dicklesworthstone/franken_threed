@@ -1284,7 +1284,9 @@ export async function createGpuThreeScene(device,scene,{
       // Preparation may grow source residency. Prior history consumers are
       // already submitted; retire their cache before sharing that byte budget.
       releaseBatchHistory();
-      textureOwner?.prepare(owned,{initialize:true});
+      // A later object can register a shared instance-morph Source during the
+      // scan. Earlier aliases then belong to that same borrowed history.
+      textureOwner?.prepare([...owned].filter(texture=>!textures.has(texture)),{initialize:true});
       await Promise.race([textureBindings.prepare(),stopped]);live();
       preparedShadowMode=programShadowMode;
       if(programShadowMode){

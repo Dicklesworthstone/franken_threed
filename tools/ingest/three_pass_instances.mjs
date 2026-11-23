@@ -1,6 +1,6 @@
 import {createWebGLInstanceHistory} from './webgl_instance_history.mjs';
 import {createThreePassGeometry} from './three_pass_geometry.mjs';
-import {createThreePassSkeletons} from './three_pass_deformation.mjs';
+import {createThreePassSkeletons, isOrdinaryPassMorphTexture} from './three_pass_deformation.mjs';
 
 const applyLodUpdate = Reflect.apply;
 
@@ -55,7 +55,7 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
     }
     return state;
   }
-  function capture(root, camera, frame, {maxValues = 1048576, sortObjects = true, required = true} = {}) {
+  function capture(root, camera, frame, {maxValues = 1048576, sortObjects = true, required = true, captureTexture = null} = {}) {
     if (!frame?.objects?.size) return null;
     const candidates = new Map(), deformationObjects = new Set(), skeletonSources = new Set();
     for (const source of frame.objects.keys()) {
@@ -89,6 +89,8 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
           const owner = attribute.isInterleavedBufferAttribute ? attribute.data : attribute;
           if (paletteBuffers.has(owner.array?.buffer)) return refuse('Queued skeleton palettes cannot also serve as geometry or morph inputs');
         }
+        if (candidate.instanced && candidate.morph && paletteBuffers.has(object.morphTexture.image.data.buffer))
+          return refuse('Queued skeleton palettes cannot also serve as instance morph inputs');
       }
       const pending = [], seen = new Set();
       for (const material of frame.materials.keys()) for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(material)))
@@ -127,8 +129,8 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
       bytes += size * size * 16; deformationValues += skeleton.bones.length * 32;
     }
     for (const object of deformationObjects) deformationValues +=
-      (candidates.get(object).morph ? object.morphTargetInfluences.length : 0) + (object.isSkinnedMesh ? 32 : 0);
-    const selectedSkeletons = new Set(), skeletonTextures = new Set();
+      (candidates.get(object).morph && !candidates.get(object).instanced ? object.morphTargetInfluences.length : 0) + (object.isSkinnedMesh ? 32 : 0);
+    const selectedSkeletons = new Set(), skeletonTextures = new Set(), morphTextures = new Set();
     const wireframes = new Map([...frame.materials.keys()].map(material => [material, material.wireframe === true]));
     // Validate budgets and projection eligibility before acknowledging a source
     // upload or clearing any update range. Material eligibility was established
@@ -188,6 +190,7 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
         for (const {material, group} of selections) if (material?.visible) {
           shape.morphSelected = true;
           if (source.isSkinnedMesh) skeletonTextures.add(source.skeleton);
+          if (source.isInstancedMesh && candidates.get(source).morph) morphTextures.add(source.morphTexture);
           const effective = frame.overrideMaterial && material.allowOverride === true ? frame.overrideMaterial : material;
           if (source.isMesh && wireframes.get(effective)) shape.edgePlan ??= geometry.edgePlan(selectedGeometry);
           else if (shape.index) {
@@ -211,17 +214,50 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
     const geometryStreams = new Set([...shapes.values()].flatMap(shape => [...shape.uploads]));
     for (const owner of geometryStreams) { bytes += owner.array.byteLength; streams.add(owner); }
     for (const shape of shapes.values()) bytes += (shape.edgePlan?.bytes ?? 0) + (shape.morphSelected ? shape.morphBytes : 0);
+    for (const texture of morphTextures) { bytes += texture.image.data.byteLength; deformationValues += texture.image.data.length; }
+    if (morphTextures.size && typeof captureTexture !== 'function') return refuse('Instance morph captures require the shared sampled-texture owner');
+    const influenceSources = new Map();
+    for (const texture of morphTextures) {
+      if (influenceSources.has(texture.source) && influenceSources.get(texture.source) !== texture)
+        return refuse('Distinct instance morph aliases require their source per-draw upload order');
+      influenceSources.set(texture.source, texture);
+    }
+    if (influenceSources.size) {
+      const pending = [...frame.materials.keys(), Object.getOwnPropertyDescriptor(root, 'background')?.value,
+        Object.getOwnPropertyDescriptor(root, 'environment')?.value], seen = new Set();
+      while (pending.length) {
+        const value = pending.pop();
+        if (!value || typeof value !== 'object' || seen.has(value) || ArrayBuffer.isView(value)) continue;
+        if (seen.size >= maxValues) return refuse('Instance morph material input capacity exceeded');
+        seen.add(value);
+        if (value instanceof three.Texture) {
+          const source = Object.getOwnPropertyDescriptor(value, 'source')?.value;
+          if (influenceSources.has(source))
+            return refuse('Instance morph material/background aliases require their source per-draw upload order');
+          continue;
+        }
+        const prototype = Object.getPrototypeOf(value);
+        if (value instanceof three.Material || prototype === Object.prototype || prototype === null || prototype === three.Uniform?.prototype || Array.isArray(value))
+          for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(value)))
+            if (Object.hasOwn(descriptor, 'value')) pending.push(descriptor.value);
+      }
+    }
     const values = hierarchy.size * 4 + candidates.size * 40 + geometryValues + deformationValues;
     if (values > maxValues || bytes > maxBytes - pendingBytes) return refuse('Pending instanced pass snapshot capacity exceeded');
     try { history.validate(streams); }
     catch (error) { if (error.code !== 'GEOMETRY_GPU_HISTORY') throw error; return refuse(error.message); }
+    const morphInputs = new Map(), skeletonPackets = new Map(), geometryPackets = new Map();
+    try {
+    // Use the existing immutable sampled history, including prior ordinary
+    // draws. Texture admission precedes any attribute-range acknowledgement.
+    for (const texture of morphTextures) morphInputs.set(texture, captureTexture(texture));
     const accepted = new Map([...streams].map(attribute => [attribute, history.capture(attribute)]));
     // Preserve the source's public update and lazy texture creation effects at
     // acceptance. Private views recompute only from frozen bones during draws.
     for (const skeleton of selectedSkeletons) skeleton.update();
     for (const skeleton of skeletonTextures) if (skeleton.boneTexture === null) skeleton.computeBoneTexture();
-    const skeletonPackets = new Map([...skeletonSources].map(source => [source, skeletons.capture(source)]));
-    const geometryPackets = new Map([...shapes].map(([source, shape]) => [source, geometry.capture(shape, accepted)]));
+    for (const source of skeletonSources) skeletonPackets.set(source, skeletons.capture(source));
+    for (const [source, shape] of shapes) geometryPackets.set(source, geometry.capture(shape, accepted));
     const deformations = new Set();
     for (const [source, candidate] of candidates) {
       const state = privateObject(source, candidate.instanced, candidate.skinned), view = state.view, active = selected.has(source), captured = [];
@@ -247,7 +283,8 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
       const bounds = candidate.instanced || candidate.skinned ? source : candidate.geometry;
       if (deformationObjects.has(source)) deformations.add(view);
       packets.push({state, captured, count: source.count, geometry: geometryPackets.get(candidate.geometry)?.view ?? candidate.geometry,
-        influences: candidate.morph ? source.morphTargetInfluences.slice() : undefined, skin: candidate.skinned ? {
+        morphTexture: candidate.instanced ? morphInputs.get(source.morphTexture)?.texture ?? null : null,
+        influences: candidate.morph && !candidate.instanced ? source.morphTargetInfluences.slice() : undefined, skin: candidate.skinned ? {
           skeleton: skeletonPackets.get(source.skeleton).view, bindMode: source.bindMode,
           bindMatrix: new three.Matrix4().copy(source.bindMatrix), bindMatrixInverse: new three.Matrix4().copy(source.bindMatrixInverse)} : null,
         matrixWorld: new three.Matrix4().copy(source.matrixWorld), boundingSphere: bounds.boundingSphere
@@ -264,7 +301,8 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
     return {objects, hierarchy, visibility, layers, orders, geometries, values, bytes, wireframes, deformations, deformationObjects, lods: frame.lods,
       geometryView: source => geometryPackets.get(source)?.view,
       geometrySafe: () => [...geometryPackets.values()].every(packet => packet.safe()),
-      deformationSafe: () => [...skeletonPackets.values()].every(packet => packet.safe()),
+      deformationSafe: () => [...skeletonPackets.values()].every(packet => packet.safe()) &&
+        [...morphInputs.keys()].every(texture => isOrdinaryPassMorphTexture(three, texture)),
       publishLod() {
         if (released || publishedLod) return;
         // The renderer calls this only once all request captures and queue
@@ -281,7 +319,7 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
         for (const packet of packets) {
           const view = packet.state.view;
           view.count = packet.count; view.geometry = packet.geometry;
-          view.morphTargetInfluences = packet.influences;
+          view.morphTargetInfluences = packet.influences; view.morphTexture = packet.morphTexture;
           if (packet.skin) {
             view.skeleton = packet.skin.skeleton; view.bindMode = packet.skin.bindMode;
             view.bindMatrix.copy(packet.skin.bindMatrix); view.bindMatrixInverse.copy(packet.skin.bindMatrixInverse);
@@ -300,8 +338,15 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
         released = true; pendingBytes -= bytes;
         for (const packet of geometryPackets.values()) packet.release();
         for (const packet of skeletonPackets.values()) packet.release();
+        for (const input of morphInputs.values()) input.release();
       } },
     };
+    } catch (error) {
+      for (const packet of geometryPackets.values()) packet.release();
+      for (const packet of skeletonPackets.values()) packet.release();
+      for (const input of morphInputs.values()) input.release();
+      throw error;
+    }
   }
   return {history, capture,
     dispose() { for (const [source, state] of sources) source.removeEventListener('dispose', state.dispose); sources.clear(); attributes = new WeakMap(); rigidSources = new WeakMap(); skeletons.dispose(); geometry.dispose(); history.dispose(); },

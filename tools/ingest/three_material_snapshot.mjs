@@ -76,7 +76,7 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
   if (excludedRoots) claim(excludedRoots.size);
   if (excludedObjects) claim(excludedObjects.size);
   const ordinaryInstances = object => {
-    if (!allowInstances || !(object instanceof three.InstancedMesh) || data(object, 'morphTexture') !== null ||
+    if (!allowInstances || !(object instanceof three.InstancedMesh) || !allowDeformations && data(object, 'morphTexture') !== null ||
         data(object, 'computeBoundingSphere') !== three.InstancedMesh.prototype.computeBoundingSphere ||
         data(object, 'getMatrixAt') !== three.InstancedMesh.prototype.getMatrixAt) return false;
     const sphere = data(object, 'boundingSphere');
@@ -104,7 +104,7 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
           data(range, 'start') < 0 || data(range, 'count') < 0 || data(range, 'start') + data(range, 'count') > array.length)) return false;
     }
     const morphs = data(data(object, 'geometry'), 'morphAttributes');
-    return morphs && dataOnly(morphs) && Object.values(morphs).every(value => Array.isArray(value) && value.length === 0);
+    return morphs && dataOnly(morphs) && (allowDeformations || Object.values(morphs).every(value => Array.isArray(value) && value.length === 0));
   };
   const ordinaryObject = (object, capturedDeformation = false) => {
     if (!(object instanceof three.Object3D) || !dataOnly(object)) return false;
@@ -202,6 +202,7 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
     const reserved = new Set([
       ...(skinned ? ['bindMatrix', 'bindMatrixInverse', 'boneTexture'] : []),
       ...(morphed ? ['morphTargetInfluences', 'morphTargetBaseInfluence', 'morphTargetsTexture', 'morphTargetsTextureSize'] : []),
+      ...(morphed && data(object, 'isInstancedMesh') ? ['morphTexture'] : []),
     ]);
     for (const source of Array.isArray(selected) ? selected : [selected]) {
       const material = source && overrideMaterial && data(source, 'allowOverride') === true ? overrideMaterial : source;
