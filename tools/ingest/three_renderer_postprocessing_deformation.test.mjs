@@ -183,6 +183,46 @@ for (const morph of [false, true]) test(`SSAA retains queued ${morph ? 'morphed 
   assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
 });
 
+test('SSAA automatic LOD retains each selected skinned morph pose and source hysteresis across queued camera changes', async t => {
+  const lod = new T.LOD(), oracle = new T.LOD(), sourceUpdate = T.LOD.prototype.update; let updates = 0;
+  T.LOD.prototype.update = function (camera) { if (Object.getPrototypeOf(this) === lod) updates++; return sourceUpdate.call(this, camera); };
+  t.after(() => { T.LOD.prototype.update = sourceUpdate; });
+  const f = await fixture(t), near = animatedMesh(t, {skin: true, morph: true}), far = animatedMesh(t, {skin: true, morph: true});
+  lod.addLevel(near.mesh, 0); lod.addLevel(far.mesh, 10, .2); f.scene.add(lod);
+  oracle.addLevel(new T.Object3D(), 0); oracle.addLevel(new T.Object3D(), 10, .2);
+  const pass = new SSAARenderPass(f.scene, f.camera); pass.sampleLevel = 1; t.after(() => pass.dispose());
+  const expected = [], selectedCounts = new Map([[near, 0], [far, 0]]);
+  for (const [index, distance] of [5, 12, 9, 7].entries()) {
+    f.camera.position.z = distance; f.camera.updateMatrixWorld();
+    sourceUpdate.call(oracle, f.camera); sourceUpdate.call(oracle, f.camera);
+    near.tip.rotation.z = .1 * (index + 1); far.tip.rotation.z = -.2 * (index + 1);
+    near.mesh.morphTargetInfluences[0] = .125 * (index + 1); far.mesh.morphTargetInfluences[0] = .75 - .125 * index;
+    pass.render(f.renderer, f.write, f.read);
+    const selected = oracle.getCurrentLevel() ? far : near;
+    assert.equal(lod.getCurrentLevel(), oracle.getCurrentLevel());
+    assert.equal(updates, (index + 1) * 2, 'each source SSAA sample advances LOD exactly once');
+    selectedCounts.set(selected, selectedCounts.get(selected) + 2);
+    for (const object of [near, far]) assert.equal(object.skeleton.boneTexture?.version ?? 0, selectedCounts.get(object),
+      'only the selected level updates its public skeleton');
+    const value = {palette: sourcePalette(selected.mesh), influence: selected.mesh.morphTargetInfluences[0], reflection: f.reflection(selected.mesh)};
+    expected.push(value, value);
+  }
+  f.camera.position.z = 99; lod.levels.reverse(); lod._currentLevel = 77; f.scene.clear();
+  for (const object of [near, far]) {
+    object.mesh.visible = true; object.tip.rotation.z = 2; object.skeleton.boneMatrices.fill(99);
+    object.mesh.morphTargetInfluences.fill(99); object.target.array.fill(99);
+    object.skeleton.dispose(); object.geometry.dispose(); object.material.dispose();
+  }
+  await drain(f.renderer);
+  const draws = programDraws(f.device); assert.equal(draws.length, expected.length);
+  for (const [index, draw] of draws.entries()) {
+    assert.deepEqual(palette(draw), expected[index].palette);
+    assert.deepEqual(uniformFloats(draw, expected[index].reflection, 'morphTargetInfluences'), [expected[index].influence]);
+  }
+  assert.equal(updates, 8); assert.equal(lod.getCurrentLevel(), 77); assert.ok(near.mesh.visible && far.mesh.visible);
+  assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
 for (const relative of [false, true]) test(`TAA preserves ${relative ? 'relative' : 'absolute'} morph atlas history across ordinary draws, count changes and disposal`, async t => {
   const f = await fixture(t), a = animatedMesh(t, {morph: true, relative}), reference = morphOracle(); f.scene.add(a.mesh);
   a.mesh.morphTargetInfluences[0] = .25; f.renderer.render(f.scene, f.camera); await drain(f.renderer);
@@ -237,6 +277,48 @@ test('Outline retains animated depth and selected-mask draws while public select
   assert.deepEqual(palette(draws[1]), first); assert.deepEqual(palette(draws[2]), second);
   assert.deepEqual(uniformFloats(draws[0], depth, 'morphTargetInfluences'), [.125]);
   assert.deepEqual(uniformFloats(draws[3], mask, 'morphTargetInfluences'), [.75]);
+  assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
+test('Outline LOD follows the retained pass visibility changes before source hysteresis selection', async t => {
+  const f = await fixture(t), near = animatedMesh(t, {morph: true}), far = animatedMesh(t, {morph: true}), lod = new T.LOD();
+  near.mesh.morphTargetInfluences[0] = .25; far.mesh.morphTargetInfluences[0] = .75;
+  lod.addLevel(near.mesh, 0); lod.addLevel(far.mesh, 10, .2); f.scene.add(lod);
+  const pass = new OutlinePass(new T.Vector2(32, 32), f.scene, f.camera, [near.mesh]); t.after(() => pass.dispose());
+  const referenceScene = new T.Scene(), referenceLod = new T.LOD(), camera = f.camera.clone();
+  const a = new T.Mesh(near.geometry, near.material), b = new T.Mesh(far.geometry, far.material);
+  a.name = 'near'; b.name = 'far'; referenceLod.addLevel(a, 0); referenceLod.addLevel(b, 10, .2); referenceScene.add(referenceLod);
+  const referencePass = new OutlinePass(new T.Vector2(32, 32), referenceScene, camera, [a]); t.after(() => referencePass.dispose());
+  const expected = [];
+  // Execute the retained pass itself, including its visibility cache restores.
+  // The reference renderer only records source projection; no candidate capture
+  // helper participates in this selection oracle.
+  const recorder = {autoClear: true, getClearColor: color => color.set(0), getClearAlpha: () => 1,
+    setClearColor() {}, setRenderTarget() {}, clear() {}, render(root, currentCamera) {
+      if (root !== referenceScene) return;
+      root.updateMatrixWorld(); currentCamera.updateMatrixWorld();
+      const selected = [];
+      root.traverseVisible(object => {
+        if (!object.layers.test(currentCamera.layers)) return;
+        if (object.isLOD && object.autoUpdate) object.update(currentCamera);
+        if (object.isMesh) selected.push(object.name);
+      });
+      expected.push(selected);
+    }};
+  for (const distance of [5, 12, 9]) {
+    f.camera.position.z = camera.position.z = distance;
+    referencePass.render(recorder, f.write, f.read); pass.render(f.renderer, f.write, f.read);
+    assert.equal(lod.getCurrentLevel(), referenceLod.getCurrentLevel());
+    assert.deepEqual([near.mesh.visible, far.mesh.visible], [a.visible, b.visible]);
+  }
+  assert.deepEqual(expected, [['near'], ['near'], ['far'], ['far'], ['far'], ['near']],
+    'temporarily hiding the far level removes its hysteresis before the mask draw');
+  const depth = f.reflection(near.mesh, pass.depthMaterial), mask = f.reflection(near.mesh, pass.prepareMaskMaterial);
+  near.mesh.morphTargetInfluences.fill(99); far.mesh.morphTargetInfluences.fill(99); f.scene.clear();
+  await drain(f.renderer);
+  const draws = programDraws(f.device); assert.equal(draws.length, expected.length);
+  for (const [index, draw] of draws.entries()) assert.deepEqual(
+    uniformFloats(draw, index % 2 ? mask : depth, 'morphTargetInfluences'), [expected[index][0] === 'near' ? .25 : .75]);
   assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
 });
 

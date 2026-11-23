@@ -12,7 +12,7 @@ import {createWebGLInstanceHistory} from './webgl_instance_history.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
 const Renderer = createWebGLRendererClass(T, {maxDraws: 64, maxBindings: 64});
-async function fixture(t) {
+async function fixture(t, RendererType = Renderer) {
   const device = geometryDevice(); Object.assign(device.limits, {maxTextureDimension2D: 8192, maxBindingsPerBindGroup: 1000});
   device.createTexture = descriptor => ({dimension: '2d', depthOrArrayLayers: 1, sampleCount: 1, ...descriptor,
     width: descriptor.size.width ?? descriptor.size[0], height: descriptor.size.height ?? descriptor.size[1],
@@ -22,7 +22,7 @@ async function fixture(t) {
   let configuration;
   const canvas = {width: 32, height: 32, style: {}, getContext: () => ({configure(value) { configuration = value; }, unconfigure() {},
     getCurrentTexture: () => device.createTexture({size: [32, 32], format: configuration.format, usage: 16})})};
-  const renderer = new Renderer({canvas, device}); await renderer.init();
+  const renderer = new RendererType({canvas, device}); await renderer.init();
   const scene = new T.Scene(), camera = new T.PerspectiveCamera(60, 1, .1, 100); camera.position.z = 5;
   const mesh = new T.InstancedMesh(new T.PlaneGeometry(), new T.MeshBasicMaterial(), 3);
   mesh.setColorAt(0, new T.Color(1, .5, .25)); mesh.frustumCulled = false; scene.add(mesh);
@@ -485,6 +485,64 @@ test('actual pinned SSAA submits every accepted instance sample after source cha
   assert.equal(f.renderer._passInstances.pendingBytes, 0);
 });
 
+test('queued automatic LOD submits source-selected instance streams without replaying public updates', async t => {
+  const lod = new T.LOD(), oracle = new T.LOD(), sourceUpdate = T.LOD.prototype.update; let updates = 0;
+  T.LOD.prototype.update = function (camera) { if (Object.getPrototypeOf(this) === lod) updates++; return sourceUpdate.call(this, camera); };
+  t.after(() => { T.LOD.prototype.update = sourceUpdate; });
+  const f = await fixture(t, createWebGLRendererClass(T, {maxDraws: 64, maxBindings: 64}));
+  const far = new T.InstancedMesh(f.mesh.geometry, f.mesh.material, 2); far.frustumCulled = false;
+  f.scene.remove(f.mesh); lod.addLevel(f.mesh, 0); lod.addLevel(far, 10, .2); f.scene.add(lod);
+  oracle.addLevel(new T.Object3D(), 0); oracle.addLevel(new T.Object3D(), 10, .2);
+  t.after(() => far.dispose());
+  const expected = [];
+  for (const [index, distance] of [5, 12, 9, 7].entries()) {
+    f.camera.position.z = distance; f.camera.updateMatrixWorld(); sourceUpdate.call(oracle, f.camera);
+    f.mesh.setMatrixAt(0, new T.Matrix4().makeTranslation(index, 0, 0)); f.mesh.instanceMatrix.needsUpdate = true;
+    far.setMatrixAt(0, new T.Matrix4().makeTranslation(index + 10, 0, 0)); far.instanceMatrix.needsUpdate = true;
+    renderThreePassScene(f.renderer, f.scene, f.camera);
+    const level = oracle.getCurrentLevel(); assert.equal(lod.getCurrentLevel(), level);
+    assert.equal(updates, index + 1, 'source selection takes effect synchronously at acceptance');
+    expected.push({count: level ? 2 : 3, translation: index + level * 10});
+  }
+  f.camera.position.z = 99; lod.position.x = 99; lod.levels.reverse(); lod._currentLevel = 77;
+  f.mesh.visible = far.visible = true; f.mesh.count = far.count = 0;
+  f.mesh.instanceMatrix.array.fill(99); far.instanceMatrix.array.fill(99); f.scene.clear();
+  await drain(f.renderer);
+  assert.deepEqual(instanceDraws(f.device).map(draw => ({count: draw.count, translation: draw.matrix[12]})), expected);
+  assert.equal(updates, 4); assert.equal(lod.getCurrentLevel(), 77); assert.ok(f.mesh.visible && far.visible);
+  assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
+test('a full render FIFO refuses the next LOD selection without publishing its visibility or current level', async t => {
+  const f = await fixture(t, createWebGLRendererClass(T, {maxDraws: 64, maxBindings: 64, maxPendingRenders: 1}));
+  const lod = new T.LOD(), far = new T.InstancedMesh(f.mesh.geometry, f.mesh.material, 2); far.frustumCulled = false;
+  f.scene.remove(f.mesh); lod.addLevel(f.mesh, 0); lod.addLevel(far, 10, .2); f.scene.add(lod); t.after(() => far.dispose());
+  renderThreePassScene(f.renderer, f.scene, f.camera);
+  assert.equal(lod.getCurrentLevel(), 0); assert.equal(far.visible, false);
+  f.camera.position.z = 12;
+  assert.throws(() => renderThreePassScene(f.renderer, f.scene, f.camera), {code: 'F3D_RENDERER_LIMIT'});
+  assert.equal(lod.getCurrentLevel(), 0); assert.equal(f.mesh.visible, true); assert.equal(far.visible, false);
+  await drain(f.renderer);
+  assert.deepEqual(instanceDraws(f.device).map(draw => draw.count), [3]);
+  assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
+test('global LOD prototype changes after facade creation are refused before capture and queued preparation', async t => {
+  const f = await fixture(t), lod = new T.LOD(); f.scene.remove(f.mesh); lod.addLevel(f.mesh, 0); f.scene.add(lod);
+  const sourceUpdate = T.LOD.prototype.update; let calls = 0;
+  t.after(() => { T.LOD.prototype.update = sourceUpdate; });
+  const callback = function () { calls++; };
+  T.LOD.prototype.update = callback;
+  assert.throws(() => renderThreePassScene(f.renderer, f.scene, f.camera), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.equal(calls, 0); assert.equal(f.device.submissions.length, 0);
+  T.LOD.prototype.update = sourceUpdate;
+  renderThreePassScene(f.renderer, f.scene, f.camera);
+  T.LOD.prototype.update = callback;
+  await assert.rejects(drain(f.renderer), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.equal(calls, 0); assert.equal(instanceDraws(f.device).length, 0);
+  assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
 test('verified shader overrides consume captured instances through the source-program path', async t => {
   const f = await fixture(t), material = new T.ShaderMaterial({
     vertexShader: 'varying vec3 instanceTint; void main() { instanceTint = instanceColor; gl_Position = projectionMatrix * modelViewMatrix * instanceMatrix * vec4(position, 1.0); }',
@@ -530,18 +588,18 @@ test('verified instance capture refuses unsupported hooks and morphs without con
   assert.equal(a.updateRanges.length, 1); f.mesh.morphTexture.dispose(); f.mesh.morphTexture = null;
 });
 
-test('automatic LOD and hooks installed after optional capture retain the ordinary source path', async t => {
+test('automatic LOD capture preserves the optional path and late hook identities', async t => {
   const f = await fixture(t), lod = new T.LOD(); f.scene.remove(f.mesh); lod.addLevel(f.mesh, 0); f.scene.add(lod);
   f.renderer.render(f.scene, f.camera); await drain(f.renderer);
   assert.equal(instanceDraws(f.device).length, 1);
-  const submitted = f.device.submissions.length;
-  assert.throws(() => renderThreePassScene(f.renderer, f.scene, f.camera), {code: 'F3D_RENDERER_UNSUPPORTED'});
-  assert.equal(f.device.submissions.length, submitted);
   f.scene.remove(lod); f.scene.add(f.mesh);
   f.renderer.render(f.scene, f.camera);
   let calls = 0;
   f.mesh.onBeforeRender = function (_renderer, _scene, camera) { calls++; assert.equal(this, f.mesh); assert.equal(camera, f.camera); };
   await drain(f.renderer); assert.equal(calls, 1);
+  f.mesh.onBeforeRender = T.Object3D.prototype.onBeforeRender; f.scene.remove(f.mesh); lod.add(f.mesh); f.scene.add(lod);
+  renderThreePassScene(f.renderer, f.scene, f.camera); await drain(f.renderer);
+  assert.equal(instanceDraws(f.device).length, 3);
   assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
 });
 

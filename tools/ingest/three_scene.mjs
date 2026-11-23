@@ -1738,7 +1738,7 @@ export async function createGpuThreeScene(device,scene,{
         if(excludedNodeObject(object)||bundledNodeObject(object)||(passNodeFrame?.visibility?.get(object)??passMaterialFrame?.instanceFrame?.visibility.get(object)??object.visible!==false)===false)continue;
         if(fixedGeometry(object)!==null&&sourceLayers(object,camera)){
           if(object.isGroup)groupOrder=sourceOrder(object);
-          else if(object.isLOD){if(object.autoUpdate&&!passNodeFrame?.visibility?.has(object))object.update(camera);}
+          else if(object.isLOD){if(object.autoUpdate&&!passNodeFrame?.visibility?.has(object)&&!passMaterialFrame?.instanceFrame?.visibility.has(object))object.update(camera);}
           else if(object.isLight&&!capturedNodeLight(object)){if(!programLightMode&&!nativeLightMode)lighting.lights.push(light(object));lightSources.push(object);}
           else if(object.isLineLoop&&!programRoute()){
             // Source r186 WebGPU behavior: report and draw nothing for this object.

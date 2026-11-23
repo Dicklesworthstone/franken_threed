@@ -22,6 +22,18 @@ const data = (object, key) => {
 };
 const dataOnly = object => Object.values(Object.getOwnPropertyDescriptors(object))
   .every(descriptor => Object.hasOwn(descriptor, 'value'));
+
+/** Retain the finite method dependencies of the pinned LOD.update at facade
+ * installation, before application prototype changes can introduce callbacks. */
+export function captureThreeLodSource(three) {
+  const prototype = three.LOD?.prototype, vector = three.Vector3?.prototype, host = globalThis, math = data(host, 'Math');
+  const update = data(prototype, 'update'), sqrt = data(math, 'sqrt');
+  const methods = ['setFromMatrixPosition', 'distanceTo', 'distanceToSquared'].map(name => [name, data(vector, name)]);
+  return {update, safe: () => three.LOD?.prototype === prototype && three.Vector3?.prototype === vector && data(host, 'Math') === math &&
+    typeof update === 'function' && data(prototype, 'update') === update && typeof sqrt === 'function' && data(math, 'sqrt') === sqrt &&
+    methods.every(([name, method]) => typeof method === 'function' && data(vector, name) === method)};
+}
+
 const mapPrototype = Map.prototype, mapForEach = mapPrototype.forEach;
 const mapSize = Object.getOwnPropertyDescriptor(mapPrototype, 'size').get;
 const selectorArray = (array, limit) => {
@@ -39,15 +51,15 @@ const selectorArray = (array, limit) => {
  * uniforms stay live. Hooks that could change selection during projection keep
  * their existing live-source path instead of being moved ahead of source work.
  */
-function captureSelections(three, root, {camera, overrideMaterial, exclusions, allowInstances, allowDeformations, maxNodes, maxMaterials, maxValues}) {
-  const materials = new Map(), objects = new Map(), seen = new Set(), instances = new Set(), stack = [root];
+function captureSelections(three, root, {camera, overrideMaterial, exclusions, allowInstances, allowDeformations, allowLod, lodSource, maxNodes, maxMaterials, maxValues}) {
+  const materials = new Map(), objects = new Map(), seen = new Set(), instances = new Set(), lods = new Set(), stack = [root];
   let values = 0;
   const claim = count => {
     if (count > maxValues - values) fail('LIMIT', 'Pending material snapshot value capacity exceeded');
     values += count;
   };
-  // Only the pinned pass's temporary hidden list/cache is captured. Ordinary scene
-  // visibility and LOD updates retain their existing submission behavior.
+  // Only the pinned pass's temporary hidden list/cache supplies exclusions.
+  // Automatic LOD effects require the separately admitted capture below.
   let excluded = null;
   if (exclusions !== null && Object.getPrototypeOf(exclusions) === mapPrototype) {
     // OutlinePass owns an ordinary Map. Do not call application-overridable
@@ -59,7 +71,9 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
     excluded = []; mapForEach.call(exclusions, (_visible, object) => excluded.push(object));
   } else if (exclusions !== null) excluded = selectorArray(exclusions, maxNodes);
   if (exclusions !== null && (!excluded || excluded.some(object => !(object instanceof three.Object3D)))) return null;
+  const excludedRoots = allowLod && excluded ? new Set(excluded) : null;
   const excludedObjects = excluded ? new Set(excluded) : null;
+  if (excludedRoots) claim(excludedRoots.size);
   if (excludedObjects) claim(excludedObjects.size);
   const ordinaryInstances = object => {
     if (!allowInstances || !(object instanceof three.InstancedMesh) || data(object, 'morphTexture') !== null ||
@@ -162,6 +176,7 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
     if (seen.has(object)) fail('GRAPH', 'Expected an acyclic source hierarchy');
     seen.add(object);
     if (data(object, 'isInstancedMesh')) instances.add(object);
+    if (data(object, 'isLOD') && data(object, 'autoUpdate')) lods.add(object);
     const children = selectorArray(data(object, 'children'), maxNodes);
     if (!children) return null;
     if (seen.size + stack.length + children.length > maxNodes) fail('LIMIT', 'Material snapshot node capacity exceeded');
@@ -199,8 +214,41 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
       }
     }
   }
+  // LOD.update writes level visibility synchronously. Only the required pass
+  // route moves that source work to acceptance; ordinary rendering keeps its
+  // live projection path. Validate every level without invoking accessors.
+  const lodMatrix = object => {
+    const matrix = data(object, 'matrixWorld');
+    if (!(matrix instanceof three.Matrix4) || !dataOnly(matrix)) return false;
+    const elements = selectorArray(data(matrix, 'elements'), 16);
+    return elements?.length === 16 && Array.from({length: 16}, (_, index) => data(elements, index))
+      .every(value => typeof value === 'number');
+  };
+  const ordinaryLods = () => {
+    if (lods.size && (!lodSource?.safe() || typeof data(camera, 'zoom') !== 'number' || !lodMatrix(camera))) return false;
+    for (const lod of lods) {
+      if (!(lod instanceof three.LOD) || data(lod, 'update') !== lodSource.update || !lodMatrix(lod)) return false;
+      const levels = selectorArray(data(lod, 'levels'), maxNodes), children = selectorArray(data(lod, 'children'), maxNodes);
+      const current = Object.getOwnPropertyDescriptor(lod, '_currentLevel');
+      if (!levels || !children || !current || !Object.hasOwn(current, 'value') || !current.writable) return false;
+      const direct = new Set(children);
+      for (const level of levels) {
+        if (!level || ![Object.prototype, null].includes(Object.getPrototypeOf(level)) || !dataOnly(level) ||
+            typeof data(level, 'distance') !== 'number' || typeof data(level, 'hysteresis') !== 'number') return false;
+        const object = data(level, 'object'), visible = object && Object.getOwnPropertyDescriptor(object, 'visible');
+        if (!direct.has(object) || !seen.has(object) || !visible || !Object.hasOwn(visible, 'value') ||
+            !visible.writable || typeof visible.value !== 'boolean') return false;
+      }
+    }
+    return true;
+  };
+  if (allowLod && !ordinaryLods()) return null;
   let selection;
   const cameraSafe = () => {
+    if (allowLod && lods.size && (!lodSource?.safe() || [...lods].some(lod => data(lod, 'update') !== lodSource.update))) return false;
+    // Once the packet owns hierarchy/visibility, later ordinary level edits
+    // belong to the next render and cannot retarget accepted passes.
+    if (allowLod && !selection?.instanceFrame && !ordinaryLods()) return false;
     if (selection?.instanceFrame?.geometrySafe?.() === false || selection?.instanceFrame?.deformationSafe?.() === false) return false;
     const perspective = data(camera, 'isPerspectiveCamera') === true;
     if (!camera || !ordinaryObject(camera) || data(camera, 'isArrayCamera') || data(camera, 'isMultiViewCamera') ||
@@ -221,19 +269,21 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
     for (const material of materials.keys()) if (!ordinaryMaterial(material)) return false;
     return true;
   };
-  // Automatic LOD projection still follows the original live scene path. The
-  // required pass scope rejects it before destination retention; ordinary
-  // rendering must not newly fail because optional instance capture is enabled.
-  if (instances.size && [...seen].some(object => data(object, 'isLOD') && data(object, 'autoUpdate'))) return null;
-  selection = objects.size ? {materials, objects, values, cameraSafe, excludedObjects, instances, overrideMaterial, allowDeformations} : null;
+  if (!allowLod && instances.size && lods.size) return null;
+  if (allowLod) {
+    claim(lods.size);
+    for (const lod of lods) claim(data(lod, 'levels').length * 3);
+  }
+  selection = objects.size ? {materials, objects, values, cameraSafe, excludedObjects, excludedRoots, instances, overrideMaterial, allowDeformations,
+    lods: allowLod ? lods : null, lodUpdate: lodSource?.update} : null;
   return selection;
 }
 
 export function captureThreeMaterialState(three, root, {overrideMaterial = null, nodeFrame = null,
-  selectionOnly = false, camera = null, exclusions = null, allowInstances = false, allowDeformations = false, maxNodes = 16384, maxMaterials = 16384, maxValues = 1048576} = {}) {
+  selectionOnly = false, camera = null, exclusions = null, allowInstances = false, allowDeformations = false, allowLod = false, lodSource = null, maxNodes = 16384, maxMaterials = 16384, maxValues = 1048576} = {}) {
   if (![maxNodes, maxMaterials, maxValues].every(n => Number.isSafeInteger(n) && n >= 0) || !maxNodes || !maxMaterials)
     fail('LIMIT', 'Invalid material snapshot capacity');
-  if (selectionOnly) return captureSelections(three, root, {camera, overrideMaterial, exclusions, allowInstances, allowDeformations, maxNodes, maxMaterials, maxValues});
+  if (selectionOnly) return captureSelections(three, root, {camera, overrideMaterial, exclusions, allowInstances, allowDeformations, allowLod, lodSource, maxNodes, maxMaterials, maxValues});
   const materials = new Map(), objects = new Map(), seen = new Set(), copies = new WeakMap(), stack = [root];
   const valuePrototypes = new Set(['Color', 'Vector2', 'Vector3', 'Vector4', 'Quaternion', 'Euler', 'Matrix3', 'Matrix4', 'Plane']
     .map(name => three[name]?.prototype).filter(Boolean));

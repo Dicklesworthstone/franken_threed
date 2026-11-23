@@ -38,7 +38,7 @@ import {createThreeRendererTransfers} from './three_renderer_transfers.mjs';
 import {createThreeTimestampQueries} from './three_timestamp_queries.mjs';
 import {createThreeBackendOperations} from './three_backend_operations.mjs';
 import {createThreePassSnapshots, captureThreeArrayCamera, captureThreeCamera, captureThreeBackground, updateThreeCameraProjection} from './three_pass_snapshot.mjs';
-import {captureThreeMaterialState} from './three_material_snapshot.mjs';
+import {captureThreeMaterialState, captureThreeLodSource} from './three_material_snapshot.mjs';
 import {createThreePassInstances} from './three_pass_instances.mjs';
 import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
 import {registerThreePassState, captureThreePassState, finishThreePassState, requiresThreePassCamera, getThreePassExcludedObjects} from './three_pass_state.mjs';
@@ -172,6 +172,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
   if (!Number.isSafeInteger(maxDraws) || maxDraws < 1 || !Number.isSafeInteger(maxBindings) || maxBindings < 1)
     fail('OPTIONS', 'Expected positive draw and binding capacities');
   const {NoToneMapping, SRGBColorSpace} = THREE;
+  // The facade is installed before application code. Eager LOD selection must
+  // retain this source method, not adopt a later global prototype callback.
+  const sourceLod = captureThreeLodSource(THREE);
   const sourceError = THREE.error ?? (message => console.error('THREE.' + message));
   const normalizeNativeShadowMap = renderer => {
     if (!renderer._shaderEncodedOutput && THREE.PCFSoftShadowMap !== undefined &&
@@ -1335,7 +1338,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (passCameraRequired) {
         if (this.shadowMap.enabled || this.sortObjects && (this._opaqueSort || this._transparentSort))
           fail('UNSUPPORTED', 'Pinned pass capture requires a callback-free scene without shadows or custom sorting');
-        requiredMaterialFrame = captureThreeMaterialState(THREE, scene, {camera, overrideMaterial, selectionOnly: true, allowInstances: true, allowDeformations: true,
+        requiredMaterialFrame = captureThreeMaterialState(THREE, scene, {camera, overrideMaterial, selectionOnly: true, allowInstances: true, allowDeformations: true, allowLod: true, lodSource: sourceLod,
           exclusions: getThreePassExcludedObjects(this),
           maxNodes: sceneLimits.maxNodes ?? 16384, maxMaterials: maxBindings,
           maxValues: MAX_MATERIAL_CAPTURE_VALUES - this._materialCaptureValues});
@@ -1485,10 +1488,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           if (materialFrame.instanceFrame) {
             materialFrame.values += materialFrame.instanceFrame.values;
             this._materialCaptureValues += materialFrame.instanceFrame.values;
-            // Animated pass packets already performed the source matrix and
-            // skeleton work at acceptance. Rewalking the live hierarchy while
-            // queued would overwrite later public bone/bind-matrix edits.
-            if (passCameraRequired && materialFrame.instanceFrame.deformations?.size) matricesUpdated = true;
+            // Animated and LOD packets already performed source projection
+            // work at acceptance. Rewalking the live hierarchy while queued
+            // would overwrite later public bone/bind-matrix or topology edits.
+            if (passCameraRequired && (materialFrame.instanceFrame.deformations?.size || materialFrame.instanceFrame.lods?.size)) matricesUpdated = true;
           }
         }
         if (webglSourceCamera && materialFrame?.cameraSafe()) {
@@ -1942,7 +1945,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         if (request.pmremInput?.owner.preparation([request.pmremInput.lease])) return this._defer(request);
         if (request.snapshot?.preparation?.()) return this._defer(request);
         if (captured?.textureOwner?.preparation(captured.textureUses)) return this._defer(request);
-        this._submit(request); this._releaseRequest(request);
+        this._submit(request); request.materialFrame?.instanceFrame?.publishLod(); this._releaseRequest(request);
       }
       catch (error) {
         if (isPrepareBoundary(error) || (error?.code === 'THREE_SCENE_MATERIAL' && !entry.clipping && needsClipping(scene, request.overrideMaterial, request.nodeFrame, request.materialFrame)))
@@ -2091,6 +2094,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // source callback or readback. All destinations share this submission FIFO.
       if (this._pending.length >= maxPendingRenders) fail('LIMIT', 'Too many render operations are waiting for preparation');
       this._pending.push(request);
+      request.materialFrame?.instanceFrame?.publishLod();
       this._startDrain();
     }
     _startDrain() {

@@ -2,6 +2,8 @@ import {createWebGLInstanceHistory} from './webgl_instance_history.mjs';
 import {createThreePassGeometry} from './three_pass_geometry.mjs';
 import {createThreePassSkeletons} from './three_pass_deformation.mjs';
 
+const applyLodUpdate = Reflect.apply;
+
 /** Callback-free object packets for deferred WebGL scene passes.
  * Source objects stay untouched while preparation awaits. Stable private views
  * reuse the ordinary geometry/program owners; each packet installs only its
@@ -68,6 +70,7 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
     }
     if (!candidates.size) return null;
     const refuse = message => { if (required) fail(message); return null; };
+    if (frame.lods?.size && !frame.cameraSafe()) return refuse('Automatic LOD source state changed before pass capture');
     // Attribute uploads precede Skeleton.update in WebGLObjects. Shared palette
     // storage would couple otherwise independent captured inputs to that order.
     const paletteBuffers = new Map(), paletteTextures = new Set();
@@ -114,6 +117,7 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
     if (sources.size + [...frame.instances].filter(object => !sources.has(object)).length > maxMeshes)
       return refuse('Pass instance identity capacity exceeded');
     const hierarchy = new Map(), visibility = new Map(), layers = new Map(), orders = new Map(), selected = new Set(), geometries = new Map();
+    const lodViews = new Map(), levelViews = new Map();
     const stack = [{object: root, visible: true}], objects = new Map(), packets = [], streams = new Set(), shapes = new Map();
     const vp = new three.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const frustum = new three.Frustum().setFromProjectionMatrix(vp, three.WebGLCoordinateSystem, camera.reversedDepth);
@@ -131,9 +135,28 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
     // by captureThreeMaterialState without invoking application accessors.
     while (stack.length) {
       const {object, visible: parentVisible} = stack.pop();
-      if (object.isLOD && object.autoUpdate) return frame.instances.size || deformationObjects.size
+      if (object.isLOD && object.autoUpdate && !frame.lods?.has(object)) return frame.instances.size || deformationObjects.size
         ? refuse('Instanced and deformed pass capture requires an explicit LOD selection') : null;
-      const visible = parentVisible && object.visible !== false && !frame.excludedObjects?.has(object);
+      const sourceVisible = (frame.excludedRoots ?? frame.excludedObjects)?.has(object) ? false : object.visible;
+      const visible = parentVisible && (levelViews.get(object)?.visible ?? sourceVisible) !== false;
+      // Match projectObject: hidden ancestors suppress updates; a layer-masked
+      // LOD skips its own update but still traverses independently layered
+      // children. Run the retained method on private levels before capturing
+      // those children. A later budget/refusal must not publish source effects.
+      if (visible && object.layers.test(camera.layers) && !object.isGroup && object.isLOD && object.autoUpdate) {
+        const levels = object.levels.map(level => {
+          let view = levelViews.get(level.object);
+          if (!view) {
+            view = {visible: frame.excludedRoots?.has(level.object) ? false : level.object.visible};
+            levelViews.set(level.object, view);
+          }
+          return {distance: level.distance, hysteresis: level.hysteresis, object: view};
+        });
+        const view = Object.create(object, {
+          levels: {value: levels}, _currentLevel: {value: object._currentLevel, writable: true},
+        });
+        applyLodUpdate(frame.lodUpdate, view, [camera]); lodViews.set(object, view);
+      }
       hierarchy.set(object, object.children.slice()); visibility.set(object, visible);
       layers.set(object, object.layers.mask); orders.set(object, object.renderOrder);
       for (let i = object.children.length - 1; i >= 0; i--) stack.push({object: object.children[i], visible});
@@ -231,12 +254,26 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
           ? new three.Sphere(new three.Vector3().copy(bounds.boundingSphere.center), bounds.boundingSphere.radius) : null,
         castShadow: source.castShadow, receiveShadow: source.receiveShadow});
     }
+    // Passes initially hide their exclusions, but a source LOD update can
+    // reveal a level again. Keep only exclusions that remain effectively
+    // hidden after the captured preorder, including inherited visibility.
+    if (frame.lods?.size && frame.excludedObjects)
+      frame.excludedObjects = new Set([...frame.excludedObjects].filter(object => visibility.get(object) !== true));
     pendingBytes += bytes;
-    let released = false;
-    return {objects, hierarchy, visibility, layers, orders, geometries, values, bytes, wireframes, deformations, deformationObjects,
+    let released = false, publishedLod = false;
+    return {objects, hierarchy, visibility, layers, orders, geometries, values, bytes, wireframes, deformations, deformationObjects, lods: frame.lods,
       geometryView: source => geometryPackets.get(source)?.view,
       geometrySafe: () => [...geometryPackets.values()].every(packet => packet.safe()),
       deformationSafe: () => [...skeletonPackets.values()].every(packet => packet.safe()),
+      publishLod() {
+        if (released || publishedLod) return;
+        // The renderer calls this only once all request captures and queue
+        // limits succeed. These admitted writable data properties have no
+        // application callbacks, and submission never replays their effects.
+        for (const [source, view] of levelViews) source.visible = view.visible;
+        for (const [source, view] of lodViews) source._currentLevel = view._currentLevel;
+        publishedLod = true;
+      },
       install() {
         if (released) fail('An instanced pass snapshot was released before submission');
         for (const packet of geometryPackets.values()) packet.install();

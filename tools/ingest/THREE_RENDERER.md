@@ -1342,9 +1342,22 @@ skeletons, attached/detached binds, combined skinning/morphs, queued disposal an
 renderer cancellation. The checks use a recording device; rasterized pixel
 equivalence and hardware performance remain unmeasured. Private bone textures
 retire after their final pending use, so later drained batches may need fresh
-residency. Instanced morph textures, automatic LOD, custom deformation hooks,
+residency. Instanced morph textures, custom deformation hooks,
 renderer-uniform overrides and palette aliases into geometry/material inputs
 remain explicit boundaries for this capture profile.
+
+Automatic `LOD` now participates in required pass captures, retaining selected
+instance streams and skinned/morph poses across queued camera changes. The
+retained source update preserves distance, camera zoom, hysteresis, nested
+visibility and the ordering of Outline's temporary exclusions. Selection runs
+on private level views; public visibility and current-level state publish only
+when the request is accepted, and submission does not replay those effects.
+Budget or queue refusals leave public LOD state untouched. Ordinary numeric
+matrices, writable level visibility and direct child levels are required;
+custom LOD callbacks, replaced source math helpers and accessor-backed inputs
+remain outside this capture profile. Source-oracle and recording-device tests
+cover the selection and submitted data; no new pixel or performance claim is
+made for this extension.
 
 The verified `EffectComposer.setSize()` body runs inside the existing target
 owner's resize scope. Queued fullscreen draws retain their sampled target
