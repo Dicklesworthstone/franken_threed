@@ -405,8 +405,9 @@ shared rule also reaches module worker URLs, finite document fetches, Three
 loader resources and finite CommonJS requires.
 
 Resolved static imports can also carry finite primitive strings across module
-boundaries. Named/default exports, explicit reexports and local immutable aliases
-share the ordinary import-map/package resolution and normalized source snapshot:
+boundaries. Named/default exports, explicit reexports, namespace member selections
+and local immutable aliases share the ordinary import-map/package resolution and
+normalized source snapshot:
 
 ```js
 // routes.mjs
@@ -416,6 +417,10 @@ export default './editor.mjs';
 // app.mjs
 import editor, { viewer } from './routes.mjs';
 export const open = preview => import(preview ? viewer : editor);
+
+// Namespace reads and finite key choices use the same export proof.
+import * as routes from './routes.mjs';
+export const openNamed = preview => import(routes[preview ? 'viewer' : 'default']);
 ```
 
 The URL strings still resolve from the importing application module. Module
@@ -425,7 +430,10 @@ consumed import operand receives a mapping; exported strings, initialization
 effects, top-level await, live module identity and early cyclic TDZ errors remain
 source-owned. The analysis inspects at most 128 exact module URLs and 2 MiB of source
 per build pass, with a combined depth of at most 64 local aliases/export hops. It never evaluates
-configuration modules. Namespace selection, star reexports, mutable bindings,
+configuration modules. Namespace aliases and simple object destructuring may
+select proved primitive exports without evaluating configuration code. Runtime
+member/key reads and effects stay intact; a namespace's exported objects are not
+assumed immutable. Unknown keys, star reexports, mutable bindings,
 opaque values, JSON/CommonJS imports and unresolved external modules do not prove
 a finite selector. Ordinary worker graphs share this proof for lazy imports;
 loader/fetch discovery keeps its existing local-selector requirements.

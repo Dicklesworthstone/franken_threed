@@ -708,11 +708,10 @@ test("imported worker selectors use one frontend snapshot and remain part of wor
   }}),{code:'F3D_SOURCE_TRANSFORM'});
 });
 
-test("imported worker selectors keep mutable, namespace and open exports outside relocation", () => {
+test("imported worker selectors keep mutable and open exports outside relocation", () => {
   for(const [imported, config, selected] of [
     ["{entry}","export let entry='./lazy.mjs';",'entry'],
     ["{entry}","export const entry=readFromNetwork();",'entry'],
-    ["* as config","export const entry='./lazy.mjs';",'config.entry'],
     ["{entry}","export * from './actual.mjs';",'entry'],
     ["{entry}","export const table={path:'./lazy.mjs'};export const entry=table.path;",'entry'],
   ]) {

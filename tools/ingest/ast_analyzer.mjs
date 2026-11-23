@@ -266,7 +266,8 @@ export function createDynamicImportClassifier(ast, resolveImportedString = null)
       for (const specifier of node.specifiers) {
         const name = specifier.type === "ImportDefaultSpecifier" ? "default" :
           specifier.type === "ImportSpecifier" ? specifier.imported.name ?? specifier.imported.value : null;
-        const admitted = resolveImportedString && name !== null && !node.attributes?.length;
+        const admitted = resolveImportedString &&
+          (name !== null || specifier.type === "ImportNamespaceSpecifier") && !node.attributes?.length;
         put(ast, [specifier.local.name], admitted ? specifier : null);
         if (admitted) imported.set(specifier, {source: node.source.value, name});
       }
@@ -300,8 +301,48 @@ export function createDynamicImportClassifier(ast, resolveImportedString = null)
     return null;
   };
   const selectRecord = privateStringRecordSelections(nodes, parents, initializerOf, destructured);
+  const namespaceOf = node => {
+    // An actual ESM namespace cannot acquire replacement exports through an
+    // escaped alias. Only its immutable primitive exports are proved below;
+    // ordinary imported objects still require the private-record proof.
+    const seen = new Set();
+    for (let hops = 0; node && hops < 64; hops++) {
+      const binding = imported.get(node);
+      if (binding?.name === null) return {...binding, hops};
+      if (node.type !== "Identifier" || seen.has(node)) return null;
+      seen.add(node);
+      node = initializerOf(node);
+    }
+    return null;
+  };
+  const validImportedCandidates = candidates => Array.isArray(candidates) && candidates.length > 0 &&
+    candidates.length <= 128 && candidates.every(value => typeof value === "string" && value.length <= 65536);
   let depth = 0;
   const resolveReference = node => {
+    if (node.type === "MemberExpression" && !node.optional) {
+      const namespace = namespaceOf(node.object);
+      if (namespace) {
+        if (depth + namespace.hops >= 64) return null;
+        if (selections.has(node)) return selections.get(node);
+        selections.set(node, null);
+        depth++;
+        try {
+          const names = !node.computed && node.property.type === "Identifier" ? [node.property.name]
+            : extractFiniteStringCandidates(node.property, 128, resolveReference);
+          if (!names?.length) return null;
+          const result = new Set();
+          for (const name of names) {
+            const candidates = resolveImportedString(namespace.source, name, depth + namespace.hops);
+            if (!validImportedCandidates(candidates)) return null;
+            for (const candidate of candidates) result.add(candidate);
+            if (result.size > 128) return null;
+          }
+          const candidates = [...result];
+          selections.set(node, candidates);
+          return candidates;
+        } finally { depth--; }
+      }
+    }
     const sources = node.type === "Identifier" ? [initializerOf(node)] : selectRecord(node);
     if (!sources || sources.some(source => !source) || depth >= 64) return null;
     // Reuse the initializer cache for scalar aliases; each selected member has
@@ -312,9 +353,9 @@ export function createDynamicImportClassifier(ast, resolveImportedString = null)
     cache.set(key, null);
     if (imported.has(key)) {
       const {source, name} = imported.get(key);
+      if (name === null) return null;
       const candidates = resolveImportedString(source, name, depth);
-      if (!Array.isArray(candidates) || !candidates.length || candidates.length > 128 ||
-          candidates.some(value => typeof value !== "string" || value.length > 65536)) return null;
+      if (!validImportedCandidates(candidates)) return null;
       cache.set(key, candidates);
       return candidates;
     }

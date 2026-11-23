@@ -35,14 +35,49 @@ test('imported immutable primitive strings follow explicit exports and reexports
   assert.equal(reads.length, 3, 'each exact source URL is inspected once');
 });
 
-test('mutable, namespace, opaque, star, JSON and cyclic selector exports stay unresolved', () => {
+test('namespace selectors follow immutable exports, aliases, destructuring and finite keys', () => {
+  const files = {
+    'config.mjs': `export const first=(observe(),'./a.mjs'); export const second='./b.mjs';
+      export default './default.mjs'; export const key='first';`,
+    'relay.mjs': `export {first as entry, second, default, key} from './config.mjs';`,
+    'selected.mjs': `import * as paths from './relay.mjs'; export const entry=paths.entry;`,
+  };
+  const {sites, reads} = analyze(`import * as paths from './relay.mjs';
+    import * as selected from './selected.mjs'; const alias=paths; const {entry: picked}=alias;
+    import(paths.entry); import(alias['default']); import(picked);
+    import(paths[(observe(),choose()?'entry':'second')]);
+    import(selected.entry); import(paths);`, files);
+  assert.deepEqual(sites.map(site => site.candidates), [
+    ['./a.mjs'], ['./default.mjs'], ['./a.mjs'], ['./a.mjs', './b.mjs'], ['./a.mjs'], undefined,
+  ]);
+  assert.equal(reads.length, 3, 'namespace reads reuse the same resolved source snapshots');
+});
+
+test('namespace proof respects shadowing, live mutable exports and opaque member selection', () => {
+  const source = `import * as paths from './config.mjs';
+    import(paths.mutable); import(paths.object.entry); import(paths[choose()]); import(paths.missing);
+    let alias=paths; import(alias.entry);
+    function parameter(paths){return import(paths.entry);}
+    function local(){import(paths.entry); const paths={entry:'./unproved.mjs'}; expose(paths);}
+    import(paths['entry']);`;
+  const {sites} = analyze(source, {'config.mjs':
+    `export const entry='./a.mjs'; export let mutable='./mutable.mjs'; export const object={entry:'./object.mjs'};`});
+  assert.deepEqual(sites.map(site => site.classification), [
+    'nonliteral', 'nonliteral', 'nonliteral', 'nonliteral', 'nonliteral', 'nonliteral', 'nonliteral', 'finite_set',
+  ]);
+  assert.deepEqual(sites.at(-1).candidates, ['./a.mjs']);
+});
+
+test('mutable, opaque, star, JSON and cyclic selector exports stay unresolved', () => {
   const cases = [
     [`import {entry} from './config.mjs'; import(entry);`, `export let entry='./a.mjs';`],
     [`import {entry} from './config.mjs'; import(entry);`, `let value='./a.mjs'; export {value as entry};`],
     [`import entry from './config.mjs'; import(entry);`, `let value='./a.mjs'; export default value;`],
     [`import {entry} from './config.mjs'; import(entry);`, `export const entry=plugin();`],
     [`import {entry} from './config.mjs'; import(entry);`, `export const entry={get path(){return './a.mjs'}}.path;`],
-    [`import * as config from './config.mjs'; import(config.entry);`, `export const entry='./a.mjs';`],
+    [`import * as config from './config.mjs'; import(config.entry);`, `export let entry='./a.mjs';`],
+    [`import * as config from './config.mjs'; import(config.entry);`, `export * from './other.mjs';`],
+    [`import * as config from './config.mjs' with {type:'json'}; import(config.default);`, `export default './a.mjs';`],
     [`import {entry} from './config.mjs'; import(entry);`, `export * from './other.mjs';`],
     [`import {entry} from './config.mjs'; import(entry);`, `export {entry} from './other.mjs';`],
     [`import entry from './config.mjs' with {type:'json'}; import(entry);`, `export default './a.mjs';`],
@@ -68,6 +103,15 @@ test('cross-module string analysis keeps recursion, module count and source byte
     `export const entry=a49;`]));
   assert.equal(analyze(`import {entry} from './c0.mjs'; import(entry);`, deep).sites[0].classification,
     'nonliteral', 'alias depth and module depth cannot multiply into a host stack overflow');
+  const namespaces = Object.fromEntries(Array.from({length: 60}, (_, index) => [`n${index}.mjs`,
+    index === 59 ? `export const entry='./a.mjs';` : `import * as paths from './n${index + 1}.mjs';` +
+      Array.from({length: 50}, (_, alias) => `const a${alias}=${alias ? 'a' + (alias - 1) : 'paths'};`).join('') +
+      `export const entry=a49.entry;`]));
+  assert.equal(analyze(`import * as paths from './n0.mjs'; import(paths.entry);`, namespaces).sites[0].classification,
+    'nonliteral', 'namespace aliases share the cross-module depth budget');
+  assert.equal(analyze(`import * as paths from './cycle.mjs'; import(paths.entry);`, {
+    'cycle.mjs': `import * as paths from './cycle.mjs'; export const entry=paths.entry;`,
+  }).sites[0].classification, 'nonliteral');
   assert.equal(analyze(`import {entry} from './large.mjs'; import(entry);`, {
     'large.mjs': `/*${' '.repeat(2 * 1024 * 1024)}*/ export const entry='./a.mjs';`,
   }).sites[0].classification, 'nonliteral');
@@ -139,4 +183,38 @@ test('graph import-map scope and frontend snapshots determine the selector sourc
   assert.equal(graph.summary.unresolved_dynamic_imports, 0);
   assert.ok(graph.modules[pathToFileURL(path.join(source, 'nested/lazy.mjs')).href]);
   assert.equal(visits.get(pathToFileURL(path.join(source, 'right.mjs')).href), 1);
+});
+
+test('namespace-selected application modules relocate with source effects, identity and errors intact', async () => {
+  const {root, source} = fixture({
+    'index.html': '<script type="module" src="app.mjs"></script>',
+    'app.mjs': `import * as routes from './relay.mjs'; import {log} from './config.mjs';
+      const alias=routes; const {entry}=alias;
+      export async function run(){const initial=log.slice();
+        const a=await import((log.push('select:first'),routes.entry));
+        const again=await import(entry), variant=await import(alias['variant']);
+        const load=flag=>import(routes[(log.push('key:'+flag),flag?'entry':'alternate')]);
+        const first=await load(true), second=await load(false);
+        function mutate(target){target.entry='./missing.mjs';}
+        let mutationError; try { mutate(routes); } catch(error){mutationError=error.name;}
+        a.bump(); return {initial,same:a===again&&a===first,different:a!==variant,
+          values:[a.value,second.value,variant.value],mutationError,log:log.slice()};}`,
+    'relay.mjs': `export {entry, default as alternate, variant} from './config.mjs';`,
+    'config.mjs': `export const log=[]; export const entry=(log.push('config'),'./a.mjs');
+      export default './b.mjs'; export const variant='./a.mjs?variant#view';`,
+    'a.mjs': `export let value=7; export const bump=()=>++value;`,
+    'b.mjs': `export const value=42;`,
+  });
+  const entry = path.join(source, 'index.html'), graph = await buildModuleGraph(entry);
+  assert.equal(graph.summary.unresolved_dynamic_imports, 0);
+  const app = graph.modules[pathToFileURL(path.join(source, 'app.mjs')).href];
+  assert.deepEqual(app.dynamic_imports.at(-1).candidates, ['./a.mjs', './b.mjs']);
+  const expected = await (await import(pathToFileURL(path.join(source, 'app.mjs')).href)).run();
+  const built = await buildApplication(entry, path.join(root, 'output'));
+  fs.renameSync(source, path.join(root, 'source-unavailable'));
+  const moved = path.join(root, 'relocated'); fs.renameSync(built.outDir, moved);
+  const actual = await (await import(pathToFileURL(path.join(moved, built.entryFiles[0])).href)).run();
+  assert.deepEqual(actual, expected);
+  assert.deepEqual(actual.values, [8, 42, 7]);
+  assert.equal(actual.mutationError, 'TypeError');
 });
