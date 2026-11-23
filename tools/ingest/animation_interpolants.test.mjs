@@ -11,32 +11,40 @@ import {buildApplication} from './build_application.mjs';
 import * as reference from '../../upstream/three.js/build/three.core.js';
 
 const upstream=fileURLToPath(new URL('../../upstream/three.js/',import.meta.url));
-const names=['LinearInterpolant','CubicInterpolant','BezierInterpolant'];
+const quaternionName='QuaternionLinearInterpolant';
+const names=['LinearInterpolant','CubicInterpolant','BezierInterpolant',quaternionName];
 const exports={...Object.fromEntries(names.map(name=>[name,'math/interpolants/'+name+'.js'])),
   AnimationMixer:'animation/AnimationMixer.js',AnimationClip:'animation/AnimationClip.js',
   VectorKeyframeTrack:'animation/tracks/VectorKeyframeTrack.js',NumberKeyframeTrack:'animation/tracks/NumberKeyframeTrack.js',
-  Object3D:'core/Object3D.js'};
+  QuaternionKeyframeTrack:'animation/tracks/QuaternionKeyframeTrack.js',Quaternion:'math/Quaternion.js',Object3D:'core/Object3D.js'};
 const constants=['InterpolateLinear','InterpolateSmooth','InterpolateBezier','LoopOnce','LoopRepeat','LoopPingPong',
   'AdditiveAnimationBlendMode','ZeroSlopeEnding','ZeroCurvatureEnding','WrapAroundEnding'];
-async function fixture(core=false,options={}) {
-  const entry='\0animation-interpolants-fixture',plugin=marchingCubesRollupPlugin(options);
+async function fixture(core=false,options={},hooks={}) {
+  const entry='\0animation-interpolants-fixture',plugin=hooks.specialized===false?null:marchingCubesRollupPlugin(options);
+  const quaternionPath=path.join(upstream,'src/math/Quaternion.js');
   const source=(core?`export {${[...Object.keys(exports),...constants]}} from ${JSON.stringify(path.join(upstream,'build/three.core.js'))};`:
     Object.entries(exports).map(([name,file])=>`export {${name}} from ${JSON.stringify(path.join(upstream,'src',file))};`).join('\n')+
     `export {${constants}} from ${JSON.stringify(path.join(upstream,'src/constants.js'))};`)+
-    `export {animationInterpolantDiagnostics as diagnostics} from ${JSON.stringify('\0f3d-animation-interpolants-adapter')};`;
-  const bundle=await rollup({input:entry,plugins:[{name:'interpolation-fixture',resolveId:id=>id===entry?id:null,
-    load:id=>id===entry?source:null},plugin]});
+    (plugin?`export {animationInterpolantDiagnostics as diagnostics} from ${JSON.stringify('\0f3d-animation-interpolants-adapter')};`:'');
+  const bundle=await rollup({input:entry,plugins:[{name:'interpolation-fixture',resolveId(id) {
+    if(id===entry)return id;
+    return hooks.quaternionFile && path.basename(id)==='Quaternion.js'?hooks.quaternionFile:null;
+  },load(id){return id===entry?source:id===quaternionPath?hooks.quaternionSource??null:null;}},...(plugin?[plugin]:[])]});
   try {
     const {output}=await bundle.generate({format:'es'}),code=output[0].code;
     return {api:await import('data:text/javascript;base64,'+Buffer.from(code).toString('base64')),code,
-      report:plugin.api.getAnimationInterpolantsReport(),core};
+      report:plugin?.api.getAnimationInterpolantsReport(),core};
   }finally{await bundle.close();}
 }
 let fixtures;
 before(async()=>{fixtures=[await fixture(),await fixture(true)];});
 const bytes=view=>new Uint8Array(view.buffer,view.byteOffset,view.byteLength);
-function interpolant(api,name,{Type=Float32Array,Output=Float64Array,stride=3}={}) {
+function interpolant(api,name,{Type=Float32Array,Output=Float64Array,stride=name===quaternionName?4:3}={}) {
   const times=new Float32Array([0,.25,1,2]),values=new Type(Array.from({length:stride*4},(_,i)=>Math.sin(i*.7)*3));
+  if(name===quaternionName)for(let key=0;key<4;key++)for(let lane=0;lane<stride;lane+=4) {
+    const angle=(key+lane*.3)*.7;
+    values.set([0,Math.sin(angle),0,Math.cos(angle)],key*stride+lane);
+  }
   const value=new api[name](times,values,stride,new Output(stride+2).fill(71));
   if(name==='BezierInterpolant') {
     value.inTangents=new Type(stride*8);value.outTangents=new Float64Array(stride*8);
@@ -62,7 +70,7 @@ test('exact source/core interpolation bodies compile while edited sources retain
     assert.equal(specializeAnimationInterpolants(source+'\n// modified').changed,false);
   }
   for(const {api,report,core}of fixtures) {
-    assert.equal(report.compiledModules,core?1:3);assert.equal(report.accelerationClaim,false);
+    assert.equal(report.compiledModules,core?1:4);assert.equal(report.accelerationClaim,false);
     assert.deepEqual(report.modules.flatMap(m=>m.compiledMethods).sort(),names.map(name=>name+'.interpolate_').sort());
     assert.ok(report.modules.every(m=>m.sourceDerived && m.wasmBytes>0));
     for(const name of names) {assert.equal(api[name].prototype.interpolate_.name,'interpolate_');assert.equal(api[name].prototype.interpolate_.length,4);}
@@ -86,6 +94,126 @@ test('source interval caches, ending modes, typed output and live track/tangent 
       }
       compare(a,b,.19);assert.ok(api.diagnostics(api[name]).wasmCalls>previous,name);
     }
+});
+
+test('quaternion sign correction, angle thresholds, extrapolation and typed stores preserve source bytes',()=>{
+  const pairs=[
+    [[0,0,0,1],[0,0,0,1]],
+    [[0,.6,0,.8],[-0,-.6,-0,-.8]],
+    [[0,0,0,1],[0,Math.sin(.01),0,Math.cos(.01)]],
+    [[0,0,0,1],[0,Math.sqrt(1-.9995*.9995),0,.9995]],
+    [[Math.sin(.6),0,0,Math.cos(.6)],[0,Math.sin(1.2),0,Math.cos(1.2)]],
+    [[0,-0,0,1],[-0,0,-0,1]],
+    [[3,0,0,4],[2,0,0,5]],
+  ];
+  for(const {api}of fixtures)for(const Type of [Float32Array,Float64Array])
+    for(const Output of [Float32Array,Float64Array,Int8Array,Uint8Array,Uint8ClampedArray,Int16Array,Uint16Array,Int32Array,Uint32Array])
+      for(const pair of pairs) {
+        const make=library=>new library[quaternionName](new Float64Array([0,1]),new Type(pair.flat()),4,new Output(7).fill(71));
+        const a=make(api),b=make(reference),before=api.diagnostics(api[quaternionName]).wasmCalls;
+        for(const time of [-.35,0,.13,.5,1,1.75]) {
+          assert.equal(a.interpolate_(1,0,time,1),a.resultBuffer);b.interpolate_(1,0,time,1);
+          assert.deepEqual(bytes(a.resultBuffer),bytes(b.resultBuffer));
+        }
+        assert.equal(api.diagnostics(api[quaternionName]).wasmCalls-before,6);
+      }
+});
+
+test('multi-quaternion strides retain repeated offset-zero stores and untouched subview tails',()=>{
+  for(const {api}of fixtures)for(const stride of [0,4,8,12])for(const Output of [Float32Array,Float64Array,Int16Array]) {
+    const make=library=>{
+      const value=interpolant(library,quaternionName,{stride,Output});
+      if(stride===0)value.sampleValues=new Float32Array([1]);
+      const storage=new Output(18).fill(71),result=storage.subarray(3,15);
+      // An untouched NaN payload must not refuse the finite active result.
+      if(Output===Float64Array)new DataView(storage.buffer).setBigUint64(9*8,0x7ff8000000000042n,true);
+      value.resultBuffer=result;return {value,storage};
+    };
+    const a=make(api),b=make(reference),before=api.diagnostics(api[quaternionName]).wasmCalls;
+    a.value.interpolate_(1,0,.13,.25);b.value.interpolate_(1,0,.13,.25);
+    assert.deepEqual(bytes(a.storage),bytes(b.storage));assert.equal(api.diagnostics(api[quaternionName]).wasmCalls-before,1);
+    if(stride>4) {
+      a.value.resultBuffer=a.value.resultBuffer.subarray(0,4);b.value.resultBuffer=b.value.resultBuffer.subarray(0,4);
+      a.value.interpolate_(1,0,.19,.25);b.value.interpolate_(1,0,.19,.25);
+      assert.deepEqual(bytes(a.storage),bytes(b.storage));assert.equal(api.diagnostics(api[quaternionName]).wasmCalls-before,2);
+    }
+  }
+});
+
+test('overlapping quaternion results retain recurrence across later quaternions in the same sample',()=>{
+  for(const {api}of fixtures)for(const mixed of [false,true]) {
+    const make=library=>{
+      const value=interpolant(library,quaternionName,{stride:8});
+      value.resultBuffer=mixed?new Float64Array(value.sampleValues.buffer,16,8):value.sampleValues.subarray(4,12);
+      return value;
+    };
+    const a=make(api),b=make(reference),before=api.diagnostics(api[quaternionName]);
+    a.interpolate_(1,0,.13,.25);b.interpolate_(1,0,.13,.25);
+    assert.deepEqual(bytes(a.sampleValues),bytes(b.sampleValues));assert.deepEqual(bytes(a.resultBuffer),bytes(b.resultBuffer));
+    assert.equal(api.diagnostics(api[quaternionName]).wasmCalls,before.wasmCalls);
+    assert.equal(api.diagnostics(api[quaternionName]).fallbackCalls,before.fallbackCalls+1);
+  }
+});
+
+test('quaternion helper replacements, getters and abrupt second calls retain original partial publication',()=>{
+  for(const {api}of fixtures)for(const mode of ['replacement','getter','throw']) {
+    const a=interpolant(api,quaternionName,{stride:8}),b=interpolant(reference,quaternionName,{stride:8}),logs=[[],[]];
+    const originals=[api,reference].map(owner=>Object.getOwnPropertyDescriptor(owner.Quaternion,'slerpFlat'));
+    const before=api.diagnostics(api[quaternionName]);
+    try {
+      for(const [index,owner]of [api,reference].entries()) {
+        const method=function(...args){
+          logs[index].push([args[1],args[3],args[5],args[6]]);
+          if(mode==='throw'&&logs[index].length===2)throw new Error('second quaternion');
+          return Reflect.apply(originals[index].value,this,args);
+        };
+        Object.defineProperty(owner.Quaternion,'slerpFlat',mode==='getter'?{configurable:true,get(){logs[index].push('get');return method;}}:
+          {...originals[index],value:method});
+      }
+      if(mode==='throw') {
+        assert.throws(()=>a.interpolate_(1,0,.13,.25),/second quaternion/);
+        assert.throws(()=>b.interpolate_(1,0,.13,.25),/second quaternion/);
+      }else {a.interpolate_(1,0,.13,.25);b.interpolate_(1,0,.13,.25);}
+    }finally{for(const [index,owner]of [api,reference].entries())Object.defineProperty(owner.Quaternion,'slerpFlat',originals[index]);}
+    assert.deepEqual(logs[0],logs[1]);assert.deepEqual(bytes(a.resultBuffer),bytes(b.resultBuffer));
+    assert.equal(api.diagnostics(api[quaternionName]).wasmCalls,before.wasmCalls);
+    assert.equal(api.diagnostics(api[quaternionName]).fallbackCalls,before.fallbackCalls+1);
+  }
+});
+
+test('quaternion native and global Math getters preserve source callback counts and order',()=>{
+  for(const {api}of fixtures)for(const name of ['acos','sin','sqrt','Math']) {
+    const a=interpolant(api,quaternionName),b=interpolant(reference,quaternionName),logs=[[],[]];
+    if(name==='sqrt')for(const value of [a,b])value.sampleValues.set([0,0,0,1,0,Math.sin(.01),0,Math.cos(.01)]);
+    const owner=name==='Math'?globalThis:Math,original=Object.getOwnPropertyDescriptor(owner,name);
+    const before=api.diagnostics(api[quaternionName]);let current=0;
+    try {
+      Object.defineProperty(owner,name,{configurable:true,get(){logs[current].push(name);return original.value;}});
+      a.interpolate_(1,0,.13,.25);current=1;b.interpolate_(1,0,.13,.25);
+    }finally{Object.defineProperty(owner,name,original);}
+    assert.ok(logs[0].length>0);assert.deepEqual(logs[0],logs[1]);assert.deepEqual(bytes(a.resultBuffer),bytes(b.resultBuffer));
+    assert.equal(api.diagnostics(api[quaternionName]).wasmCalls,before.wasmCalls);
+    assert.equal(api.diagnostics(api[quaternionName]).fallbackCalls,before.fallbackCalls+1);
+  }
+});
+
+test('changed quaternion source and frontend helper loading retain the actual imported arithmetic',async()=>{
+  const original=fs.readFileSync(path.join(upstream,'src/math/Quaternion.js'),'utf8');
+  const modified=original.replace('dst[ dstOffset ] = x0;','dst[ dstOffset ] = x0 + 0.125;');
+  const source=fs.readFileSync(path.join(upstream,'src/math/interpolants/QuaternionLinearInterpolant.js'),'utf8');
+  assert.equal(specializeAnimationInterpolants(source).changed,false);
+  assert.equal(specializeAnimationInterpolants(source,{quaternionSource:modified}).changed,false);
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'f3d-quaternion-interpolant-')),quaternionFile=path.join(root,'Quaternion.js');
+  fs.writeFileSync(quaternionFile,modified.replace("'./MathUtils.js'",JSON.stringify(path.join(upstream,'src/math/MathUtils.js')))
+    .replace("'../utils.js'",JSON.stringify(path.join(upstream,'src/utils.js'))));
+  for(const hooks of [{quaternionSource:modified},{quaternionFile}]) {
+    const {api,report}=await fixture(false,{},hooks),{api:oracle}=await fixture(false,{},{...hooks,specialized:false});
+    const a=interpolant(api,quaternionName,{stride:8}),b=interpolant(oracle,quaternionName,{stride:8});
+    compare(a,b,.13);assert.notEqual(a.resultBuffer[0],0);
+    assert.equal(api.diagnostics(api[quaternionName]).wasmCalls,0);
+    assert.equal(api.diagnostics(api[quaternionName]).fallbackCalls,hooks.quaternionSource?1:0);
+    assert.equal(report.modules.some(value=>value.role===quaternionName),!!hooks.quaternionSource);
+  }
 });
 
 test('property prefixes and proxy receivers preserve original observation order without duplicate reads',()=>{
@@ -174,6 +302,8 @@ function scene(api,stopOnLoop) {
     bezier.settings={inTangents:new Float32Array([-.1,.1,.3,.9,.9,.4]),outTangents:new Float32Array([.1,.6,.6,.5,1.1,0])};
     return new api.AnimationClip(name,1,[new api.VectorKeyframeTrack('.position',[0,.4,1],[0,0,0,2*scale,1,-1,-scale,2,3]),
       new api.VectorKeyframeTrack('.scale',[0,.4,1],[1,1,1,1.1,1.3,.7,.9,1.4,1.2],api.InterpolateSmooth),
+      new api.QuaternionKeyframeTrack('.quaternion',[0,.4,1],[0,0,0,1,0,Math.sin(scale*.3),0,Math.cos(scale*.3),
+        0,Math.sin(scale*.7),0,Math.cos(scale*.7)]),
       new api.NumberKeyframeTrack('.morphTargetInfluences',[0,1],[0,.2,.3,.4,1,.8,.4,.1]),bezier],blend);
   };
   const mixer=new api.AnimationMixer(root),actions=[clip('base',1),clip('overlay',-.7),clip('additive',.2,api.AdditiveAnimationBlendMode)]
@@ -189,10 +319,10 @@ function scene(api,stopOnLoop) {
   });
   return {root,mixer,actions,trace};
 }
-const snapshot=s=>({position:s.root.position.toArray(),scale:s.root.scale.toArray(),opacity:s.root.opacity,
+const snapshot=s=>({position:s.root.position.toArray(),scale:s.root.scale.toArray(),quaternion:s.root.quaternion.toArray(),opacity:s.root.opacity,
   morph:s.root.morphTargetInfluences,time:s.mixer.time,active:s.mixer._nActiveActions,trace:s.trace,
   actions:s.actions.map(a=>[a.time,a.enabled,a.paused,a.getEffectiveWeight(),a.getEffectiveTimeScale(),a._loopCount])});
-test('real mixers retain blended vector/morph/Bezier tracks, bindings, control changes and event effects',()=>{
+test('real mixers retain blended vector/quaternion/morph/Bezier tracks, bindings, control changes and event effects',()=>{
   for(const {api}of fixtures)for(const stop of [false,true]) {
     const a=scene(api,stop),b=scene(reference,stop),before=names.map(name=>api.diagnostics(api[name]).wasmCalls);
     for(const [i,dt]of [.1,.2,.3,.5,.15,.8,.6,.7,-.2].entries()) {
@@ -216,7 +346,8 @@ test('native budgets cover active samples; iteration failure resumes the source 
   }
   const {api}=await fixture(false,{maxIterations:1});
   for(const name of names) {
-    const a=interpolant(api,name),b=interpolant(reference,name);compare(a,b,.13);
+    const options=name===quaternionName?{stride:8}:{};
+    const a=interpolant(api,name,options),b=interpolant(reference,name,options);compare(a,b,.13);
     assert.equal(api.diagnostics(api[name]).wasmCalls,0);assert.equal(api.diagnostics(api[name]).fallbackCalls,1);
   }
 });

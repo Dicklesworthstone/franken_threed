@@ -23,6 +23,7 @@ async function fixture(core) {
     Object.entries(exports).map(([name,file])=>'export {'+name+'} from '+JSON.stringify(path.join(upstream,'src',file))+';').join('\n')+
       'export {'+constants.join(',')+'} from '+JSON.stringify(path.join(upstream,'src/constants.js'))+';')+
     'export {quaternionFlatDiagnostics as diagnostics} from '+JSON.stringify('\0f3d-quaternion-flat-adapter')+';'+
+    'export {animationInterpolantDiagnostics as interpolationDiagnostics} from '+JSON.stringify('\0f3d-animation-interpolants-adapter')+';'+
     'export {propertyMixerDiagnostics} from '+JSON.stringify('\0f3d-property-mixer-adapter')+';';
   const bundle=await rollup({input:entry,plugins:[{name:'quaternion-flat-fixture',
     resolveId(id){return id===entry?id:null;},load(id){return id===entry?source:null;}},plugin]});
@@ -35,9 +36,10 @@ async function fixture(core) {
 let fixtures;
 before(async()=>{fixtures=await Promise.all([fixture(false),fixture(true)]);});
 const observed=api=>api.diagnostics(api.Quaternion);
+const observedInterpolation=api=>api.interpolationDiagnostics(api.QuaternionLinearInterpolant);
 const vector=angle=>[0,Math.sin(angle/2),0,Math.cos(angle/2)];
 
-test('real quaternion track loop refusal is covered by source/core pinned static-method lowering',()=>{
+test('pinned flat-quaternion methods lower alongside whole-track interpolation',()=>{
   const interpolant=fs.readFileSync(path.join(upstream,'src/math/interpolants/QuaternionLinearInterpolant.js'),'utf8');
   const generic=specializeNumericModule(interpolant,{loopIslands:true});
   assert.equal(generic.changed,false);
@@ -104,14 +106,14 @@ test('ordinary QuaternionLinearInterpolant keeps cache/output identity through s
     const make=Type=>new Type(new Float32Array([0,0.3,1.2,2]),new Float32Array([
       ...vector(0),...vector(0.9),...vector(-1.2),...vector(2.3)]),4,new Float64Array(4));
     const actual=make(api.QuaternionLinearInterpolant),expected=make(reference.QuaternionLinearInterpolant);
-    const result=actual.resultBuffer,before=observed(api).slerpFlat.wasmCalls;
+    const result=actual.resultBuffer,before=observedInterpolation(api).wasmCalls;
     for(const time of [-1,0,0.1,0.29,0.3,0.8,1.7,2,4,1.7,0.2,0.2]) {
       assert.equal(actual.evaluate(time),result);expected.evaluate(time);
       assert.deepEqual(result,expected.resultBuffer);assert.equal(actual._cachedIndex,expected._cachedIndex);
     }
     actual.sampleValues.set(vector(-0.4),4);expected.sampleValues.set(vector(-0.4),4);
     actual.evaluate(0.2);expected.evaluate(0.2);assert.deepEqual(result,expected.resultBuffer);
-    assert.ok(observed(api).slerpFlat.wasmCalls>before);
+    assert.ok(observedInterpolation(api).wasmCalls>before);
   }
 });
 
@@ -147,7 +149,7 @@ function snapshot(value) {
 test('real mixers retain synchronous bindings, crossfade/additive accumulation and action/event order',()=>{
   for(const {api}of fixtures)for(const eventMutation of [false,true]) {
     const actual=scene(api,{events:eventMutation}),expected=scene(reference,{events:eventMutation});
-    const before=observed(api),beforeProperty=api.propertyMixerDiagnostics(api.PropertyMixer);
+    const before=observedInterpolation(api),beforeProperty=api.propertyMixerDiagnostics(api.PropertyMixer);
     const steps=[0.1,0.2,0.3,0.5,0.15,0.8,0.6,0.7,-0.2];
     for(let i=0;i<steps.length;i++) {
       if(i===2)for(const value of [actual,expected])value.actions[0].crossFadeTo(value.actions[1],0.3,true);
@@ -158,7 +160,7 @@ test('real mixers retain synchronous bindings, crossfade/additive accumulation a
     assert.ok(actual.trace.some(event=>event[0]==='loop'));
     assert.ok(actual.trace.some(event=>event[0]==='finished'));
     assert.ok(actual.trace.some(event=>event[0]==='binding'));
-    const after=observed(api);assert.ok(after.slerpFlat.wasmCalls>before.slerpFlat.wasmCalls);
+    assert.ok(observedInterpolation(api).wasmCalls>before.wasmCalls);
     assert.ok(api.propertyMixerDiagnostics(api.PropertyMixer).quaternionCalls>beforeProperty.quaternionCalls);
   }
 });

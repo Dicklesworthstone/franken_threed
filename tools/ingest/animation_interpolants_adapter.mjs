@@ -4,6 +4,7 @@
  */
 import {instantiateNumericKernel,numericArrayIterationIntact} from './numeric_kernel_runtime.mjs';
 import {matrixNumericPlatformIntact} from './matrix_multiply_adapter.mjs';
+import {quaternionFlatMethodsIntact} from './quaternion_flat_adapter.mjs';
 const host=globalThis,apply=Reflect.apply,descriptor=Object.getOwnPropertyDescriptor,prototype=Object.getPrototypeOf;
 const hasOwn=Object.hasOwn,freeze=Object.freeze,integer=Number.isSafeInteger;
 const get=WeakMap.prototype.get,set=WeakMap.prototype.set,F64=Float64Array,U8=Uint8Array;
@@ -21,12 +22,15 @@ const math=data(host,'Math'),mathMethods=['abs','min','max'].map(name=>[name,dat
 const nativeMath=mathMethods.every(([name,method])=>native(method,name));
 const stats=()=>({wasmCalls:0,fallbackCalls:0,lastFailure:null});
 
-export function createAnimationInterpolantDispatch(Class,mode,base64,resolveMath,maxMemoryBytes) {
-  const token=freeze({}),record={mode,base64,resolveMath,maxMemoryBytes,attempted:false,kernel:null,statistics:stats()};
+export function createAnimationInterpolantDispatch(Class,mode,base64,resolveMath,maxMemoryBytes,Quaternion=null) {
+  const token=freeze({}),record={mode,base64,resolveMath,maxMemoryBytes,Quaternion,attempted:false,kernel:null,statistics:stats()};
   apply(set,records,[token,record]);apply(set,classes,[Class,record]);return token;
 }
 function platform(record) {
   if(!nativeWasm || !numericArrayIterationIntact() || !matrixNumericPlatformIntact())return false;
+  // Inlining a pinned helper never authorizes bypassing an application override
+  // or getter on the actual Quaternion binding used by the source interpolant.
+  if(record.mode==='quaternion' && !quaternionFlatMethodsIntact(record.Quaternion))return false;
   if(record.mode!=='bezier')return true;
   if(!nativeMath || data(host,'Math')!==math)return false;
   for(const [name,method]of mathMethods)if(data(math,name)!==method)return false;
@@ -47,12 +51,16 @@ const span=(input,start,size)=>typeof start==='number' && integer(start) && star
 const overlaps=(a,b)=>a.backing===b.backing && a.offset<b.offset+b.bytes && b.offset<a.offset+a.bytes;
 function inputs(record,result,values,stride,args) {
   if(typeof stride!=='number' || !integer(stride) || stride<0 || stride>record.maxMemoryBytes/80)return null;
+  if(record.mode==='quaternion' && stride%4!==0)return null;
+  // The pinned quaternion loop always writes offset zero. A wider sample size
+  // repeats those four stores and leaves the rest of the result untouched.
+  const written=record.mode==='quaternion' && stride>0?4:stride;
   const target=storage(result,true),samples=storage(values);
-  if(!target || !samples || target.count<stride || overlaps(target,samples))return null;
+  if(!target || !samples || target.count<written || overlaps(target,samples))return null;
   const mode=record.mode;
   for(let i=0;i<args.length;i++)if(!(mode==='bezier' && (i===2 || i===3)) && typeof args[i]!=='number')return null;
   let offsets,tangents=null;
-  if(mode==='linear')offsets=[(args[0]-1)*stride,args[0]*stride];
+  if(mode==='linear'||mode==='quaternion')offsets=[(args[0]-1)*stride,args[0]*stride];
   else if(mode==='gltfCubicSpline') {
     const current=args[0]*(stride*3);
     // Previous value/outgoing tangent and current incoming tangent/value are
@@ -69,7 +77,7 @@ function inputs(record,result,values,stride,args) {
     tangents={incoming,outgoing,current,previous};
   }
   for(const offset of offsets)if(!span(samples,offset,stride))return null;
-  return {target,samples,offsets,tangents};
+  return {target,samples,offsets,tangents,written};
 }
 function kernel(record) {
   if(!record.attempted) {
@@ -94,14 +102,15 @@ export function tryAnimationInterpolant(token,result,values,stride,...args) {
   if(!platform(record) || !(input=inputs(record,result,values,stride,args)))return fallback('INTERPOLATION_STORAGE');
   let output;
   try {
-    output=new F64(stride);
+    output=new F64(input.written);
     // Leave the first glTF incoming-tangent slot empty to preserve the exact
     // source offset expressions at normalized keyframe index 1.
     const first=record.mode==='gltfCubicSpline'?1:0;
     const packed=new F64((input.offsets.length+first)*stride);
     for(let key=0;key<input.offsets.length;key++)for(let i=0;i<stride;i++)
       packed[(key+first)*stride+i]=values[input.offsets[key]+i];
-    if(record.mode==='linear'||record.mode==='gltfCubicSpline')runtime.run(output,packed,stride,1,args[1],args[2],args[3]);
+    if(record.mode==='linear'||record.mode==='quaternion'||record.mode==='gltfCubicSpline')
+      runtime.run(output,packed,stride,1,args[1],args[2],args[3]);
     else if(record.mode==='cubic')runtime.run(output,packed,stride,2*stride,stride,0,3*stride,...args.slice(4));
     else {
       const incoming=new F64(4*stride),outgoing=new F64(2*stride),t=input.tangents;
@@ -112,8 +121,8 @@ export function tryAnimationInterpolant(token,result,values,stride,...args) {
     }
   }catch{return fallback(runtime.diagnostics.lastGuardFailure??'INTERPOLATION_EXECUTION');}
   // Different engine NaN payloads must not escape through a typed-buffer alias.
-  for(let i=0;i<stride;i++)if(output[i]!==output[i])return fallback('INTERPOLATION_NAN');
-  for(let i=0;i<stride;i++)result[i]=output[i];
+  for(let i=0;i<input.written;i++)if(output[i]!==output[i])return fallback('INTERPOLATION_NAN');
+  for(let i=0;i<input.written;i++)result[i]=output[i];
   current.wasmCalls++;current.lastFailure=null;return true;
 }
 export function animationInterpolantDiagnostics(Class) {

@@ -4,23 +4,33 @@
 import {createHash} from 'node:crypto';
 import * as acorn from 'acorn';
 import {sourceBlob} from './marching_cubes_specialization.mjs';
-import {normalMethod} from './geometry_normals_compile.mjs';
+import {normalClasses,normalMethod} from './geometry_normals_compile.mjs';
 import {compileNumericKernel} from './numeric_kernel.mjs';
+import {quaternionFlatSourceRole} from './quaternion_flat_specialization.mjs';
 
 const sources=new Map([
   ['4729c13494ec171cd468ec75b10c7a598d09926a','LinearInterpolant'],
   ['24b3096de529e13fbe0723db76fd84a7028b14e4','CubicInterpolant'],
   ['b14b25b527f4c4c9a8ac81b64a65c6299f936181','BezierInterpolant'],
+  ['d6c999b30351e518d4c1be4b857592c088e9a447','QuaternionLinearInterpolant'],
 ]);
 const gltfBlob='cd95b20593264ba8b503f8152484c456be64b1af';
 const coreHash='9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
 const fresh=(source,name)=>{let value='__f3d_interpolation_'+name;while(source.includes(value))value+='_';return value;};
 
-export function specializeAnimationInterpolants(source,{runtimeModule,maxMemoryPages=2048,maxIterations=100000000}={}) {
-  const blob=sourceBlob(source),role=sources.get(blob) ??
+export function animationInterpolantSourceRole(source) {
+  const blob=sourceBlob(source);
+  return sources.get(blob) ??
     (blob===gltfBlob?'GLTFCubicSplineInterpolant':
       createHash('sha256').update(source).digest('hex')===coreHash?'core':null);
+}
+
+export function specializeAnimationInterpolants(source,{runtimeModule,quaternionSource,maxMemoryPages=2048,maxIterations=100000000}={}) {
+  const role=animationInterpolantSourceRole(source);
   if(!role)return {changed:false,edits:[],header:'',tail:''};
+  if(role==='core')quaternionSource=source;
+  if(role==='QuaternionLinearInterpolant' && quaternionFlatSourceRole(quaternionSource??'')!=='quaternion')
+    return {changed:false,edits:[],header:'',tail:''};
   const ast=acorn.parse(source,{ecmaVersion:'latest',sourceType:'module'});
   const classes=new Map(ast.body.filter(node=>node.type==='ClassDeclaration').map(node=>[node.id.name,node]));
   const create=fresh(source,'create'),attempt=fresh(source,'try'),edits=[],tails=[],tokens=[],methods=[];
@@ -30,16 +40,26 @@ export function specializeAnimationInterpolants(source,{runtimeModule,maxMemoryP
     const last=body.at(-1),loop=body.findLast(node=>node.type==='ForStatement');
     if(last.type!=='ReturnStatement' || last.argument.name!=='result' || !loop)
       throw new TypeError('Missing pinned interpolation boundaries');
-    const mode=Class==='GLTFCubicSplineInterpolant'?'gltfCubicSpline':Class.replace('Interpolant','').toLowerCase(),token=fresh(source,mode);
+    const mode=Class==='GLTFCubicSplineInterpolant'?'gltfCubicSpline':Class==='QuaternionLinearInterpolant'?'quaternion':
+      Class.replace('Interpolant','').toLowerCase(),token=fresh(source,mode);
     let start,args,parameterTypes,prefix='';
-    if(mode==='linear') {
+    if(mode==='linear' || mode==='quaternion') {
       const first=body[0],stride=first.declarations.find(node=>node.id.name==='stride');
-      const rest=first.declarations.find(node=>node.id.name==='offset1');
+      const rest=first.declarations.find(node=>node.id.name===(mode==='quaternion'?'alpha':'offset1'));
       if(!stride || !rest || source[stride.end]!==',')throw new TypeError('Missing pinned linear prefix');
       // Preserve the three original property reads, once and in order. Numeric
       // coercions remain in the original suffix when the native guard refuses.
       start=stride.end;
       prefix='const '+source.slice(rest.start,first.end)+'\n'+source.slice(first.end,loop.end);
+      if(mode==='quaternion') {
+        const call=loop.body.body[0]?.expression?.callee;
+        if(call?.object?.name!=='Quaternion' || call.property.name!=='slerpFlat')
+          throw new TypeError('Missing pinned quaternion interpolation helper');
+        // The original loop, including its repeated destination offset zero,
+        // invokes the verified helper in Wasm without changing source order.
+        prefix='const '+source.slice(rest.start,first.end)+'\n'+source.slice(first.end,call.start)+
+          'slerpFlat'+source.slice(call.end,loop.end);
+      }
       args=['result','values','stride','i1','t0','t','t1'];
       parameterTypes=['f64[]','f64[]',...Array(5).fill('f64')];
     }else if(mode==='gltfCubicSpline') {
@@ -63,13 +83,19 @@ export function specializeAnimationInterpolants(source,{runtimeModule,maxMemoryP
     }
     const helperSources=new Map(mode==='bezier'?ast.body.filter(node=>node.type==='FunctionDeclaration' &&
       ['solveBezierParameter','cubicBezier','cubicBezierSlope'].includes(node.id.name)).map(node=>[node.id.name,source.slice(node.start,node.end)]):[]);
+    if(mode==='quaternion') {
+      const method=normalMethod((role==='core'?classes:normalClasses(quaternionSource)).get('Quaternion'),'slerpFlat');
+      helperSources.set('slerpFlat',`function slerpFlat(${method.params.map(node=>node.name).join(',')})`+
+        quaternionSource.slice(method.body.start,method.body.end));
+    }
     const artifact=compileNumericKernel(`function interpolate(${args.join(',')}){${prefix}}`,{
-      parameterTypes,helperSources,generalControl:true,allowMath:mode==='bezier',maxMemoryPages,maxIterations,
+      parameterTypes,helperSources,generalControl:true,allowMath:mode==='bezier'||mode==='quaternion',maxMemoryPages,maxIterations,
       sourceName:'pinned '+Class+'.interpolate_'});
     const branch=`if(${attempt}(${token},${args.join(',')})) return result;\n`;
-    edits.push(mode==='linear'?{start,end:start+1,text:';\n'+branch+'const '}:{start,end:start,text:branch});
+    edits.push(mode==='linear'||mode==='quaternion'?{start,end:start+1,text:';\n'+branch+'const '}:{start,end:start,text:branch});
     tokens.push(token);methods.push(Class+'.interpolate_');wasmBytes+=artifact.wasm.length;
-    tails.push(`${token}=${create}(${Class},${JSON.stringify(mode)},${JSON.stringify(Buffer.from(artifact.wasm).toString('base64'))},()=>Math,${maxMemoryPages*65536});`);
+    tails.push(`${token}=${create}(${Class},${JSON.stringify(mode)},${JSON.stringify(Buffer.from(artifact.wasm).toString('base64'))},()=>Math,${maxMemoryPages*65536}`+
+      `${mode==='quaternion'?',Quaternion':''});`);
   }
   return {changed:true,edits,
     header:`import {createAnimationInterpolantDispatch as ${create},tryAnimationInterpolant as ${attempt}} from ${JSON.stringify(runtimeModule)};var ${tokens.join(',')};\n`,
