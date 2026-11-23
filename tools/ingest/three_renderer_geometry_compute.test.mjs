@@ -85,6 +85,112 @@ function sourceCode(f) {
   builder.scene = f.scene; builder.camera = f.camera; builder.lightsNode = N.lights([]); builder.build(); return builder;
 }
 
+test('before-render compute produces the current draw storage at the source callback boundary', async t => {
+  const f = fixture(t, {background: false}), attribute = new T.StorageBufferAttribute(1, 4);
+  const values = N.storage(attribute, 'vec4', 1), callbacks = [];
+  const kernel = N.Fn(() => { values.element(0).addAssign(N.vec4(.25, 0, 0, 0)); })().compute(1).setName('callback-step');
+  t.after(() => kernel.dispose()); f.material.colorNode = values.element(0).xyz;
+  f.device.onCompute = pass => { new Float32Array(storage(pass)[0].data)[0] += .25; };
+  f.object.onBeforeRender = (renderer, scene, camera, geometry, material) => {
+    assert.equal(renderer, f.renderer); assert.equal(scene, f.scene); assert.equal(camera, f.camera);
+    assert.equal(geometry, f.object.geometry); assert.equal(material, f.material);
+    callbacks.push('before'); renderer.compute(kernel); callbacks.push('computed');
+  };
+  f.object.onAfterRender = () => callbacks.push('after');
+  await f.renderer.init();
+  for (let i = 0; i < 2; i++) { f.renderer.render(f.scene, f.camera); await drain(f.renderer); }
+  const gpu = storage(f.computes[0])[0];
+  assert.deepEqual(draws(f).map(draw => new Float32Array(draw.contents.get(gpu).buffer)[0]), [.25, .5]);
+  assert.deepEqual(f.events, ['callback-step', 'render', 'callback-step', 'render']);
+  assert.deepEqual(callbacks, ['before', 'computed', 'after', 'before', 'computed', 'after']);
+  assert.ok(attribute.array.every(value => value === 0), 'GPU results never overwrite the public CPU array');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const hook of ['onBeforeRender', 'onAfterRender'])
+test(`disjoint ${hook} compute follows earlier compute and precedes the pending parent render`, async t => {
+  const f = fixture(t, {background: false}), first = N.instancedArray(1, 'vec4'), second = N.instancedArray(1, 'vec4');
+  const initial = N.Fn(() => { first.element(0).assign(N.vec4(.25)); })().compute(1).setName('earlier-callback');
+  const later = N.Fn(() => { second.element(0).assign(N.vec4(.75)); })().compute(1).setName('later-callback');
+  const material = new T.MeshBasicNodeMaterial(), reader = new T.Mesh(f.object.geometry, material);
+  reader.frustumCulled = false; reader.renderOrder = -1; material.colorNode = first.element(0).xyz;
+  reader.onBeforeRender = () => f.renderer.compute(initial); f.scene.add(reader);
+  // A later callback can run after the first draw has consumed another storage
+  // allocation. Its compute still submits before both pending parent draws.
+  f.material.colorNode = N.vec3(.125); f.object[hook] = () => f.renderer.compute(later);
+  t.after(() => { initial.dispose(); later.dispose(); material.dispose(); });
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(f.events, ['earlier-callback', 'later-callback', 'render']);
+  assert.equal(draws(f).length, 2); assert.notEqual(storage(f.computes[0])[0], storage(f.computes[1])[0]);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('queued callback kernels retain per-call uniforms and storage consumers in the renderer FIFO', async t => {
+  const f = fixture(t, {background: false}), values = N.instancedArray(1, 'vec4');
+  const step = N.uniform(.125).setName('callbackStep'); let dispatch = 0;
+  const kernel = N.Fn(() => { values.element(0).assign(N.vec4(step)); })().compute(1).setName('queued-callback');
+  f.material.colorNode = values.element(0).xyz; f.object.onBeforeRender = () => f.renderer.compute(kernel);
+  f.device.onCompute = pass => { new Float32Array(storage(pass)[0].data).fill(++dispatch * .25); };
+  t.after(() => kernel.dispose()); await f.renderer.init();
+  f.renderer.render(f.scene, f.camera); step.value = .625; f.renderer.render(f.scene, f.camera);
+  step.value = 99; await drain(f.renderer);
+  const uniforms = pass => pass.bytes.flatMap(bytes => [...new Float32Array(bytes.buffer)]);
+  assert.equal(f.computes.length, 2);
+  assert.ok(uniforms(f.computes[0]).includes(.125)); assert.ok(uniforms(f.computes[1]).includes(.625));
+  assert.ok(!uniforms(f.computes[1]).includes(99));
+  const gpu = storage(f.computes[0])[0];
+  assert.deepEqual(draws(f).map(draw => new Float32Array(draw.contents.get(gpu).buffer)[0]), [.25, .5]);
+  assert.deepEqual(f.events, ['queued-callback', 'render', 'queued-callback', 'render']);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('accepted callback compute remains submitted when a later object callback throws', async t => {
+  const f = fixture(t, {background: false}), values = N.instancedArray(1, 'vec4');
+  const kernel = N.Fn(() => { values.element(0).assign(N.vec4(.25)); })().compute(1).setName('accepted-callback');
+  f.material.colorNode = values.element(0).xyz;
+  f.object.onBeforeRender = () => { f.renderer.compute(kernel); throw Error('application callback failed'); };
+  t.after(() => kernel.dispose()); await f.renderer.init();
+  assert.throws(() => f.renderer.render(f.scene, f.camera), /application callback failed/); await drain(f.renderer);
+  assert.deepEqual(f.events, ['accepted-callback']); assert.equal(draws(f).length, 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const resource of ['storage', 'indirect', 'attachment'])
+test(`callback compute refuses a pending parent ${resource} alias before uploading or dispatching`, async t => {
+  const f = fixture(t, {background: false}), values = N.instancedArray(1, 'vec4');
+  let kernel, indirect = null;
+  if (resource === 'attachment') {
+    const target = new T.RenderTarget(16, 16); f.renderer.setRenderTarget(target);
+    kernel = N.Fn(() => { values.element(0).assign(N.textureLoad(target.texture, N.ivec2(0))); })().compute(1);
+    t.after(() => target.dispose()); f.material.colorNode = N.vec3(.5);
+  } else if (resource === 'indirect') {
+    indirect = new T.IndirectStorageBufferAttribute(new Uint32Array([1, 1, 1]), 1);
+    f.material.colorNode = N.vec3(N.storage(indirect, 'uint', 3).element(0).toFloat());
+    kernel = N.Fn(() => { values.element(0).assign(N.vec4(.25)); })().compute(1);
+  } else {
+    f.material.colorNode = values.element(0).xyz;
+    kernel = N.Fn(() => { values.element(0).assign(N.vec4(.25)); })().compute(1);
+  }
+  f.object.onAfterRender = () => f.renderer.compute(kernel, indirect);
+  t.after(() => kernel.dispose()); await f.renderer.init();
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_REENTRY'});
+  assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0);
+  assert.equal(f.device.writes.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('compute compilation from an object callback keeps its deferred resource boundary', async t => {
+  const f = fixture(t, {background: false}), values = N.instancedArray(1, 'vec4');
+  const kernel = N.Fn(() => { values.element(0).assign(N.vec4(.25)); })().compute(1);
+  f.material.colorNode = N.vec3(.5);
+  let attempt;
+  f.object.onBeforeRender = () => { attempt = f.renderer.compileComputeAsync(kernel); attempt.catch(() => {}); };
+  t.after(() => kernel.dispose()); await f.renderer.init();
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  await assert.rejects(attempt, {code: 'THREE_NODE_PROGRAM_REENTRY'});
+  assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('geometry constructors run once, public compilation computes, and named storage retains native residency', async t => {
   const f = fixture(t), state = jelly(f);
   const companionMaterial = new T.MeshBasicMaterial({color: 0x336699}), companion = new T.Mesh(new T.PlaneGeometry(), companionMaterial);

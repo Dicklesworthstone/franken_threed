@@ -253,9 +253,11 @@ export function markThreeNativeDrawCaptured(renderer, known = false) {
 }
 
 /** Object callbacks execute synchronously around their accepted draw. Nested
- * GPU writes need a split parent pass; do not silently enqueue them before an
- * already captured parent draw. The retained renderObject lifecycle calls its
- * draw handler between callbacks, where registered node effects remain legal.
+ * texture writes still need a separate pass boundary. Compute owns a separate
+ * source encoder and may submit before the pending parent, but only after its
+ * complete resource list passes the disjoint callback check below. The retained
+ * renderObject lifecycle calls its draw handler between callbacks, where
+ * registered node effects retain their existing resource-identity proof.
  */
 export function withThreeNativeObjectHooks(renderer, run, active = true) {
   const previous = objectHooks.has(renderer);
@@ -292,10 +294,11 @@ export function assertThreeNativeTextureWrite(renderer, texture) {
       reject('A nested write cannot overwrite a texture sampled by an earlier draw in its pending parent pass');
 }
 
-export function assertThreeNativeComputeOutsideCapture(renderer, resources = null, storageUploadIdentity = null, storageTextureIdentity = null) {
-  assertOutsideObjectHook(renderer);
+export function assertThreeNativeComputeOutsideCapture(renderer, resources = null, storageUploadIdentity = null, storageTextureIdentity = null, allowObjectCallbacks = true) {
+  if (!allowObjectCallbacks) assertOutsideObjectHook(renderer);
+  const callback = objectHooks.has(renderer);
   const stack = captures.get(renderer);
-  const disjoint = computePrerequisites.get(renderer);
+  const disjoint = computePrerequisites.get(renderer) ?? (callback ? true : undefined);
   // The pinned backend submits a separate compute encoder before its pending
   // render encoder. Geometry prerequisites retain that order. Restrict their
   // extension beyond the first draw to known resources. Shared storage is legal
@@ -303,14 +306,20 @@ export function assertThreeNativeComputeOutsideCapture(renderer, resources = nul
   // upload record: compute then updates their one allocation before the pending
   // parent encoder submits. A new/dynamic upload or unknown geometry owner has
   // no such proof. GPU-authored storage textures can likewise share their one
-  // live residency; CPU upload and attachment histories stay separate.
+  // live residency; CPU upload and attachment histories stay separate. Object
+  // callbacks may dispatch disjoint resources through that same queue position,
+  // including before the first draw. They do not inherit the geometry-node
+  // alias proof: an earlier parent use always blocks an overlapping callback.
+  // The early no-resource check only establishes a known parent scope; capture
+  // rechecks all actual bindings and indirect arguments before any queue effect.
   if (stack && (disjoint === undefined || stack.some(scope => scope.unknown ||
       !disjoint && (scope.draws || scope.textures.size) ||
       resources?.some(resource => scope.attachments.has(resource) ||
-        scope.textures.has(resource) && (!scope.storageTextures.has(resource) ||
+        scope.textures.has(resource) && (callback || !scope.storageTextures.has(resource) ||
           scope.storageTextures.get(resource) !== storageTextureIdentity?.(resource)) ||
-        scope.buffers.has(resource) && (!scope.storageUploads.has(resource) ||
+        scope.buffers.has(resource) && (callback || !scope.storageUploads.has(resource) ||
           scope.storageUploads.get(resource) !== storageUploadIdentity?.(resource)))))) {
+    assertOutsideObjectHook(renderer);
     const error = new Error('THREE_COMPUTE_REENTRY: Compute inside native draw capture requires a separate submission boundary; compute before rendering the scene');
     error.name = 'ThreeComputeError'; error.code = 'THREE_COMPUTE_REENTRY'; throw error;
   }

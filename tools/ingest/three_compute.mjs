@@ -885,7 +885,10 @@ export function withThreeCompute(Base, THREE) {
     async computeAsync(nodes, dispatchSize = null) { await this.compute(nodes, dispatchSize); }
     async compileComputeAsync(nodes, onProgress = null) {
       if (this._isDeviceLost === true) return;
-      assertThreeNativeComputeOutsideCapture(this);
+      // Compilation can defer its resource capture until after the callback's
+      // parent scope has ended. Only compute() captures and validates the full
+      // dispatch synchronously, so compilation keeps its callback boundary.
+      assertThreeNativeComputeOutsideCapture(this, null, null, null, false);
       const list = listOf(nodes);
       if (onProgress !== null && typeof onProgress !== 'function') fail('OPTIONS', 'onProgress must be a function');
       await submit(this, () => owner(this).compile(list, onProgress), true);

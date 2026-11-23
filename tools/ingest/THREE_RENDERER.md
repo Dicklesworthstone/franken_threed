@@ -464,6 +464,38 @@ earlier request's views with later camera edits. Public matrix and projection
 updates follow the pinned native renderer. This does not admit nested arrays
 or multiview/XR cameras.
 
+## Native compute from object render callbacks
+
+The native node-material path admits synchronous `renderer.compute()` calls
+from `Object3D.onBeforeRender` and `onAfterRender` when the complete dispatch
+resource set is disjoint from every earlier captured parent draw and the active
+render target. A before-render callback can therefore produce storage consumed
+by its current draw; later callbacks can dispatch into independent resources.
+The retained source callback still receives its original receiver and arguments.
+
+Compute keeps the pinned backend's submission order: its separate encoder
+submits before the enclosing render encoder. Buffer, indirect-argument,
+sampled-texture and attachment aliases remain checked before any queue effect,
+including a second check after source binding getters. Unknown earlier resource
+histories remain refused. Registered geometry prerequisites retain their
+existing unchanged-residency sharing rules; ordinary object callbacks do not
+inherit that permission.
+
+Prepare pipelines outside the callback with `compileComputeAsync()` as needed.
+Calling that asynchronous preparation method inside an object callback remains
+refused because its resource capture may happen after the parent scope ends.
+Nested texture writes retain their existing restriction.
+
+The focused guards are covered by
+`node --test tools/ingest/three_node_capture.test.mjs`; 16 checks passed against
+the actual capture module in an independent V8 execution environment. Nine
+recording-device integration cases were added to
+`three_renderer_geometry_compute.test.mjs`, and
+`node tests/e2e/webgpu_renderer/native_callback_compute.mjs` reuses the pinned
+source/candidate pixel runner with exact GPU storage readbacks. Those integration
+and browser checks were not run because the execution environment disconnected.
+No browser parity or acceleration claim is established by the guard checks.
+
 ## Native Scene lifecycle
 
 Native `Scene.onBeforeRender` and `Scene.onAfterRender` now surround the retained
