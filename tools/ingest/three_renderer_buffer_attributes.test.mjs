@@ -27,7 +27,7 @@ const drain = async renderer => { while (renderer._drain) await renderer._drain;
 // Output conversion also uses main; select the public inputs exercised here.
 const draws = device => device.snapshots.flat().filter(draw =>
   draw.pipeline.vertex.entryPoint === 'main' &&
-  /@location\(\s*\d+\s*\)\s*(?:nodeAttribute\d+|color)\s*:/.test(draw.pipeline.vertex.module.code));
+  /@location\(\s*\d+\s*\)\s*(?:nodeAttribute\d+|color|halfValue)\s*:/.test(draw.pipeline.vertex.module.code));
 function attributeWords(draw, input, Type = Float32Array) {
   const shader = draw.pipeline.vertex.module.code;
   const location = Number(new RegExp(`@location\\(\\s*(\\d+)\\s*\\)\\s*${input.name}\\s*:`).exec(shader)?.[1]);
@@ -71,6 +71,50 @@ for (const interleaved of [false, true]) test(`public ${interleaved ? 'interleav
   assert.deepEqual(attributeWords(draws(f.device).at(-1), input).words, [...source.array], 'disposal/reuse allocates current source bytes');
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
+
+for (const components of [2, 3, 4]) for (const interleaved of [false, true])
+for (const extension of [false, true])
+test(`native Float16Array vec${components} ${interleaved ? 'interleaved' : 'separate'} ${extension ? 'extension geometry' : 'public node'} inputs retain queued source versions`,
+  {skip: typeof Float16Array !== 'function'}, async t => {
+    const f = fixture(t), stride = interleaved ? 8 : components, offset = interleaved ? 4 : 0;
+    class Extension extends T.MeshBasicNodeMaterial {
+      setupOutput(builder, output) { return super.setupOutput(builder, output.mul(.75)); }
+    }
+    if (extension) f.material = f.mesh.material = new Extension();
+    const array = new Float16Array(new ArrayBuffer((4 * stride + 8) * 2), 8, 4 * stride);
+    for (let i = 0; i < array.length; i++) array[i] = [.3333, -0, 2 ** -24, -.75][i % 4];
+    const source = interleaved ? new T.InterleavedBuffer(array, stride) : new T.BufferAttribute(array, components);
+    const attribute = interleaved ? new T.InterleavedBufferAttribute(source, components, offset) : source;
+    if (extension) f.mesh.geometry.setAttribute('halfValue', attribute);
+    const input = extension ? N.attribute('halfValue', `vec${components}`)
+      : interleaved ? N.bufferAttribute(source, `vec${components}`, stride, offset) : N.bufferAttribute(attribute);
+    f.material.colorNode = components === 2 ? N.vec3(input, .5) : components === 3 ? input : input.xyz;
+    const reflected = extension ? {name: 'halfValue'} : input;
+    let uploads = 0; source.onUploadCallback = () => { uploads++; };
+    await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+    assert.equal(draws(f.device).length, 0, 'preparation does not consume the source input');
+    const initial = [...array], expected = initial.slice();
+    f.renderer.render(f.scene, f.camera);
+    array.fill(.875);
+    // A separate vec3 is padded to four half words by r186. Even an empty
+    // interior range therefore uploads the complete selected source vertex.
+    const padded = !interleaved && components === 3;
+    const start = padded ? 1 : offset, count = padded ? 0 : 2;
+    source.addUpdateRange(start, count); source.needsUpdate = true;
+    for (let i = padded ? 0 : start; i < (padded ? components : start + count); i++) expected[i] = .875;
+    f.renderer.render(f.scene, f.camera);
+    array.fill(.125); f.renderer.render(f.scene, f.camera);
+    await drain(f.renderer);
+    assert.equal(draws(f.device).length, 3);
+    assert.deepEqual(draws(f.device).map(draw => attributeWords(draw, reflected).words), [initial, expected, expected]);
+    assert.deepEqual(source.updateRanges, []); assert.equal(source.array, array);
+    assert.equal(source.version, 1); assert.equal(uploads, 0, 'native attributes leave WebGL upload callbacks inert');
+    assert.equal(attribute.itemSize, components); assert.equal(attribute.normalized, false);
+    f.mesh.geometry.dispose();
+    f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+    assert.deepEqual(attributeWords(draws(f.device).at(-1), reflected).words, [...array]);
+    assert.equal(f.renderer._nodeCaptureBytes, 0);
+  });
 
 for (const Type of [Int32Array, Uint32Array]) test(`public ${Type.name} node inputs preserve integer vertex formats and values`, async t => {
   const f = fixture(t), value = Type === Int32Array ? -16777219 : 16777219;

@@ -1440,6 +1440,24 @@ graphs, ordinary aliases, integer bits, partial uploads, queued changes and
 disposal/reuse. These checks establish construction and submission behavior;
 fresh browser pixel parity and hardware performance remain unverified.
 
+Public vector attributes backed by `Float16Array` also use this shared history.
+Two-, three- and four-component inputs retain their source values and identities,
+including interleaved layouts and ordinary geometry aliases. The existing
+geometry uploader converts the captured half-precision values to Float32 for
+the owned draw; this does not enable WGSL half-precision arithmetic or change
+the application's quantization.
+
+Separate three-component half arrays follow the pinned uploader's four-component
+padding when applying update ranges: every affected vertex is refreshed, even
+for an empty range inside a vertex. Unpadded vectors and interleaved inputs retain
+the source's four-byte alignment requirements. Unmarked CPU edits, queued draws,
+dynamic uploads and disposal/reuse keep their established histories. Scalar
+half inputs, normalized half inputs and the separate Uint16-backed
+`Float16BufferAttribute` wrapper retain their existing admission boundaries.
+Pinned-source uploader comparisons and recording-device draws verify these
+formats and updates; fresh browser pixel and hardware-performance evidence is
+still required.
+
 The program records the smaller matrix/color capacity, or the matrix capacity
 when colors are absent. After node updates, the captured count must fit that
 capacity; an excessive count is rejected before submission rather than silently

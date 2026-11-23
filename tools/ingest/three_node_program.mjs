@@ -1612,7 +1612,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const sharedVertexExtension = ordinaryGeometryExtension || skinExtension || primitiveExtension;
     const namedGeometry = geometrySetup || sharedVertexExtension &&
       Object.values(object.geometry.attributes).some(attribute =>
-        attribute.isStorageBufferAttribute || attribute.isInterleavedBufferAttribute || attribute.normalized);
+        attribute.isStorageBufferAttribute || attribute.isInterleavedBufferAttribute || attribute.normalized ||
+        typeof Float16Array === 'function' && attribute.array?.constructor === Float16Array);
     // Transparent side passes retain separate render-object bindings. Their
     // builders share only when the source material/dynamic keys are identical,
     // including restored DoubleSide construction during compileAsync.
@@ -1642,7 +1643,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           attribute.array?.constructor !== Float32Array && !(skinExtension && name === 'skinIndex' &&
             [Uint8Array, Uint16Array, Uint32Array].includes(attribute.array?.constructor)) &&
             !(sharedVertexExtension && attribute.normalized === true &&
-              [Int8Array, Uint8Array, Int16Array, Uint16Array].includes(attribute.array?.constructor)) ||
+              [Int8Array, Uint8Array, Int16Array, Uint16Array].includes(attribute.array?.constructor)) &&
+            !(sharedVertexExtension && typeof Float16Array === 'function' && attribute.array?.constructor === Float16Array) ||
           attribute.isInterleavedBufferAttribute && !instancedGeometryExtension && !sharedVertexExtension ||
           !instancedGeometryExtension && (attribute.isInstancedBufferAttribute || attribute.data?.isInstancedInterleavedBuffer) ||
           attribute.isStorageInstancedBufferAttribute ||
@@ -1655,7 +1657,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         renderer.getOutputRenderTarget?.()?.multiview) return null;
     if (sharedVertexExtension) for (const [name, attribute] of Object.entries(object.geometry.attributes)) {
       if (attribute.isStorageBufferAttribute) inspectThreeNodeStorageAttribute(three, attribute, fail);
-      else if (attribute.isInterleavedBufferAttribute || attribute.normalized)
+      else if (attribute.isInterleavedBufferAttribute || attribute.normalized ||
+          typeof Float16Array === 'function' && attribute.array?.constructor === Float16Array)
         inspectThreeNodeSharedAttribute(three, attribute, fail, skinExtension && name === 'skinIndex');
     }
     const {attachment, chain} = builderScope(context);

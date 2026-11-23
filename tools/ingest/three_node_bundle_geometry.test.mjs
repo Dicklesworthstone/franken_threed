@@ -360,7 +360,8 @@ test('GPU view proofs retain accepted shape and cannot be forged or used as indi
   assert.equal(owner.diagnostics.allocatedBytes, 36); accepted.release();
 });
 
-for (const Type of [Int8Array, Uint8Array, Int16Array, Uint16Array]) for (const components of [2, 3, 4])
+for (const Type of [Int8Array, Uint8Array, Int16Array, Uint16Array,
+  ...(typeof Float16Array === 'function' ? [Float16Array] : [])]) for (const components of [2, 3, 4])
 for (const interleaved of [false, true])
 test(`native ${Type.name} vec${components} ${interleaved ? 'interleaved' : 'separate'} ranges match pinned upload bytes`, t => {
   const owner = histories(t), source = new T.BufferGeometry(), device = geometryDevice(), records = new Map();
@@ -369,8 +370,9 @@ test(`native ${Type.name} vec${components} ${interleaved ? 'interleaved' : 'sepa
   const make = () => {
     const array = new Type(new ArrayBuffer((4 * stride + 8) * Type.BYTES_PER_ELEMENT), 4 * Type.BYTES_PER_ELEMENT, 4 * stride);
     for (let i = 0; i < array.length; i++) array[i] = i + 10;
-    return interleaved ? new T.InterleavedBufferAttribute(new T.InterleavedBuffer(array, stride), components, offset, true)
-      : new T.BufferAttribute(array, components, true);
+    const normalized = typeof Float16Array !== 'function' || Type !== Float16Array;
+    return interleaved ? new T.InterleavedBufferAttribute(new T.InterleavedBuffer(array, stride), components, offset, normalized)
+      : new T.BufferAttribute(array, components, normalized);
   };
   const reference = make(), attribute = make(), referenceOwner = interleaved ? reference.data : reference;
   const inputOwner = interleaved ? attribute.data : attribute, original = reference.array, initial = [...original], packets = [];
@@ -382,6 +384,8 @@ test(`native ${Type.name} vec${components} ${interleaved ? 'interleaved' : 'sepa
   const layout = uploader.createShaderVertexBuffers({getAttributes: () => [reference]})[0];
   assert.equal(layout.arrayStride, interleaved ? stride * Type.BYTES_PER_ELEMENT : Math.ceil(components * Type.BYTES_PER_ELEMENT / 4) * 4);
   assert.equal(layout.attributes[0].offset, offset * Type.BYTES_PER_ELEMENT);
+  if (typeof Float16Array === 'function' && Type === Float16Array)
+    assert.equal(layout.attributes[0].format, `float16x${components === 3 ? 4 : components}`);
   const compare = renderId => {
     const packet = owner.capture(source, renderId, ['value']); packets.push(packet);
     const gpu = new Type(backend.get(referenceOwner).buffer.data), raw = [];
@@ -461,6 +465,28 @@ test('native unpadded normalized ranges preserve first-upload behavior and refus
   const next = owner.capture(source, 2); assert.deepEqual([...next.geometry.attributes.color.array], [90, 90, 90, 90]);
   assert.deepEqual(attribute.updateRanges, []); first.release(); next.release();
 });
+
+for (const components of [2, 4]) test(`native Float16Array vec${components} preserves source update alignment`,
+  {skip: typeof Float16Array !== 'function'}, t => {
+    const owner = histories(t), source = new T.BufferGeometry();
+    const attribute = new T.BufferAttribute(new Float16Array(components * 2).fill(.25), components);
+    const reference = attribute.clone();
+    source.setAttribute('value', attribute);
+    for (const input of [reference, attribute]) input.addUpdateRange(1, 1);
+    const record = {}, uploader = new SourceWebGPUAttributeUtils({device: geometryDevice(), get: () => record});
+    uploader.createAttribute(reference, 32);
+    const first = owner.capture(source, 1);
+    for (const input of [reference, attribute]) { input.array.fill(.75); input.needsUpdate = true; }
+    assert.throws(() => uploader.updateAttribute(reference), 'the source rejects this unaligned two-byte write');
+    assert.throws(() => owner.capture(source, 2), {code: 'THREE_NODE_BUNDLE_GEOMETRY_ATTRIBUTE'});
+    assert.deepEqual(attribute.updateRanges, [{start: 1, count: 1}]);
+    assert.deepEqual([...first.geometry.attributes.value.array], Array(components * 2).fill(.25));
+    for (const input of [reference, attribute]) { input.clearUpdateRanges(); input.addUpdateRange(0, 2); }
+    uploader.updateAttribute(reference);
+    const next = owner.capture(source, 2);
+    assert.deepEqual([...next.geometry.attributes.value.array], [...new Float16Array(record.buffer.data)]);
+    assert.deepEqual(attribute.updateRanges, []); first.release(); next.release();
+  });
 
 for (const [Type, before, after] of [[Uint8Array, 3, 4], [Uint8Array, 4, 3], [Uint8Array, 2, 3], [Int16Array, 3, 2]])
 test(`native ${Type.name} resident ${before}-to-${after} component padding changes require a new owner`, t => {

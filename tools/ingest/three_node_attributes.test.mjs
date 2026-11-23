@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
-import {createThreeNodeAttributes} from './three_node_attributes.mjs';
+import {createThreeNodeAttributes, inspectThreeNodeSharedAttribute} from './three_node_attributes.mjs';
 import {createThreeNodeBundleGeometry} from './three_node_bundle_geometry.mjs';
 
 test('public node attributes share budgets, first-upload gates and disposal with ordinary geometry',()=>{
@@ -145,3 +145,23 @@ test('generated attribute history validates the whole selection before consuming
   assert.throws(()=>small.register({},new T.PlaneGeometry(),[{name:'left',attribute:left}]),/byte budget/);
   assert.equal(small.diagnostics.owners,0);small.dispose();
 });
+
+test('shared Float16Array inputs accept native vectors and reject invalid scalar, normalization and alignment profiles',
+  {skip: typeof Float16Array !== 'function'}, () => {
+    const reject = (code, message) => { throw Object.assign(new Error(message), {code}); };
+    for (const components of [2, 3, 4]) {
+      const attribute = new T.BufferAttribute(new Float16Array(components * 4), components);
+      assert.equal(inspectThreeNodeSharedAttribute(T, attribute, reject).array, attribute.array);
+      attribute.normalized = true;
+      assert.throws(() => inspectThreeNodeSharedAttribute(T, attribute, reject), {code: 'ATTRIBUTE'});
+      attribute.normalized = false; attribute.isFloat16BufferAttribute = true;
+      assert.throws(() => inspectThreeNodeSharedAttribute(T, attribute, reject), {code: 'ATTRIBUTE'});
+    }
+    for (const attribute of [new T.BufferAttribute(new Float16Array(4), 1),
+      new T.InterleavedBufferAttribute(new T.InterleavedBuffer(new Float16Array(12), 3), 3, 0),
+      new T.InterleavedBufferAttribute(new T.InterleavedBuffer(new Float16Array(24), 6), 3, 1)])
+      assert.throws(() => inspectThreeNodeSharedAttribute(T, attribute, reject), {code: 'ATTRIBUTE'});
+    const owner = new T.InterleavedBuffer(new Float16Array(32), 8);
+    const attribute = new T.InterleavedBufferAttribute(owner, 3, 4);
+    assert.equal(inspectThreeNodeSharedAttribute(T, attribute, reject).owner, owner);
+  });

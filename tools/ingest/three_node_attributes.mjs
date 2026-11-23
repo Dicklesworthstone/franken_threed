@@ -1,4 +1,4 @@
-/** Captured source-generated 32-bit vertex streams for native node programs.
+/** Captured source vertex streams for native node programs.
  * The pinned Instance/BufferAttribute nodes own their public attributes. Keep
  * their WebGPU version/range history at the logical render boundary, then give
  * the existing geometry uploader private owners containing that history. A
@@ -46,14 +46,19 @@ function inspectAttribute(three, attribute, reject, shared = false, allowNarrowI
   // Both use the existing public geometry history, never a generated copy.
   const narrowInteger = shared && allowNarrowInteger && attribute?.normalized === false &&
     !attribute.isFloat16BufferAttribute && [Uint8Array, Uint16Array].includes(array?.constructor);
-  if (!normalized && !narrowInteger && (![Float32Array, Int32Array, Uint32Array].includes(array?.constructor) || attribute?.normalized) ||
+  // Native Float16Array vectors have real source float16 vertex formats. The
+  // separate Uint16-backed Float16BufferAttribute follows a different source
+  // upload path; neither its flag nor normalization can opt a stream in here.
+  const half = shared && typeof Float16Array === 'function' && array?.constructor === Float16Array &&
+    attribute?.normalized === false && !attribute.isFloat16BufferAttribute && attribute.itemSize >= 2;
+  if (!normalized && !narrowInteger && !half && (![Float32Array, Int32Array, Uint32Array].includes(array?.constructor) || attribute?.normalized) ||
       !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
       !Number.isSafeInteger(array.length) || !Number.isSafeInteger(attribute?.count) || attribute.count < 0 ||
       !Number.isSafeInteger(attribute?.itemSize) || attribute.itemSize < 1 || attribute.itemSize > 4 ||
       normalized && (attribute.itemSize < 2 || attribute.isFloat16BufferAttribute) ||
       !shared && attribute.gpuType === three.IntType ||
       !Number.isSafeInteger(owner.version) || owner.version < 0)
-    reject('ATTRIBUTE', 'Native vertex inputs require fixed 32-bit streams or shared 8/16-bit integer vectors');
+    reject('ATTRIBUTE', 'Native vertex inputs require fixed 32-bit streams or shared Float16Array/8/16-bit integer vectors');
   try { new Uint8Array(array.buffer, 0, 0); }
   catch { reject('ATTRIBUTE', 'Native generated attribute storage is detached'); }
   const stride = interleaved ? owner.stride : attribute.itemSize, offset = interleaved ? attribute.offset : 0;
