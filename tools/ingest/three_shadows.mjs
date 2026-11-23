@@ -26,7 +26,7 @@ const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 // shadow (which could carry custom hooks). Cache per source light constructor
 // so ordinary frame inspection creates no temporary source objects.
 const nativeShadowClasses = new WeakMap();
-function nativeShadowClass(C, exported) {
+export function nativeShadowClass(C, exported) {
   if (exported !== undefined) return exported;
   if (!nativeShadowClasses.has(C)) {
     const prototype = Object.getPrototypeOf(new C().shadow);

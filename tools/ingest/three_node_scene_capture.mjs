@@ -11,6 +11,7 @@ import {inspectThreeLightingContext, inspectThreeNativeCamera, hasThreeHighPreci
 import {captureThreeNodeClipping} from './three_node_clipping.mjs';
 import {inspectThreeNativeBatch, captureThreeNativeBatch} from './three_node_batch.mjs';
 import {updateThreeCameraProjection} from './three_pass_snapshot.mjs';
+import {nativeShadowClass} from './three_shadows.mjs';
 
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
 const integer = value => Number.isSafeInteger(value) && value >= 0;
@@ -61,6 +62,87 @@ const nativeFeatures = material => hasThreeNodeProgram(material) || hasThreeNati
 const litMaterial = material => material?.isMaterial === true && material.lights !== false &&
   (material.isVolumeNodeMaterial === true || ['MeshToon', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical'].some(name =>
     material[`is${name}Material`] === true || material[`is${name}NodeMaterial`] === true));
+
+// Fixed shadow preparation has its own caster traversal and upload history.
+// Admit ordinary source scenes before their first upload instead of capturing
+// only the camera-visible color list or migrating already GPU-visible bytes.
+function freshOrdinaryShadowScene(three, root, camera, renderer, hierarchy, visibility) {
+  // Inspect only source participants, never nested application annotations.
+  // Accessors keep the existing route and its original observation count.
+  const dataOnly = object => object !== null && typeof object === 'object' &&
+    Object.values(Object.getOwnPropertyDescriptors(object)).every(property => Object.hasOwn(property, 'value'));
+  const controls = dataProperty(renderer, 'shadowMap'), clipping = dataProperty(renderer, 'clippingPlanes');
+  if (!dataOnly(controls) || controls.enabled !== true || ![three.BasicShadowMap, three.PCFShadowMap].includes(controls.type) ||
+      !dataOnly(root) || !dataOnly(camera) || Object.getPrototypeOf(root) !== three.Scene.prototype ||
+      ![three.PerspectiveCamera.prototype, three.OrthographicCamera.prototype].includes(Object.getPrototypeOf(camera)) ||
+      clipping != null && (!Array.isArray(clipping) || clipping.length) || root.overrideMaterial !== null || root.environment || root.environmentNode ||
+      root.backgroundNode || root.fogNode || root.background && !root.background.isColor) return false;
+  const cameraMask = dataProperty(camera.layers, 'mask');
+  if (!dataOnly(camera.layers) || dataProperty(camera.layers, 'test') !== three.Layers.prototype.test || typeof cameraMask !== 'number') return false;
+  const materials = new Set(['MeshBasic', 'MeshNormal', 'MeshLambert', 'MeshPhong', 'MeshToon', 'MeshStandard']
+    .map(name => three[`${name}Material`].prototype));
+  const lights = new Set([three.AmbientLight, three.HemisphereLight, three.DirectionalLight, three.SpotLight, three.PointLight]
+    .map(Source => Source.prototype));
+  const containers = new Set([three.Scene, three.Group, three.Object3D, three.PerspectiveCamera, three.OrthographicCamera]
+    .map(Source => Source.prototype));
+  const history = fixedAttributeHistory.get(renderer), shadows = [];
+  let light = false, caster = false, receiver = false;
+  for (const object of hierarchy.keys()) {
+    if (!visibility.get(object)) continue;
+    if (!dataOnly(object) || !dataOnly(object.layers) || dataProperty(object.layers, 'test') !== three.Layers.prototype.test) return false;
+    const source = Object.getPrototypeOf(object);
+    const mask = dataProperty(object.layers, 'mask');
+    if (typeof mask !== 'number') return false;
+    const onLayer = (mask & cameraMask) !== 0;
+    if (lights.has(source)) {
+      if (Object.hasOwn(object, 'constructor') || dataProperty(object, 'map')) return false;
+      if (!object.castShadow) continue;
+      const Source = source === three.DirectionalLight.prototype ? three.DirectionalLight : source === three.SpotLight.prototype ? three.SpotLight : null;
+      if (!Source) return false;
+      const shadow = object.shadow;
+      if (!dataOnly(shadow) || !dataOnly(shadow.camera) || shadow.map !== null || shadow.filterNode || shadow.shadowNode || shadow.biasNode) return false;
+      shadows.push({Source, shadow});
+      light ||= onLayer;
+      continue;
+    }
+    if (containers.has(source)) continue;
+    if (source !== three.Mesh.prototype) return false;
+    const geometry = object.geometry;
+    if (!dataOnly(geometry) || !(geometry instanceof three.BufferGeometry) || dataProperty(geometry, 'isInstancedBufferGeometry') ||
+        !dataOnly(geometry.attributes) || !dataOnly(geometry.morphAttributes) || Object.keys(geometry.morphAttributes).length ||
+        object.intersectsFrustum !== three.Mesh.prototype.intersectsFrustum || object.customDepthMaterial || object.customDistanceMaterial ||
+        ['onBeforeRender', 'onAfterRender', 'onBeforeShadow', 'onAfterShadow']
+          .some(key => dataProperty(object, key) !== three.Object3D.prototype[key])) return false;
+    for (const attribute of [...Object.values(geometry.attributes), geometry.index].filter(Boolean)) {
+      if (!dataOnly(attribute)) return false;
+      const owner = dataProperty(attribute, 'isInterleavedBufferAttribute') ? dataProperty(attribute, 'data') : attribute;
+      if (!dataOnly(owner)) return false;
+      const array = dataProperty(owner, 'array');
+      if (history?.has(owner) || !ArrayBuffer.isView(array) || ![Float32Array, Uint32Array, Int32Array, Uint16Array, Int16Array, Uint8Array, Int8Array]
+        .some(Type => array instanceof Type) || !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable) return false;
+    }
+    const material = object.material;
+    // Broader source families already choose their own native entrance. This
+    // automatic path must not turn legacy shader/accessor cases into errors.
+    if (Array.isArray(material) || !dataOnly(material) || !materials.has(Object.getPrototypeOf(material)) ||
+        Object.entries(Object.getOwnPropertyDescriptors(material)).some(([key, property]) => key.endsWith('Node') && property.value != null) ||
+        ['map', 'alphaMap', 'aoMap', 'lightMap', 'bumpMap', 'normalMap', 'displacementMap', 'emissiveMap',
+          'specularMap', 'gradientMap', 'envMap', 'roughnessMap', 'metalnessMap'].some(key => dataProperty(material, key) != null) ||
+        material.allowOverride !== true || material.clippingPlanes !== null ||
+        ['onBeforeCompile', 'onBeforeRender', 'customProgramCacheKey']
+          .some(key => dataProperty(material, key) !== three.Material.prototype[key])) return false;
+    caster ||= object.castShadow === true && material.visible === true;
+    receiver ||= object.receiveShadow === true && material.visible === true && litMaterial(material) && onLayer;
+  }
+  if (!(light && caster && receiver)) return false;
+  // Share the existing source-class cache, and never construct its witness for
+  // a scene already excluded by the ordinary profile above.
+  return shadows.every(({Source, shadow}) => {
+    const prototype = nativeShadowClass(Source, Source === three.DirectionalLight ? three.DirectionalLightShadow : three.SpotLightShadow).prototype;
+    return Object.getPrototypeOf(shadow) === prototype && ['updateMatrices', 'getViewportCount', 'getViewport', 'getFrameExtents']
+      .every(key => dataProperty(shadow, key) === prototype[key]);
+  });
+}
 
 export function captureThreeNodeScene(three, root, camera, {getPrograms, renderer,
   overrideMaterial = null, maxNodes = 16384, maxDraws = 16384, uniforms = true,
@@ -410,7 +492,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // draw. Keep this owner when nodes are later removed from the same root.
   let nativeCompanionScene = false;
   if (bundles && renderer && !shadowPass) {
-    nativeCompanionScene = nativeSceneHistory.get(renderer)?.has(renderRoot) === true;
+    nativeCompanionScene = nativeSceneHistory.get(renderer)?.has(renderRoot) === true ||
+      freshOrdinaryShadowScene(three, renderRoot, camera, renderer, hierarchy, visibility);
     let native = bundleSelections.some(selection => selection.warm && selection.entry.draws.length > 0), fixed = false;
     for (const object of hierarchy.keys()) {
       if (nativeCompanionScene) break;

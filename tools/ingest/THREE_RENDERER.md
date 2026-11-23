@@ -556,10 +556,25 @@ edits or removal while preparation is pending. These captures share the existing
 pending-byte budget and keep the original objects as public/cache identities.
 Geometry upload generations and fixed shaders retain their existing owners.
 
-This extends the ordinary fixed capture; separate shadow, instancing,
-deformation and mixed native/fixed owners retain their existing boundaries.
+Fresh ordinary directional/spot shadow scenes can now enter the existing
+source-ordered native capture before their first upload. Rigid meshes with
+ordinary untextured built-in materials, Basic/PCF shadows and an ordinary camera
+retain each accepted receiver and caster transform, material color and geometry
+generation, including casters outside the main camera's frustum. Later node
+companions and shadow toggles keep the same upload owner; unrequested CPU edits
+cannot replace its GPU-visible bytes.
+
+The narrow admission checks source descriptors before reading candidate values
+and leaves unrelated application annotations untouched. Custom hooks, accessors,
+material arrays, clipping, broader geometry and established fixed upload histories
+keep their existing routes. The new path shares the existing source shadow-class
+cache and pending-capture resource limits.
+
+Established separate fixed shadow, instancing, deformation and mixed native/fixed
+owners retain their existing transition boundaries.
 `three_renderer_fixed_snapshot.test.mjs` checks the actual queued GPU matrices,
-light buffers, draw membership and fixed shader route with the recording device.
+light buffers, draw membership, shadow captures and retained upload routes with
+the recording device.
 It does not establish additional pixel parity or a performance result.
 
 ## Public render-list sorting

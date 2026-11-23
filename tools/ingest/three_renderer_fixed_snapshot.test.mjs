@@ -214,6 +214,152 @@ const vertex = draw => {
   return [...new Float32Array(bytes.buffer, bytes.byteOffset, 3)];
 };
 
+function ordinaryShadowFixture(t, Light = T.DirectionalLight, Material = T.MeshPhongMaterial) {
+  const f = fixture(t, Material), light = new Light(), geometry = new T.PlaneGeometry();
+  const material = new T.MeshBasicMaterial(), caster = new T.Mesh(geometry, material);
+  f.renderer.shadowMap.enabled = true; f.renderer.shadowMap.type = T.PCFShadowMap;
+  f.mesh.receiveShadow = true; caster.castShadow = true; caster.position.x = 3;
+  light.castShadow = true; light.position.set(0, 0, 8); light.shadow.mapSize.set(16, 16);
+  light.shadow.camera.near = .1; light.shadow.camera.far = 20; light.shadow.camera.updateProjectionMatrix();
+  f.scene.add(caster, light, light.target);
+  t.after(() => { geometry.dispose(); material.dispose(); });
+  return {...f, light, caster};
+}
+const canvasNativePackets = device => nativePackets(device).filter(draw =>
+  draw.pipeline.fragment.targets.some(target => target?.format === 'bgra8unorm'));
+const shadowNativePackets = device => nativePackets(device).filter(draw =>
+  !draw.pipeline.fragment.targets.some(target => target?.format === 'bgra8unorm'));
+function nativePosition(draw) {
+  const location = Number(draw.pipeline.vertex.module.code.match(/@location\(\s*(\d+)\s*\)\s+position\s*:/)[1]);
+  const slot = draw.pipeline.vertex.buffers.findIndex(layout => layout.attributes.some(attribute => attribute.shaderLocation === location));
+  const attribute = draw.pipeline.vertex.buffers[slot].attributes.find(value => value.shaderLocation === location);
+  const bytes = draw.contents.get(draw.streams.get(slot));
+  return [...new Float32Array(bytes.buffer, bytes.byteOffset + attribute.offset, 3)];
+}
+
+test('ordinary shadow admission leaves inert material userData descriptor and prototype traps untouched', async t => {
+  const f = ordinaryShadowFixture(t), events = [];
+  f.material.userData = new Proxy({}, {
+    getOwnPropertyDescriptor(target, key) { events.push(['descriptor', key]); return Reflect.getOwnPropertyDescriptor(target, key); },
+    getPrototypeOf(target) { events.push(['prototype']); return Reflect.getPrototypeOf(target); },
+  });
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(events, []); assert.equal(canvasNativePackets(f.device).length, 1);
+});
+
+test('a refused ordinary shadow scene does not construct an extra source light witness', async t => {
+  const f = ordinaryShadowFixture(t, T.SpotLight); f.material.onBeforeCompile = () => {};
+  f.scene.clear(); f.scene.add(f.light, f.light.target, f.caster, f.mesh);
+  const source = T.Color.prototype.set; let calls = 0;
+  T.Color.prototype.set = function(...args) { calls++; return source.apply(this, args); };
+  t.after(() => { T.Color.prototype.set = source; });
+  await f.renderer.init();
+  const captured = f.renderer._captureNodeFrame({scene: f.scene, camera: f.camera, destination: f.renderer,
+    overrideMaterial: null, captureCameras: true, renderId: 1});
+  assert.equal(captured.draws.length, 0); assert.equal(calls, 0);
+});
+
+// Counts were compared with the unchanged capture module from before this
+// feature. Admission must not add observations to the retained fixed route.
+for (const [owner, key, expectedReads] of [['scene', 'environment', 10], ['scene', 'background', 1], ['geometry', 'morphAttributes', 2],
+  ['light', 'map', 0], ['shadow', 'map', 0], ['camera', 'reversedDepth', 1], ['mesh', 'receiveShadow', 0]])
+test(`ordinary shadow admission preserves the old-route ${owner}.${key} getter observations`, async t => {
+  const f = ordinaryShadowFixture(t), object = owner === 'shadow' ? f.light.shadow : f[owner];
+  const value = object[key]; let reads = 0;
+  Object.defineProperty(object, key, {configurable: true, get() { reads++; return value; }});
+  await f.renderer.init();
+  const captured = f.renderer._captureNodeFrame({scene: f.scene, camera: f.camera, destination: f.renderer,
+    overrideMaterial: null, captureCameras: true, renderId: 1});
+  assert.equal(captured.draws.length, 0); assert.equal(reads, expectedReads);
+});
+
+for (const [owner, expectedCalls] of [['camera', 21], ['mesh', 4]]) test(`ordinary shadow admission preserves ${owner} layer-mask coercion count`, async t => {
+  const f = ordinaryShadowFixture(t), mask = f[owner].layers.mask; let calls = 0;
+  f[owner].layers.mask = {valueOf() { calls++; return mask; }};
+  await f.renderer.init();
+  const captured = f.renderer._captureNodeFrame({scene: f.scene, camera: f.camera, destination: f.renderer,
+    overrideMaterial: null, captureCameras: true, renderId: 1});
+  assert.equal(captured.draws.length, 0); assert.equal(calls, expectedCalls);
+});
+
+for (const [Light, Material, shadowType] of [[T.DirectionalLight, T.MeshPhongMaterial, T.BasicShadowMap],
+  [T.SpotLight, T.MeshStandardMaterial, T.PCFShadowMap]])
+test(`ordinary ${Light.name} shadows capture queued receivers and off-camera casters from their first upload`, async t => {
+  const f = ordinaryShadowFixture(t, Light, Material), position = f.geometry.attributes.position;
+  f.renderer.shadowMap.type = shadowType;
+  await f.renderer.init();
+  for (const [x, color] of [[.125, [.125, .375, .625]], [.625, [.75, .5, .25]]]) {
+    f.mesh.position.x = x; f.caster.position.x = 3 + x;
+    position.setX(0, x); position.needsUpdate = true; f.material.color.setRGB(...color);
+    f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  }
+  f.mesh.position.x = 9; f.caster.position.x = 9; f.scene.updateMatrixWorld();
+  f.material.color.setRGB(1, 0, 0); position.setX(0, 99); f.scene.clear();
+  await drain(f.renderer);
+  const color = canvasNativePackets(f.device), shadow = shadowNativePackets(f.device);
+  assert.equal(color.length, 2, 'the caster remains outside the accepted main-camera frustum');
+  assert.equal(shadow.length, 2, 'each accepted shadow pass retains the off-camera caster');
+  for (const [i, x] of [.125, .625].entries()) {
+    assert.ok(colorIn(color[i], new T.Matrix4().makeTranslation(x, 0, 0).elements), 'accepted receiver world matrix');
+    assert.ok(colorIn(shadow[i], new T.Matrix4().makeTranslation(3 + x, 0, 0).elements), 'accepted caster world matrix');
+  }
+  assert.deepEqual(color.map(draw => nativePosition(draw)[0]), [.125, .625]);
+  assert.ok(colorIn(color[0], [.125, .375, .625])); assert.ok(colorIn(color[1], [.75, .5, .25]));
+  assert.equal(fixedPackets(f.device).length, 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer.info.f3d.presentedRenders, 2);
+});
+
+test('ordinary source shadows retain their upload owner through node companions and shadow toggles', async t => {
+  const f = ordinaryShadowFixture(t), position = f.geometry.attributes.position;
+  position.setX(0, .125); await f.renderer.init();
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  position.setX(0, 99);
+  const native = addNativeMesh(t, f); f.mesh.position.x = .25;
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  f.scene.remove(native); f.renderer.shadowMap.enabled = false; f.mesh.position.x = .5;
+  f.renderer.render(f.scene, f.camera);
+  f.renderer.shadowMap.enabled = true; f.mesh.position.x = .75;
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  f.mesh.position.x = 9; f.mesh.updateMatrixWorld();
+  await drain(f.renderer);
+  const draws = canvasNativePackets(f.device).filter(draw => colorIn(draw, [.125, .375, .625]));
+  assert.equal(draws.length, 4);
+  for (const [i, x] of [0, .25, .5, .75].entries())
+    assert.ok(colorIn(draws[i], new T.Matrix4().makeTranslation(x, 0, 0).elements), 'accepted receiver world matrix');
+  assert.deepEqual(draws.map(draw => nativePosition(draw)[0]), [.125, .125, .125, .125]);
+  assert.equal(fixedPackets(f.device).length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('automatic ordinary shadow capture never migrates established fixed shadow uploads', async t => {
+  const f = ordinaryShadowFixture(t), position = f.geometry.attributes.position;
+  f.mesh.receiveShadow = false; position.setX(0, .125);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  f.mesh.receiveShadow = true; position.setX(0, 99);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const color = fixedPackets(f.device).filter(({draw}) =>
+    draw.pipeline.fragment.targets.some(target => target?.format === 'bgra8unorm'));
+  assert.equal(color.length, 2); assert.deepEqual(color.map(({draw}) => vertex(draw)[0]), [.125, .125]);
+  assert.equal(nativePackets(f.device).length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const legacy of ['material callback', 'material accessor', 'clipping planes', 'nonstandard attribute', 'proxied attribute'])
+test(`automatic ordinary shadow capture preserves the existing ${legacy} route`, async t => {
+  const f = ordinaryShadowFixture(t); let reads = 0;
+  if (legacy === 'material callback') f.material.onBeforeCompile = () => {};
+  if (legacy === 'material accessor') Object.defineProperty(f.material, 'applicationState', {get() { reads++; return 1; }});
+  if (legacy === 'clipping planes') f.material.clippingPlanes = [new T.Plane(new T.Vector3(1, 0, 0), 0)];
+  if (legacy === 'nonstandard attribute') f.geometry.setAttribute('position',
+    new T.BufferAttribute(new Float64Array(f.geometry.attributes.position.array), 3));
+  if (legacy === 'proxied attribute') f.geometry.attributes.position.array = new Proxy(f.geometry.attributes.position.array, {
+    get(target, key) { if (key === 'buffer') reads++; return Reflect.get(target, key, target); },
+  });
+  await f.renderer.init();
+  const captured = f.renderer._captureNodeFrame({scene: f.scene, camera: f.camera, destination: f.renderer,
+    overrideMaterial: null, captureCameras: true, renderId: 1});
+  assert.equal(captured.objects.has(f.mesh), false); assert.equal(captured.draws.length, 0);
+  assert.equal(reads, 0); assert.equal(captured.bytes, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('mixed node and ordinary draws keep accepted pose, material, geometry and membership through preparation', async t => {
   const f = fixture(t); f.renderer.sortObjects = false; f.mesh.frustumCulled = false;
   addNativeMesh(t, f);
