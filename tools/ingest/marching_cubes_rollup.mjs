@@ -1,6 +1,7 @@
 /** Opt-in library-kernel recognition in the real Rollup module graph. */
 import fs from 'node:fs';
 import {specializeMarchingCubesModule,specializeMarchingCubesBase} from './marching_cubes_specialization.mjs';
+import {specializeMarchingCubesBallLoops} from './marching_cubes_ball_loops.mjs';
 import {geometryNormalSourceRole,specializeGeometryNormals} from './geometry_normals_specialization.mjs';
 import {specializeMatrixMultiply} from './matrix_multiply_specialization.mjs';
 import {specializeTransformBatch,transformBatchSourceRole} from './transform_batch_specialization.mjs';
@@ -42,10 +43,10 @@ export function marchingCubesRollupPlugin(options={}) {
       !Number.isInteger(maxIterations) || maxIterations<1 || maxIterations>1000000000) {
     throw new RangeError('Invalid marching-cubes memory or iteration budget');
   }
-  const reports=[],normalReports=[],matrixReports=[],transformReports=[],attributeReports=[],eulerReports=[],instanceReports=[],quaternionReports=[],boundsReports=[],tangentReports=[],interpolantReports=[],propertyMixerReports=[],skeletonReports=[];let registrations=0,colorRegistrations=0;
+  const reports=[],ballLoopReports=[],normalReports=[],matrixReports=[],transformReports=[],attributeReports=[],eulerReports=[],instanceReports=[],quaternionReports=[],boundsReports=[],tangentReports=[],interpolantReports=[],propertyMixerReports=[],skeletonReports=[];let registrations=0,colorRegistrations=0;
   return {
     name:'f3d-marching-cubes',
-    buildStart() {reports.length=0;normalReports.length=0;matrixReports.length=0;transformReports.length=0;attributeReports.length=0;eulerReports.length=0;instanceReports.length=0;quaternionReports.length=0;boundsReports.length=0;tangentReports.length=0;interpolantReports.length=0;propertyMixerReports.length=0;skeletonReports.length=0;registrations=0;colorRegistrations=0;},
+    buildStart() {reports.length=0;ballLoopReports.length=0;normalReports.length=0;matrixReports.length=0;transformReports.length=0;attributeReports.length=0;eulerReports.length=0;instanceReports.length=0;quaternionReports.length=0;boundsReports.length=0;tangentReports.length=0;interpolantReports.length=0;propertyMixerReports.length=0;skeletonReports.length=0;registrations=0;colorRegistrations=0;},
     resolveId(source,importer) {
       if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS,INTERPOLANTS,PROPERTY_MIXER,SKELETON].includes(source)) return source;
       if ([ADAPTER,NORMALS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS,INTERPOLANTS,PROPERTY_MIXER,SKELETON].includes(importer) && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
@@ -163,6 +164,9 @@ export function marchingCubesRollupPlugin(options={}) {
         const instanceLoops=specializeInstancedMatrixLoops(code,{runtimeModule:INSTANCE_UPDATES});
         if(instanceLoops.report)instanceReports.push({id,...instanceLoops.report});
         if(instanceLoops.changed){edits.push(...instanceLoops.edits);headers.push(instanceLoops.header);}
+        const ballLoops=specializeMarchingCubesBallLoops(code,{runtimeModule:ADAPTER});
+        if(ballLoops.report)ballLoopReports.push({id,...ballLoops.report});
+        if(ballLoops.changed){edits.push(...ballLoops.edits);headers.push(ballLoops.header);}
         const skeletonArrays=specializeSkeletonArrayWitnesses(code,{runtimeModule:SKELETON});
         if(skeletonArrays.changed){edits.push(...skeletonArrays.edits);headers.push(skeletonArrays.header);}
         if(!headers.length)return null;
@@ -242,6 +246,7 @@ export function marchingCubesRollupPlugin(options={}) {
     },
     api:{getReport() {return {version:1,maxMemoryPages,maxIterations,compiledAddons:reports.filter(x=>x.route!=='retained-js').length,
       registeredBaseModules:registrations,registeredColorModules:colorRegistrations,
+      compiledBallLoops:ballLoopReports.reduce((sum,report)=>sum+report.compiledLoops,0),ballLoopModules:ballLoopReports.map(report=>({...report})),
       compiledFieldKernels:reports.reduce((sum,report)=>sum+(report.compiledFieldKernels??0),0),accelerationClaim:false,modules:reports.map(x=>({...x}))};},
       getGeometryNormalsReport(){return {version:1,accelerationClaim:false,
         compiledModules:normalReports.filter(report=>report.compiledMethods.length).length,modules:normalReports.map(report=>({...report}))};},

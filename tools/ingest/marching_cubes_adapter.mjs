@@ -9,7 +9,7 @@
  * Unknown owners/materials, including proxies around known objects, take the
  * original path without property inspection. Bootstrap trusted platform APIs.
  */
-import {instantiateNumericKernel} from './numeric_kernel_runtime.mjs';
+import {instantiateNumericKernel,numericArrayIterationIntact} from './numeric_kernel_runtime.mjs';
 import {registerNumericObject,isNumericObject} from './numeric_objects.mjs';
 const apply=Reflect.apply, descriptor=Object.getOwnPropertyDescriptor, hasOwn=Object.hasOwn;
 const prototype=Object.getPrototypeOf,setHas=WeakSet.prototype.has,setAdd=WeakSet.prototype.add;
@@ -37,6 +37,14 @@ function platformIntact() {
   return true;
 }
 const objects={has:isNumericObject},dispatches=new WeakMap(),updates=new WeakMap(),fieldUpdates=new WeakMap();
+const ballOwners=new WeakMap(),ballColors=new WeakMap(),ballRecipes=new WeakMap(),ballArrays=new WeakSet(),ballUpdates=new WeakMap();
+const F64=Float64Array,functionPrototype=Function.prototype,objectPrototype=Object.prototype;
+const functionSource=Function.prototype.toString,instanceCheck=data(functionPrototype,Symbol.hasInstance);
+const mathObject=data(globalThis,'Math'),ballMath=new Map();
+for(const name of ['abs','acos','asin','atan','atan2','ceil','cos','exp','floor','log','max','min','pow','round','sign','sin','sqrt','tan','trunc']) {
+  const fn=data(mathObject,name);
+  ballMath.set(name,typeof fn==='function'&&apply(functionSource,fn,[])===`function ${name}() { [native code] }`?fn:null);
+}
 const own=(object,key)=>{
   const d=descriptor(object,key);
   return d && hasOwn(d,'value') ? d : null;
@@ -151,11 +159,114 @@ export function tryMarchingCubesUpdate(receiver,object,token,edgePositions,edgeN
 
 /** Opt-in diagnostics; the generated Three module gains no new public exports. */
 export function marchingCubesDiagnostics(object) {
-  const stats=updates.get(object),fieldKernels=fieldDiagnostics(object);
-  if (!stats) return Object.freeze({wasmCalls:0,fallbackCalls:0,lastFailure:null,initialized:false,kernel:null,fieldKernels});
+  const stats=updates.get(object),fieldKernels=fieldDiagnostics(object),ballLoops=ballDiagnostics(object);
+  if (!stats) return Object.freeze({wasmCalls:0,fallbackCalls:0,lastFailure:null,initialized:false,kernel:null,fieldKernels,ballLoops});
   const dispatch=dispatches.get(stats.token);
   return Object.freeze({wasmCalls:stats.wasmCalls,fallbackCalls:stats.fallbackCalls,lastFailure:stats.lastFailure,
-    initialized:dispatch?.attempted??false,kernel:dispatch?.kernel?.diagnostics??null,fieldKernels});
+    initialized:dispatch?.attempted??false,kernel:dispatch?.kernel?.diagnostics??null,fieldKernels,ballLoops});
+}
+
+/** The complete core hash proves both Color and its ColorManagement closure.
+ * Source-tree Color without that dependency proof keeps ordinary addBall calls. */
+export function registerMarchingCubesBallColorClass(Class,management) {
+  const proto=data(Class,'prototype');
+  ballColors.set(Class,{Class,proto,management,set:data(proto,'set'),setRGB:data(proto,'setRGB'),
+    convert:data(management,'convert'),toWorking:data(management,'colorSpaceToWorking')});
+}
+export function attachMarchingCubesBallBatch(token,base64,resolveMath) {
+  const record=dispatches.get(token);
+  if(record)record.balls={base64,resolveMath,attempted:false,kernel:null,initializationFailure:null};
+}
+/** Invoked at allocation of the verified function, BEFORE assignment to the
+ * public property. A prototype setter cannot nominate its own replacement. */
+export function registerMarchingCubesBallOwner(object,token,Color,method) {
+  if(objects.has(object))ballOwners.set(object,{record:dispatches.get(token),Color,method});
+  return method;
+}
+export function registerMarchingCubesBallArray(array) {apply(setAdd,ballArrays,[array]);return array;}
+export function createMarchingCubesBallRecipe(prepare,scalarCount,countIndex,math,condition) {
+  const token=Object.freeze({});ballRecipes.set(token,{prepare,scalarCount,countIndex,math,condition});return token;
+}
+function ballPlatform(recipe) {
+  if(!numericArrayIterationIntact()||!platformIntact()||data(globalThis,'Math')!==mathObject)return false;
+  for(const name of ['sign','abs','sqrt','floor',...recipe.math])
+    if(!ballMath.get(name)||data(mathObject,name)!==ballMath.get(name))return false;
+  return true;
+}
+function ballColorIntact(record) {
+  if(!record)return false;
+  const {Class,proto,management}=record;
+  if(data(Class,'prototype')!==proto||prototype(Class)!==functionPrototype||prototype(proto)!==objectPrototype||
+    descriptor(Class,Symbol.hasInstance)||data(functionPrototype,Symbol.hasInstance)!==instanceCheck||
+    data(proto,'set')!==record.set||data(proto,'setRGB')!==record.setRGB||
+    data(management,'convert')!==record.convert||data(management,'colorSpaceToWorking')!==record.toWorking||
+    !own(management,'workingColorSpace')||!own(management,'enabled'))return false;
+  // Fresh Color assignments must neither call inherited setters nor throw on
+  // a nonwritable inherited slot. The two inspected prototypes are witnessed.
+  for(const key of ['r','g','b','isColor'])for(const owner of [proto,objectPrototype]) {
+    const d=descriptor(owner,key);if(d&&(!hasOwn(d,'value')||!d.writable))return false;
+  }
+  return true;
+}
+function ballInput(owner,object,palette) {
+  if(data(object,'addBall')!==owner.method)return null;
+  const color=ballColors.get(owner.Color);
+  if(!ballColorIntact(color))return null;
+  const size=data(object,'size'),size2=data(object,'size2');
+  if(!isInteger(size)||size<1||size>256||size2!==size*size)return null;
+  const field=own(object,'field'),values=own(object,'palette');
+  if(!field||!values)return null;
+  let colors=empty,colorCount=0;
+  if(palette!==null) {
+    if(!apply(setHas,ballArrays,[palette]))return null;
+    const length=data(palette,'length');if(!isInteger(length)||length<1||length>4096)return null;
+    colorCount=length;
+    colors=new F64(length*3);
+    for(let i=0;i<length;i++) {
+      const value=data(palette,i);
+      if(!objects.has(value)||prototype(value)!==color.proto)return null;
+      for(let k=0;k<3;k++) {
+        const component=own(value,['r','g','b'][k]);
+        if(!component||typeof component.value!=='number')return null;
+        colors[i*3+k]=component.value;
+      }
+    }
+  }
+  return {field:field.value,palette:values.value,size,size2,colors,colorCount};
+}
+/** Every preparation expression is compiler-checked scalar arithmetic over
+ * numeric lexical captures and intact native Math. No field read, callback,
+ * getter or application helper can observe the deferred per-ball writes. */
+export function tryMarchingCubesBallLoop(token,object,values,palette) {
+  const recipe=ballRecipes.get(token),owner=ballOwners.get(object);
+  if(!recipe||!owner?.record?.balls)return false;
+  let stats=ballUpdates.get(object);
+  if(!stats){stats={wasmCalls:0,balls:0,fallbackCalls:0,lastFailure:null};ballUpdates.set(object,stats);}
+  const fallback=reason=>{stats.fallbackCalls++;stats.lastFailure=reason;return false;};
+  if(values.length!==recipe.scalarCount+(recipe.condition?1:0))return fallback('MARCHING_CUBES_BALL_CAPTURE');
+  for(let i=0;i<recipe.scalarCount;i++)if(typeof values[i]!=='number')return fallback('MARCHING_CUBES_BALL_CAPTURE');
+  if(recipe.condition&&typeof values[recipe.scalarCount]!=='boolean')return fallback('MARCHING_CUBES_BALL_CAPTURE');
+  const count=values[recipe.countIndex];
+  if(!isInteger(count)||count<0||count>4096)return fallback('MARCHING_CUBES_BALL_COUNT');
+  if(count===0)return true;
+  const record=owner.record.balls;let kernel,input;
+  try {
+    if(!ballPlatform(recipe))return fallback('MARCHING_CUBES_BALL_PLATFORM');
+    input=ballInput(owner,object,palette);if(!input)return fallback('MARCHING_CUBES_BALL_GUARD');
+    const initialized=record.attempted;
+    kernel=kernelFor(record);if(!kernel)return fallback(record.initializationFailure);
+    if(!ballPlatform(recipe))return fallback('MARCHING_CUBES_BALL_PLATFORM');
+    if(!initialized&&!(input=ballInput(owner,object,palette)))return fallback('MARCHING_CUBES_BALL_GUARD');
+    const balls=new F64(count*8);
+    if(!recipe.prepare(balls,values,input.colors,input.colorCount))return fallback('MARCHING_CUBES_BALL_PREPARATION');
+    kernel.run(input.field,input.palette,input.size,input.size2,balls,count);
+  }catch{return fallback(kernel?.diagnostics.lastGuardFailure??'MARCHING_CUBES_BALL_EXECUTION');}
+  // Publication is complete; no fallback or source callbacks occur below.
+  stats.wasmCalls++;stats.balls+=count;stats.lastFailure=null;return true;
+}
+function ballDiagnostics(object) {
+  return Object.freeze({...ballUpdates.get(object)??{wasmCalls:0,balls:0,fallbackCalls:0,lastFailure:null},
+    kernel:ballOwners.get(object)?.record?.balls?.kernel?.diagnostics??null});
 }
 
 

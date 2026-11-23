@@ -106,3 +106,43 @@ export function compileMarchingCubesFields(source,{maxMemoryPages=2048,maxIterat
   }
   return Object.freeze(result);
 }
+
+/** One transaction for a closed application's sequence of addBall calls. The
+ * caller supplies the original numeric arguments and already-guarded RGB data;
+ * all radius, bounds, contribution and Float32-store arithmetic comes from the
+ * independently verified addon, including the scalar prefix of each call. */
+export function compileMarchingCubesBallBatch(source,{maxMemoryPages=2048,maxIterations=100000000}={}) {
+  const bytes=Buffer.from(source);
+  if(createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')!==SOURCE_BLOB)
+    throw new TypeError('MarchingCubes ball batch source pin mismatch');
+  const ast=acorn.parse(source,{ecmaVersion:'latest',sourceType:'module'});
+  const ctor=ast.body.find(node=>node.type==='ClassDeclaration'&&node.id.name==='MarchingCubes')
+    .body.body.find(node=>node.kind==='constructor').value;
+  const fn=ctor.body.body.find(node=>node.expression?.type==='AssignmentExpression'&&
+    member(node.expression.left,'this','addBall')).expression.right;
+  const statements=fn.body.body.filter(node=>!(node.type==='VariableDeclaration'&&
+    node.declarations.some(d=>['userDefineColor','ballColor'].includes(d.id.name)))&&
+    !(node.type==='IfStatement'&&node.test.type==='Identifier'&&node.test.name==='userDefineColor'));
+  const body=statements.map(statement=>{
+    const edits=[];
+    visit(statement,node=>{
+      if(node.type==='VariableDeclarator'&&node.init===null)
+        edits.push({start:node.end,end:node.end,text:'=0'});
+      for(const [object,names] of [['this',['field','palette','size','size2']],['ballColor',['r','g','b']]])
+        for(const name of names)if(member(node,object,name)) {
+          edits.push({start:node.start,end:node.end,text:'__f3d_'+name});return false;
+        }
+    });
+    let text=source.slice(statement.start,statement.end);
+    for(const edit of edits.sort((a,b)=>b.start-a.start))
+      text=text.slice(0,edit.start-statement.start)+edit.text+text.slice(edit.end-statement.start);
+    return text;
+  }).join('\n');
+  const kernelSource='function addBalls(__f3d_field,__f3d_palette,__f3d_size,__f3d_size2,__f3d_balls,__f3d_count){'+
+    'for(let __f3d_ball=0;__f3d_ball<__f3d_count;__f3d_ball++){const __f3d_offset=__f3d_ball*8;'+
+    ['ballx','bally','ballz','strength','subtract','__f3d_r','__f3d_g','__f3d_b'].map((name,index)=>
+      'let '+name+'=__f3d_balls[__f3d_offset+'+index+'];').join('')+body+'}}';
+  const artifact=compileNumericKernel(kernelSource,{parameterTypes:['f32[]','f32[]','f64','f64','f64[]','f64'],
+    allowMath:true,generalControl:true,maxMemoryPages,maxIterations,sourceName:'f3d:marching-cubes-r186:addBall-batch'});
+  return Object.freeze({...artifact,kernelSource,sourceSpan:{start:fn.body.start,end:fn.body.end}});
+}

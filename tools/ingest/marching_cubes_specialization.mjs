@@ -7,7 +7,7 @@
 import {createHash} from 'node:crypto';
 import * as acorn from 'acorn';
 import {compileMarchingCubesKernel} from './marching_cubes_compile.mjs';
-import {compileMarchingCubesFields} from './marching_cubes_fields.mjs';
+import {compileMarchingCubesFields,compileMarchingCubesBallBatch} from './marching_cubes_fields.mjs';
 const MARCHING_CUBES_PIN='148ef33ecb6d2502ff796d4554abd1549c95d519';
 export const MARCHING_CUBES_SOURCE_BLOB='29a405be3eae30a7e2b1ff04827068921d31d5dc';
 export const EVENT_DISPATCHER_SOURCE_BLOB='ac793ea9081486b1b1e834c9df2480d18fb90e0c';
@@ -63,8 +63,10 @@ export function specializeMarchingCubesModule(source,{
   // Fixture-specific expectedBlob overrides do not authorize field lifting.
   // Its own pin is independent and covers every original loop and prefix.
   const fields=hash===MARCHING_CUBES_SOURCE_BLOB?compileMarchingCubesFields(source,{maxMemoryPages,maxIterations}):[];
+  const balls=fields.length?compileMarchingCubesBallBatch(source,{maxMemoryPages,maxIterations}):null;
   const tryName=fresh(source,'try'),createName=fresh(source,'create'),token=fresh(source,'dispatch');
   const fieldTry=fresh(source,'field_try'),attach=fresh(source,'attach_fields');
+  const attachBalls=fresh(source,'attach_balls'),ballOwner=fresh(source,'ball_owner');
   const prefix=source.slice(update.body.start+1,body[tail].start);
   const edits=[{start:update.body.start+1,end:body[tail].start,
     text:`\nif (!${tryName}(this, scope, ${token}, vlist, nlist, clist)) {${prefix}\n}\n`}];
@@ -73,11 +75,17 @@ export function specializeMarchingCubesModule(source,{
     edits.push({start,end,text:`if (!${fieldTry}(this, scope, ${token}, ${JSON.stringify(field.name)}, `+
       `[${field.locals.join(',')}], ${field.color?'ballColor':'null'})) {\n${source.slice(start,end)}\n}`});
   }
+  if(balls) {
+    const method=assignments.find(node=>node.type==='AssignmentExpression'&&thisMember(node.left,'addBall')).right;
+    edits.push({start:method.start,end:method.start,text:`${ballOwner}(this,${token},Color,`},
+      {start:method.end,end:method.end,text:')'});
+  }
   let transformed=source;
   for (const edit of edits.sort((a,b)=>b.start-a.start)) {
     transformed=transformed.slice(0,edit.start)+edit.text+transformed.slice(edit.end);
   }
-  const fieldImports=fields.length?`, tryMarchingCubesField as ${fieldTry}, attachMarchingCubesFields as ${attach}`:'';
+  const fieldImports=fields.length?`, tryMarchingCubesField as ${fieldTry}, attachMarchingCubesFields as ${attach}, `+
+    `attachMarchingCubesBallBatch as ${attachBalls}, registerMarchingCubesBallOwner as ${ballOwner}`:'';
   const header=`import { tryMarchingCubesUpdate as ${tryName}, createMarchingCubesDispatch as ${createName}${fieldImports} } from ${JSON.stringify(runtimeModule)};\nvar ${token};\n`;
   // var is initialized before an ESM cycle can call the source method. Before
   // table/dispatch registration the original function supplies its own TDZ/error.
@@ -86,10 +94,12 @@ export function specializeMarchingCubesModule(source,{
     const specifications=fields.map(field=>({name:field.name,parameters:field.parameters,locals:field.locals,
       base64:Buffer.from(field.wasm).toString('base64')}));
     registration+=`${attach}(${token},${JSON.stringify(specifications)},()=>Math);\n`;
+    registration+=`${attachBalls}(${token},${JSON.stringify(Buffer.from(balls.wasm).toString('base64'))},()=>Math);\n`;
   }
   return {changed:true,code:header+transformed+registration,wasm:artifact.wasm,report:{...report,
     route:'retained-addon-with-guarded-wasm-polygonizer',wasmBytes:artifact.wasm.length,
     compiledFieldKernels:fields.length,fieldWasmBytes:fields.reduce((sum,field)=>sum+field.wasm.length,0),
+    compiledBallBatch:!!balls,ballBatchWasmBytes:balls?.wasm.length??0,
     fieldKernels:fields.map(field=>({name:field.name,wasmBytes:field.wasm.length,sourceSpan:field.sourceSpan,
       numericSemantics:field.manifest.numericSemantics})),
     numericSourceSpan:{start:update.body.start+1,end:body[tail].start},
@@ -115,6 +125,7 @@ export function specializeMarchingCubesBase(source,{
   const shaderSource=defaultPin && hash===SHADER_MATERIAL_SOURCE_BLOB;
   if (hash!==expectedBlob && !core && !colorSource && !materialSource && !shaderSource) return {changed:false,code:source};
   const ast=parse(source),register=fresh(source,'register'),registerPrototype=fresh(source,'material_prototype');
+  const registerBallColor=fresh(source,'ball_color');
   const edits=[],registeredClasses=[],registeredPrototypes=[];
   if (!colorSource && !materialSource && !shaderSource) {
     const base=ast.body.find(node=>node.type==='ClassDeclaration' && node.id?.name==='EventDispatcher');
@@ -130,6 +141,7 @@ export function specializeMarchingCubesBase(source,{
     // the true allocation BEFORE that call, never the returned identity.
     edits.push({at:ctor.body.start+1,text:`\n${register}(this);\n`});
     registeredClasses.push('Color');
+    if(core)edits.push({at:color.end,text:`\n${registerBallColor}(Color,ColorManagement);\n`});
   }
   const prototypeClasses=core?['EventDispatcher','Material','ShaderMaterial']:
     materialSource?['Material']:shaderSource?['ShaderMaterial']:
@@ -148,6 +160,7 @@ export function specializeMarchingCubesBase(source,{
   const imports=[];
   if(registeredClasses.length)imports.push(`registerMarchingCubesObject as ${register}`);
   if(registeredPrototypes.length)imports.push(`registerMarchingCubesMaterialPrototype as ${registerPrototype}`);
+  if(core)imports.push(`registerMarchingCubesBallColorClass as ${registerBallColor}`);
   const header=`import { ${imports.join(', ')} } from ${JSON.stringify(runtimeModule)};\n`;
   return {changed:true,registeredClasses,registeredPrototypes,code:header+code,header,
     edits:edits.map(edit=>({start:edit.at,end:edit.at,text:edit.text}))};

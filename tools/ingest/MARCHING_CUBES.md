@@ -52,6 +52,41 @@ aliased outputs, insufficient capacity, memory budgets and native fuel rollback.
 The F3D-09 bead remains open until the complete application and browser gates
 (including every H2 control/material route) are demonstrated.
 
+## Whole application ball loops
+
+The existing `specializeNumeric: true` application build now recognizes closed
+counted loops that prepare numeric arguments and call `addBall` once per
+iteration. Recognition uses the application's syntax and bindings, with no
+application filename or recorded metaball formula. It includes H2's original
+conditional choice between default colors and a witnessed palette of genuine
+Color objects.
+
+The original scalar expressions still execute as JavaScript into private ball
+records. One source-derived Wasm transaction then performs all balls' radius,
+bounds, field contributions and ordered Float32 stores. The 50-ball case uses
+one field/palette transaction instead of fifty. The public arrays retain their
+identity and are current when the call returns. Source `reset`, plane additions,
+polygonization, attribute versions and publication remain at their original
+boundaries.
+
+Admission requires the witnessed addon instance and original method, primitive
+numeric captures, intact native Math, plain storage and verified Color and
+ColorManagement behavior. The bounded loop limit is 4096 balls; other counts or
+shapes retain the original loop. Unknown getters, proxies, helpers, method
+overrides and storage aliases also retain source execution. A failed Wasm
+transaction publishes no partial field before the original loop executes once.
+Pinned core Color definitions carry the required dependency proof; source-tree
+Color imports currently retain the ordinary per-ball path.
+
+`marching_cubes_ball_loops.test.mjs` and the existing field/adapter suites execute
+the generated Wasm against the pinned source, including nonfinite values,
+signed zeros, memory/fuel refusal and ESM cycles. The production Rollup and full
+application-build tests in `marching_cubes_ball_loop_bundle.test.mjs` cover the
+original H2 functions, all 13 material choices, changed controls and resolution,
+exact OBJ export, relocated output, observer effects and unavailable Wasm.
+These 62 focused checks establish numerical behavior and reduced transaction
+count; browser pixel equivalence and measured hardware speedup remain open.
+
 ## Upstream attribution
 
 Algorithm and conventions: Three.js r186, commit
