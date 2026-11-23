@@ -1273,7 +1273,6 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (depth) { source = source.depthEntry ?? source; destination = destination.depthEntry ?? destination; }
     const group = source.historyGroup && source.historyGroup === destination.historyGroup ? source.historyGroup : null;
     const sameOwner = source === destination || group !== null;
-    if (depth && sameOwner) fail('FEEDBACK', 'In-place depth copies are not admitted');
     if (source.busy || destination.busy || group?.busy || group?.frame)
       fail('REENTRANT', 'Cannot copy during a target submission');
     // Source-shaped copies capture the live generation flag independently of
@@ -1284,6 +1283,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const plan = depth
       ? inspectGpuDepthCopy({...source.shape, sampleDepth: source.shape.depthTexture !== null}, destinationShape, options)
       : inspectGpuTargetCopy(source.shape, destinationShape, options);
+    if (depth && sameOwner && plan.sourceFace === plan.face)
+      fail('FEEDBACK', 'Depth copies cannot read and write the same depth subresource');
     if (!depth && sameOwner && source.shape.textures[plan.sourceColorIndex] === destination.shape.textures[plan.colorIndex] &&
         gpuTargetCopyOverlaps(source.shape, plan))
       fail('FEEDBACK', 'Copies cannot read and write overlapping color subresources');

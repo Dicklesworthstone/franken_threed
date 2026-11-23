@@ -106,6 +106,52 @@ test('queued depth copy/read captures faces and reads at submission, not admissi
   counts(f, 0);
 });
 
+test('queued self-depth copies capture distinct faces and preserve FIFO reads without another target', async t => {
+  const f = setup(t, {initialized: false}), a = target(), options = {sourceFace: 4, face: 1};
+  f.renderer._enqueue({issue() { seedDepth(f, a); }, resolve() {}, reject(error) { throw error; }});
+  const copy = f.renderer.copyRenderTargetDepthPixelsAsync(a, a, options), read = readDepth(f, a, {face: 1});
+  const entry = f.owner.capture(a);
+  assert.equal(entry.references, 2, 'one generation lease per accepted copy/read');
+  options.sourceFace = 0; options.face = 5;
+  f.renderer._enqueue({issue() {
+    entry.storage.withDepthTexture(texture => texture.data.fill(0.875, 16, 32));
+  }, resolve() {}, reject(error) { throw error; }});
+  assert.equal(f.textures.length, 0); counts(f, 2, 64);
+  f.drain(); await copy;
+  assert.deepEqual(await read, Float32Array.from({length: 16}, (_, i) => (65 + i) / 97));
+  assert.deepEqual(await readDepth(f, a, {face: 1}), new Float32Array(16).fill(0.875));
+  const pass = f.submissions[0][0][0];
+  assert.equal(pass.group.entries[0].resource.texture, pass.desc.depthStencilAttachment.view.texture);
+  assert.equal(pass.group.entries[0].resource.options.baseArrayLayer, 4);
+  assert.equal(pass.desc.depthStencilAttachment.view.options.baseArrayLayer, 1);
+  assert.equal(f.textures.length, 2); assert.equal(entry.references, 0); counts(f, 0);
+});
+
+test('public depth copies reject physical same-layer aliases across shared owners before allocation', async t => {
+  const f = setup(t, {initialized: false}), a = target({cube: false}), b = target({cube: false});
+  b.depthTexture = a.depthTexture;
+  await assert.rejects(f.renderer.copyRenderTargetDepthPixelsAsync(a, b),
+    {code: 'F3D_RENDERER_TRANSFER'});
+  const from = f.owner.capture(a), to = f.owner.capture(b);
+  assert.throws(() => f.owner.copyDepth(from, to, {}), {code: 'THREE_TARGET_FEEDBACK'});
+  assert.equal(f.textures.length, 0); assert.equal(f.renderer._pending.length, 0); counts(f, 0);
+  assert.equal(from.references, 1, 'only the shared owner lifetime remains retained');
+  assert.equal(to.references, 0); counts(f, 0);
+});
+
+test('cancelling a queued same-target depth copy releases its single generation lease', async t => {
+  const f = setup(t, {initialized: false, transferOptions: {maxRequests: 1}}), a = target(), abort = new AbortController();
+  const copy = f.renderer.copyRenderTargetDepthPixelsAsync(a, a, {sourceFace: 0, face: 1, signal: abort.signal});
+  const entry = f.owner.capture(a);
+  assert.equal(entry.references, 1); counts(f, 1);
+  abort.abort(new Error('cancel layer copy'));
+  await assert.rejects(copy, /cancel layer copy/);
+  assert.equal(entry.references, 0); counts(f, 0);
+  const retry = f.renderer.copyRenderTargetDepthPixelsAsync(a, a, {sourceFace: 0, face: 2});
+  f.drain(); await retry;
+  assert.equal(f.submissions.length, 1); assert.equal(entry.references, 0); counts(f, 0);
+});
+
 test('mapping and work fences do not stall later FIFO writes; read observes earlier content', async t => {
   const f = setup(t, {initialized: false}), a = target(), b = target(), mapping = deferred(), fence = deferred();
   f.control.mapping = mapping.promise; f.control.fence = fence.promise;
@@ -147,7 +193,7 @@ test('invalid copy/upload faces remain rejected even for empty regions and mixed
   for (const copy of [r.copyRenderTargetPixelsAsync, r.copyRenderTargetDepthPixelsAsync]) {
     await assert.rejects(copy(a, flat, {sourceFace: 0, face: 1}), faceError);
     await assert.rejects(copy(flat, a, {sourceFace: 1, face: 0}), faceError);
-    await assert.rejects(copy(a, a, {sourceFace: 0, face: 1}), {code: 'F3D_RENDERER_TRANSFER'});
+    await assert.rejects(copy(a, a, {sourceFace: 0, face: 0}), {code: 'F3D_RENDERER_TRANSFER'});
   }
   assert.equal(f.textures.length, 0); assert.equal(f.renderer._pending.length, 0); counts(f, 0);
 });
@@ -287,7 +333,7 @@ test('owner cube transfers retain reentrancy/feedback checks and invalidate only
     assert.throws(() => f.owner.copyColor(from, to, {sourceFace: 1, face: 2}), {code: 'THREE_TARGET_REENTRANT'});
     assert.throws(() => f.owner.writePixels(from, pixels(0), {face: 5}), {code: 'THREE_TARGET_REENTRANT'});
   }, {face: 2});
-  assert.throws(() => f.owner.copyColor(from, from, {sourceFace: 1, face: 2}), {code: 'THREE_TARGET_FEEDBACK'});
+  assert.throws(() => f.owner.copyColor(from, from, {sourceFace: 1, face: 1}), {code: 'THREE_TARGET_FEEDBACK'});
   await f.owner.whenIdle();
 });
 

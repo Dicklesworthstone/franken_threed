@@ -115,7 +115,7 @@ test('faces, aliasing, budgets, precision changes and usage fail before GPU work
     assert.throws(() => f.destination.copyDepthFrom(f.source, {sourceFace: 0, face: 0, ...edit}));
   const accessor = Object.defineProperty({sourceFace: 0}, 'face', {enumerable: true, get() { assert.fail('must not read getter'); }});
   assert.throws(() => f.destination.copyDepthFrom(f.source, accessor), code('OPTIONS'));
-  assert.throws(() => f.source.copyDepthFrom(f.source, {sourceFace: 0, face: 1}), {code: 'GPU_TARGET_FEEDBACK'});
+  assert.throws(() => f.source.copyDepthFrom(f.source, {sourceFace: 0, face: 0}), {code: 'GPU_TARGET_FEEDBACK'});
   assert.throws(() => inspectGpuDepthCopy({...data, cube: false}, data, {sourceFace: 1, face: 0}), code('FACE'));
   assert.throws(() => inspectGpuDepthCopy(data, {...data, cube: false}, {sourceFace: 0, face: 1}), code('FACE'));
   assert.throws(() => inspectGpuDepthCopy({...data, sampleCount: 4}, data, {sourceFace: 0, face: 1}), code('SOURCE'));
@@ -224,6 +224,68 @@ test('array color with shared 2D depth copies only its one depth attachment into
   assert.deepEqual(await f.destination.readDepthPixels({face: 2}), f.a.depth.data);
   assert.throws(() => f.destination.copyDepthFrom(f.source, {sourceFace: 2, face: 0}), code('FACE'));
   await f.destination.whenIdle();
+});
+
+for (const [name, dimension] of [
+  ['cube', {}], ['array', {cube: false, arrayLayers: 3, depthArray: true}],
+  ['volume color with array depth', {cube: false, volumeDepth: 3, depthArray: true}],
+]) test(`one ${name} target copies disjoint depth layers without changing color or stencil`, async t => {
+  const f = depthDevice(); f.device.limits.maxTextureDimension3D = 256;
+  const target = make(f, {...dimension, depthFormat: 'depth24plus-stencil8'});
+  t.after(() => target.dispose());
+  const {depth, color} = storage(target), count = depth.depthOrArrayLayers;
+  depth.data.set(Float32Array.from(depth.data, (_, i) => (i + 1) / 128)); depth.stencil.fill(71); color.data.fill(0.375);
+  const before = depth.data.slice(), expected = before.slice(), colors = color.data.slice();
+  for (let row = 0; row < 2; row++) for (let x = 0; x < 2; x++)
+    expected[(count - 1) * 16 + (row + 1) * 4 + x] = before[row * 4 + x + 1];
+  const allocations = f.textures.length;
+  assert.equal(target.copyDepthFrom(target.selectColorSlots([0]), {
+    sourceFace: 0, face: count - 1, sourceX: 1, x: 0, y: 1, width: 2, height: 2,
+  }), true);
+  const pass = f.submissions[0][0][0], sampled = pass.group.entries[0].resource, attached = pass.desc.depthStencilAttachment.view;
+  assert.equal(sampled.texture, depth); assert.equal(attached.texture, depth);
+  assert.equal(sampled.options.baseArrayLayer, 0); assert.equal(attached.options.baseArrayLayer, count - 1);
+  assert.equal(sampled.options.arrayLayerCount, 1); assert.equal(attached.options.arrayLayerCount, 1);
+  assert.deepEqual(depth.data, expected); assert.deepEqual(color.data, colors);
+  assert.ok(depth.stencil.every(value => value === 71)); assert.deepEqual(pass.desc.colorAttachments, []);
+  assert.equal(f.textures.length, allocations); assert.equal(f.buffers.length, 1); assert.equal(f.buffers[0].size, 32);
+  assert.throws(() => target.copyDepthFrom(target, {sourceFace: 0, face: 0, sourceX: 0, x: 2, width: 2}),
+    {code: 'GPU_TARGET_FEEDBACK'});
+  assert.equal(f.submissions.length, 1); assert.equal(f.buffers.length, 1);
+  await target.whenIdle(); assert.equal(f.buffers[0].destroyCount, 1);
+  assert.equal(target.diagnostics.depthCopies, 1); assert.equal(target.diagnostics.mipGenerations, 0);
+});
+
+test('shared cube depth owners permit disjoint faces and reject physical same-face aliases before submission', async t => {
+  const f = depthDevice(), a = make(f), b = make(f, {depthSource: a});
+  t.after(() => { b.dispose(); a.dispose(); });
+  const source = storage(a).depth, destination = storage(b).depth;
+  assert.equal(source, destination);
+  source.data.set(Float32Array.from(source.data, (_, i) => (i + 1) / 128));
+  const firstFace = source.data.slice(0, 16), allocations = f.textures.length;
+  assert.throws(() => b.copyDepthFrom(a, {sourceFace: 2, face: 2}), {code: 'GPU_TARGET_FEEDBACK'});
+  assert.equal(f.buffers.length, 0); assert.equal(f.submissions.length, 0);
+  b.copyDepthFrom(a, {sourceFace: 0, face: 1});
+  a.copyDepthFrom(b, {sourceFace: 1, face: 2});
+  assert.deepEqual(source.data.slice(16, 32), firstFace); assert.deepEqual(source.data.slice(32, 48), firstFace);
+  assert.equal(f.textures.length, allocations);
+  await Promise.all([a.whenIdle(), b.whenIdle()]);
+  assert.ok(f.buffers.every(buffer => buffer.destroyCount === 1));
+  a.resize(8, 8);
+  assert.throws(() => b.copyDepthFrom(a, {sourceFace: 0, face: 1}), {code: 'GPU_TARGET_STALE'});
+});
+
+test('a same-owner depth copy retains its one generation and uniform until completion across resize', async t => {
+  const f = depthDevice(), target = make(f), wait = deferred();
+  t.after(() => target.dispose());
+  const {depth} = storage(target); depth.data.fill(0.25, 0, 16);
+  f.control.fence = wait.promise;
+  target.copyDepthFrom(target, {sourceFace: 0, face: 5}); target.resize(8, 8);
+  await flush();
+  assert.equal(depth.destroyed, false); assert.equal(f.buffers[0].destroyCount, 0);
+  assert.ok(depth.data.slice(80).every(value => value === 0.25));
+  wait.resolve(); await target.whenIdle();
+  assert.equal(depth.destroyed, true); assert.equal(f.buffers[0].destroyCount, 1);
 });
 
 test('a selected private MSAA array depth layer receives every source sample without allocating an illegal MSAA array', async t => {

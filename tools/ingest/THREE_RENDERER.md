@@ -1663,6 +1663,25 @@ half-float output, ordinary and node materials, signed/HDR values, tone mapping,
 alpha, MSAA, queued changes and retained drawing. Hardware performance remains
 unmeasured.
 
+## Depth copies between layers
+
+The explicit `copyRenderTargetDepthPixelsAsync(source, destination, options)`
+extension can copy between distinct faces or depth-array layers of the same
+native target. `sourceFace` and `face` select the source and destination; the
+native owner also supports layered depth attached to volume color targets.
+These copies preserve color, stencil and unrelated depth layers without allocating
+a temporary image. Same-layer copies remain rejected, including nonoverlapping
+rectangles and separate handles that alias the same physical depth image.
+
+Submission uses the existing ordered transfer path. Accepted options and target
+generations remain captured while queued; same-target copies hold one generation
+lease, and cancellation or resize retains native resources until their submitted
+uses complete. Existing source admission limits still apply, including public
+shared cube-depth attachments. The 25 native depth, 14 shared-depth lifecycle and
+three new renderer integration tests pass using recording devices. This is
+command/data/lifecycle evidence, not real-browser pixel parity or a performance
+measurement.
+
 ## Explicit differences
 
 - Structural edits (new objects/materials, material structure, enabling fog,

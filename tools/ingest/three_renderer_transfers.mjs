@@ -211,10 +211,13 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
         assertThreeNativeTextureWrite(renderer, destination?.depthTexture);
         const {value, signal} = options(supplied);
         const from = transferEntry(source), to = transferEntry(destination);
-        if (from === to) fail('TRANSFER', 'In-place render target copies are not admitted');
         const plan = inspectGpuDepthCopy({...from.shape, sampleDepth: from.shape.depthTexture !== null}, to.shape, value);
+        const fromDepth = from.depthEntry ?? from, toDepth = to.depthEntry ?? to;
+        if ((fromDepth === toDepth || fromDepth.historyGroup && fromDepth.historyGroup === toDepth.historyGroup) &&
+            plan.sourceFace === plan.face)
+          fail('TRANSFER', 'Depth copies cannot read and write the same depth subresource');
         const copyOptions = Object.freeze({...value, width: plan.width, height: plan.height});
-        return schedule([from, to], signal, 0, () => () => renderer._targets.copyDepth(from, to, copyOptions));
+        return schedule(from === to ? [from] : [from, to], signal, 0, () => () => renderer._targets.copyDepth(from, to, copyOptions));
       } catch (error) { return Promise.reject(error); }
     },
     copyColor(source, destination, supplied = {}) {

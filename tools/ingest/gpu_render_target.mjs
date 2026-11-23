@@ -1049,19 +1049,29 @@ export function createGpuRenderTarget(device, options = {}) {
       const other = transferTargets.get(source);
       if (!other) fail('SOURCE', 'Expected a native render target handle');
       if (other.device !== device) fail('DEVICE', 'Depth copies require the same GPUDevice');
-      if (other.owner === api) fail('FEEDBACK', 'In-place depth copies are not admitted');
       other.exclusive();
       const plan = inspectGpuDepthCopy(other.depthShape(), depthShape(), options);
+      const sameOwner = other.owner === api;
+      // Depth views select one mip-zero 2D array layer. Different layers are
+      // separate WebGPU usage subresources, even within one shared allocation.
+      // Rectangles within a layer cannot legalize sampled/attachment feedback.
+      if ((sameOwner || current?.depth && current.depth === other.depthIdentity()) && plan.sourceFace === plan.face)
+        fail('FEEDBACK', 'Depth copies cannot read and write the same depth subresource');
       if (plan.empty) return false;
       busy = true;
       try {
         current.used = true;
         let completion;
-        other.borrowDepth(texture => {
-          if (texture === current.depth) fail('FEEDBACK', 'Depth copies cannot read and write the same shared image');
+        const copy = texture => {
+          if (texture === current.depth && plan.sourceFace === plan.face)
+            fail('FEEDBACK', 'Depth copies cannot read and write the same depth subresource');
           const view = cube || depthArray ? current.layerFrames[plan.face].depthView : current.depthView;
           completion = submitGpuDepthCopy(device, texture, view, plan);
-        });
+        };
+        // The same owner is already locked and its generation is captured.
+        // Reborrowing it would reject legal layer copies as reentrant work.
+        if (sameOwner) copy(current.depth);
+        else other.borrowDepth(copy);
         // Depth-only writes must not regenerate color mips. Source validation
         // remains a dependency even if this pass itself validates successfully.
         validation = Promise.all([validation, other.validation(), completion]).then(() => {});
@@ -1096,6 +1106,7 @@ export function createGpuRenderTarget(device, options = {}) {
       releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
         info => stop(new GpuRenderTargetError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
     transferTargets.set(api, {owner: api, device, exclusive, shape: transferShape, depthShape,
+      depthIdentity: () => current?.depth,
       shareDepth(shape) {
         live();
         const actual = depthShape(), storage = current?.depthStorage;
