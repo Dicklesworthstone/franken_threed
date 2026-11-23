@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import SourceRenderObject from '../../upstream/three.js/src/renderers/common/RenderObject.js';
+import SourceRenderObjects from '../../upstream/three.js/src/renderers/common/RenderObjects.js';
+import SourceNodeManager from '../../upstream/three.js/src/renderers/common/nodes/NodeManager.js';
 import {createThreeNodePrograms} from './three_node_program.mjs';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
@@ -69,6 +71,26 @@ function sourceBuilder(f) {
   source.environmentNode = f.scene.environmentNode ?? (f.scene.environment ? N.texture(f.scene.environment) : null);
   source.build(); return source;
 }
+function sourceCache(t, f) {
+  // Exercise unchanged RenderObject/NodeManager lifetimes, not a fresh source
+  // builder on every draw: the cache collision is the behavior under test.
+  const renderer = Object.create(f.renderer), backend = Object.create(f.renderer.backend);
+  Object.defineProperty(renderer, 'backend', {value: backend});
+  renderer.debug = {...f.renderer.debug, onNodeBuilderCreated: null};
+  backend.createNodeBuilder = object => new T.WGSLNodeBuilder(object, renderer);
+  const nodes = new SourceNodeManager(renderer, backend);
+  const source = new SourceRenderObjects(renderer, nodes, {}, {delete() {}}, {deleteForRender() {}}, {});
+  const lights = N.lights(f.context.lights), renderContext = {id: 0};
+  t.after(() => source.dispose());
+  return (object = f.object, material = object.material) => {
+    const owner = source.get(object, material, f.scene, f.camera, lights, renderContext, null);
+    return {owner, state: owner.getNodeBuilderState()};
+  };
+}
+function assertSourceProgram(descriptor, reference) {
+  assert.equal(descriptor.vertex, reference.state.vertexShader);
+  assert.equal(descriptor.fragment, reference.state.fragmentShader);
+}
 const meshPackets = f => f.captures.flatMap(frame => frame.draws).filter(draw => draw.object === f.object);
 const rawPackets = f => f.rawDraws.filter(draw => draw.object === f.object).map(draw => draw.packet);
 
@@ -103,35 +125,64 @@ test('source combine operations and mapping changes select fresh guarded variant
   assert.throws(() => f.programs.captureDraw(variants[2], f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
   const reflected = f.compile(); f.material.envMap.mapping = T.CubeRefractionMapping;
   assert.throws(() => f.programs.captureDraw(reflected, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  f.material.needsUpdate = true;
   const refracted = f.compile(); assert.notEqual(refracted, reflected); assert.match(refracted.fragment, /refract\(/);
 });
 
-test('pinned Mix/Add cache collisions require an explicit source rebuild boundary', async t => {
-  const f = fixture(t, T.MeshPhongMaterial); await f.renderer.init();
+for (const Material of [T.MeshBasicMaterial, T.MeshLambertMaterial, T.MeshPhongMaterial,
+  T.MeshBasicNodeMaterial, T.MeshLambertNodeMaterial, T.MeshPhongNodeMaterial])
+for (const initial of [T.MixOperation, T.AddOperation])
+test(`${Material.name} preserves source ${initial === T.MixOperation ? 'Mix-to-Add' : 'Add-to-Mix'} construction and real invalidation`, async t => {
+  const f = fixture(t, Material); await f.renderer.init();
+  const reference = sourceCache(t, f);
   const cacheView = {object: f.object, material: f.material, renderer: {backend: {isWebGPUBackend: true}},
     context: {id: 0}, clippingContextCacheKey: '', getGeometryCacheKey: () => 'same-geometry'};
   const sourceKey = () => SourceRenderObject.prototype.getMaterialCacheKey.call(cacheView);
-  f.material.combine = T.MixOperation;
-  const firstKey = sourceKey(), first = f.compile();
-  f.material.combine = T.AddOperation; f.material.needsUpdate = true;
+  f.material.combine = initial;
+  const firstKey = sourceKey(), firstReference = reference(), first = f.compile();
+  assertSourceProgram(first, firstReference);
+  const firstPacket = f.programs.captureDraw(first, f.context), saved = firstPacket.uniforms.map(bytes => bytes.slice());
+  f.material.combine = initial === T.MixOperation ? T.AddOperation : T.MixOperation;
+  f.material.needsUpdate = true; f.material.reflectivity = .875;
   assert.equal(sourceKey(), firstKey, 'the pinned renderer ignores this numeric-enum transition even with needsUpdate');
-  assert.throws(() => f.compile(), {code: 'THREE_NODE_PROGRAM_ENVIRONMENT_CACHE'});
+  const retainedReference = reference(), retained = f.compile();
+  assert.equal(retainedReference.owner, firstReference.owner); assert.equal(retainedReference.state, firstReference.state);
+  assert.equal(retained, first); assertSourceProgram(retained, retainedReference);
+  const retainedPacket = f.programs.captureDraw(retained, {...f.context, renderId: 2});
+  assert.ok(values(retainedPacket).includes(.875)); assert.deepEqual(firstPacket.uniforms, saved);
   f.material.dispose();
-  const rebuilt = f.compile(); assert.notEqual(rebuilt.fragment, first.fragment);
-  assert.equal(rebuilt.fragment, sourceBuilder(f).fragmentShader);
+  const freshReference = reference(), rebuilt = f.compile();
+  assert.notEqual(freshReference.owner, firstReference.owner); assert.notEqual(freshReference.state, firstReference.state);
+  assert.notEqual(rebuilt.fragment, first.fragment); assertSourceProgram(rebuilt, freshReference);
+  f.material.combine = T.MultiplyOperation; f.material.needsUpdate = true;
+  const multipliedReference = reference(), multiplied = f.compile();
+  assert.notEqual(multipliedReference.state, freshReference.state); assert.notEqual(multiplied, rebuilt);
+  assertSourceProgram(multiplied, multipliedReference);
 });
 
-test('pinned texture environment mapping changes require a fresh authored graph', async t => {
+for (const initial of [T.CubeReflectionMapping, T.CubeRefractionMapping])
+test(`authored cube mapping ${initial} preserves source construction until its graph changes`, async t => {
   const f = fixture(t, T.MeshPhongNodeMaterial); await f.renderer.init();
-  const texture = f.material.envMap; f.material.envMap = null; f.material.envNode = N.cubeTexture(texture);
-  const key = f.material.customProgramCacheKey(), reflected = f.compile();
-  texture.mapping = T.CubeRefractionMapping; f.material.needsUpdate = true;
+  const reference = sourceCache(t, f), texture = f.material.envMap;
+  texture.mapping = initial; f.material.envMap = null; f.material.envNode = N.cubeTexture(texture);
+  const key = f.material.customProgramCacheKey(), firstReference = reference(), first = f.compile();
+  assertSourceProgram(first, firstReference);
+  texture.mapping = initial === T.CubeReflectionMapping ? T.CubeRefractionMapping : T.CubeReflectionMapping;
+  f.material.needsUpdate = true;
   assert.equal(f.material.customProgramCacheKey(), key, 'texture mappings do not change the pinned graph key');
-  assert.throws(() => f.compile(), {code: 'THREE_NODE_PROGRAM_ENVIRONMENT_CACHE'});
+  const retainedReference = reference(), retained = f.compile();
+  assert.equal(retainedReference.state, firstReference.state); assert.equal(retained, first);
+  assertSourceProgram(retained, retainedReference);
+  assert.deepEqual(sampled(f.programs.captureDraw(retained, f.context)), [texture]);
   f.material.envNode = N.cubeTexture(texture);
   assert.notEqual(f.material.customProgramCacheKey(), key);
-  const refracted = f.compile(); assert.notEqual(refracted.fragment, reflected.fragment);
-  assert.equal(refracted.fragment, sourceBuilder(f).fragmentShader);
+  assert.equal(reference().state, firstReference.state, 'an unmarked replacement does not invalidate the source');
+  assert.equal(f.compile(), first);
+  f.material.needsUpdate = true;
+  const freshReference = reference(), rebuilt = f.compile();
+  assert.notEqual(freshReference.state, firstReference.state); assert.notEqual(rebuilt.fragment, first.fragment);
+  assertSourceProgram(rebuilt, freshReference);
+  assert.deepEqual(sampled(f.programs.captureDraw(rebuilt, {...f.context, renderId: 2})), [texture]);
 });
 
 test('reflectivity, specular strength, refraction and rotation stay live while accepted bytes are immutable', async t => {
@@ -168,6 +219,7 @@ test(`source ${reference ? 'material-reference' : 'cube-texture'} envNode takes 
   f.material.envNode = N.cubeTexture(cube(t, 112));
   assert.throws(() => f.programs.captureDraw(descriptor, {...f.context, renderId: 2}), {code: 'THREE_NODE_PROGRAM_CHANGED'});
   assert.equal(updates, 1, 'graph replacement rejects before callbacks');
+  f.material.needsUpdate = true;
   assert.notEqual(f.compile(), descriptor);
 });
 

@@ -933,14 +933,15 @@ The pinned renderer has two relevant cache limitations: its material cache
 reduces numeric properties other than `side` to zero/nonzero, which aliases
 `MixOperation` and `AddOperation`, and a texture node's graph cache key excludes
 the texture's mapping. `material.needsUpdate = true` alone does not invalidate
-those source shaders. A retained Mix/Add transition therefore requires an
-explicit material-disposal or environment-graph replacement boundary; changing
-a texture `envNode`'s mapping requires replacing that node or disposing its
-material. Native preparation reports `THREE_NODE_PROGRAM_ENVIRONMENT_CACHE`
-for these unsupported live transitions instead of silently building a shader
-that the pinned renderer would not build. The browser fixtures use these actual
-source invalidation boundaries. General emulation of source builder-cache
-collisions across otherwise-identical distinct materials is outside this slice.
+those source shaders. The admitted shared-construction profiles now preserve
+that existing source builder when these live controls change. Mix/Add switches
+and authored cube reflection/refraction switches retain the source shader,
+while reflectivity, refraction ratio and compatible texture bindings remain
+live. Native preparation no longer refuses these otherwise-valid operations.
+Material disposal or a changed source program key rebuilds the shader at the
+same boundary as the pinned renderer; a replacement authored environment node
+also needs the source material invalidation. Geometry and context profiles
+outside shared construction retain their existing explicit cache boundaries.
 
 Queued draws retain their environment textures, sampler/upload histories and
 uniform bytes through the existing owners. A later material replacement or live
@@ -951,14 +952,15 @@ this BasicEnvironmentNode path: the pinned CubeMapNode does not produce a cube
 texture for them. Standard/Physical procedural environment graphs keep their
 existing separate source semantics.
 
-Twenty-five focused `three_renderer_native_basic_environment.test.mjs` cases pass,
-including complete source WGSL equality for all six material forms in reflection
-and refraction modes, source precedence, combine variants, live controls,
-callback guards, pinned cache-key/refusal/recovery behavior, queued native draws,
+The focused `three_renderer_native_basic_environment.test.mjs` suite compares
+unchanged source `RenderObjects` and `NodeManager` cache lifetimes, including both
+Mix/Add directions across all six material forms, authored cube mapping changes,
+version-only invalidation, disposal and real program-key changes. It also checks
+complete source WGSL, live controls, callback guards, queued native draws,
 environment removal/restoration and actual six-face conversion commands.
-Seventeen directly affected PBR material/environment regression cases also pass.
-These record-device checks verify shader/resource behavior. The separate
-`native_basic_environment.mjs` browser comparisons execute WGSL for mixed
+These recording-device checks verify shader/resource behavior for the new live
+transitions. Separate `native_basic_environment.mjs` browser comparisons predate
+this change. They execute WGSL for mixed
 Basic/Lambert/Phong cube materials, panorama conversion with an authored node,
 and an animated skinned Phong mesh. All three cases match the pinned source
 exactly at frames 1, 7, 8, 10, 12, 13 and 30: 21 checkpoints and 1,032,192 RGBA

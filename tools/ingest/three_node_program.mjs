@@ -825,6 +825,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return lights.slice().sort((a, b) => a.id - b.id);
   }
   const basicEnvironmentMaterial = material => basicEnvironmentPrototypes.includes(materialPrototype(material));
+  const sharedBasicEnvironmentMaterial = material => (material.envMap != null || material.envNode != null) &&
+    (basicEnvironmentMaterial(material) || [three.MeshBasicMaterial, three.MeshLambertMaterial, three.MeshPhongMaterial]
+      .some(Type => Object.getPrototypeOf(material) === Type.prototype));
   const environmentEnabled = material => (standardPrototypes.includes(materialPrototype(material)) || basicEnvironmentMaterial(material)) &&
     material.lights === true && material.fragmentNode == null && renderer.lighting?.enabled !== false;
   const environmentGraph = (material, {scene} = {}) => environmentEnabled(material)
@@ -1069,7 +1072,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const property of reference.properties) value = value?.[property];
     return value;
   }
-  function textureSignature(nodes, references = null, filtering = null) {
+  function textureSignature(nodes, references = null, filtering = null, mappings = null) {
     const aliases = new Map(), checked = new Map();
     return JSON.stringify(nodes.map(node => {
       const texture = references ? textureValue(node, references) : node.value;
@@ -1104,7 +1107,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         texture.isVideoTexture === true, texture.isVideoFrameTexture === true,
         texture.is3DTexture === true, texture.isData3DTexture === true, node.isTexture3DNode === true,
         texture.is3DTexture === true || texture.isData3DTexture === true ? [texture.wrapS, texture.wrapT, texture.wrapR] : null,
-        texture.isCubeTexture === true ? texture.mapping : null,
+        texture.isCubeTexture === true ? mappings?.get(node) ?? texture.mapping : null,
         renderer.backend.utils.getTextureSampleData(texture).primarySamples,
         texture.isDepthTexture === true, texture.isDepthTexture === true ? texture.compareFunction : null,
         node.isSampleCompare?.() === true, texture.isDepthTexture === true && texture.compareFunction !== null
@@ -1571,8 +1574,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // Preserve that profile and its restrictions before admitting the wider
     // ordinary-material profile; a key does not turn a geometry constructor
     // into a registered material extension.
+    // Non-PBR environments select combine and reflection/refraction while
+    // constructing their source graph. RenderObject's key intentionally keeps
+    // some later enum/mapping changes on that existing NodeBuilderState.
     const extension = registeredExtension || !geometrySetup &&
-      (retainMaterial || hasThreeCustomProgramCacheKey(three, material));
+      (retainMaterial || hasThreeCustomProgramCacheKey(three, material) || sharedBasicEnvironmentMaterial(material));
     const prototype = materialPrototype(prepared);
     // r186 keys InstancedMesh builders by object UUID: their instance nodes
     // close over that object's matrix/color attributes. Reuse the existing
@@ -1750,7 +1756,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     let materials = customKeyCache.get(object), passes = materials?.get(material), record = passes?.get(chain);
     if (!record && !hasThreeCustomProgramCacheKey(three, material) &&
         !materialExtension(material) && !customGeometrySetup(material)) {
-      if (!lazyGeometrySetup(material)) return compileProgram(material, object, context);
+      if (!lazyGeometrySetup(material) && !sharedBasicEnvironmentMaterial(material)) return compileProgram(material, object, context);
       const prepared = inspect(material, object, context);
       if (!sharedConstruction(material, prepared, object, context, sourceLights(prepared, context),
           inspectThreeLightingContext(three, renderer.contextNode), true)) return compileProgram(material, object, context);
@@ -1811,6 +1817,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       state.environment = environment;
       state.materialEnvironment = materialEnvironment(prepared, environment);
       state.environmentGraph = environmentGraphKey(prepared, context);
+      state.basicEnvironmentSignature = basicEnvironmentSignature(prepared, environment);
       state.mrtSignature = inspectThreeMRT(three, renderer, prepared)?.key ?? null;
       return record.entry.descriptor;
     }
@@ -1899,6 +1906,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       previousState.environment = environment;
       previousState.materialEnvironment = materialEnvironment(preparedMaterial, environment);
       previousState.environmentGraph = environmentGraphKey(preparedMaterial, context);
+      previousState.basicEnvironmentSignature = basicEnvironmentSignature(preparedMaterial, environment);
       // Source RenderContexts shares equal attachment layouts, and retains an
       // MRT node's constructed graph until its real material/context key changes.
       // Accept this draw's current targets/graph metadata without replaying setup;
@@ -2219,6 +2227,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       textureReferences.set(node.node.getBase(), {material: node.material ?? material, properties: node.properties.slice()});
     const textureNodes = [...graphNodes].filter(node => node.isTextureNode && boundTextures.has(node.value));
     const signature = textureSignature(textureNodes, textureReferences);
+    // Cube mappings only choose generated UV arithmetic. A shared source
+    // builder retains that arithmetic until its actual cache key changes;
+    // compatible texture bindings and uniform values continue to update.
+    const textureMappings = sharedBuilder && basicEnvironmentMaterial(preparedMaterial)
+      ? new Map(textureNodes.filter(node => textureValue(node, textureReferences)?.isCubeTexture === true)
+        .map(node => [node, textureValue(node, textureReferences).mapping])) : null;
     const textureFiltering = new WeakMap();
     for (const texture of [...textureNodes.map(node => textureValue(node, textureReferences)),
       ...[...MATERIAL_MAPS].map(key => material[key])]) if (texture?.isTexture === true)
@@ -2255,7 +2269,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       clippingSamples: material.alphaToCoverage && renderer.currentSamples > 1, pmremNodes, pmremSignature: pmremKey,
       integerTextures: textureNodes.some(node => integerTextureType(node.value)),
       storageTextures: textureNodes.some(node => node.isStorageTextureNode),
-      textureNodes, textureReferences, textureFiltering, materialVersion: material.version,
+      textureNodes, textureReferences, textureFiltering, textureMappings, materialVersion: material.version,
       materialSide: preparedMaterial.side, sidePass: context.sidePass === true,
       textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, skinUniforms, uniformSignature: uniformKey,
@@ -2509,7 +2523,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // a later application callback may already have edited the public map.
     const references = liveReferences ? state.textureReferences : null;
     const filtering = state.materialVersion === state.material.version ? state.textureFiltering : null;
-    if (textureSignature(state.textureNodes, references, filtering) !== state.textureSignature)
+    if (textureSignature(state.textureNodes, references, filtering, state.textureMappings) !== state.textureSignature)
       fail('CHANGED', 'Native node texture layout, UV channel or binding aliases changed; compile the graph again');
     const textures = [];
     for (const [group, source] of state.bindings.entries()) for (const [binding, value] of source.bindings.entries())
