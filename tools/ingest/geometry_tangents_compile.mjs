@@ -2,10 +2,17 @@
  * methods. Number accumulators stay f64; only source attribute stores round.
  * The two source group passes call private Wasm helpers in their original order.
  */
-import {normalClasses,normalMethod} from './geometry_normals_compile.mjs';
+import {normalClasses,normalMethod,deriveAttributeDenormalizers} from './geometry_normals_compile.mjs';
 import {compileNumericKernel} from './numeric_kernel.mjs';
 
-export function deriveGeometryTangentKernel(geometrySource,vectorSource,vector2Source,attributeSource) {
+export function deriveGeometryTangentKernel(geometrySource,vectorSource,vector2Source,attributeSource,mathUtilsSource) {
+  const sources=[geometrySource,vectorSource,vector2Source,attributeSource];
+  const derived=deriveTangentKernel(...sources);
+  if(mathUtilsSource)derived.packed=deriveTangentKernel(...sources,deriveAttributeDenormalizers(mathUtilsSource));
+  return derived;
+}
+
+function deriveTangentKernel(geometrySource,vectorSource,vector2Source,attributeSource,denormalizers=null) {
   const geometry=normalClasses(geometrySource).get('BufferGeometry');
   const classes={Vector3:normalClasses(vectorSource).get('Vector3'),Vector2:normalClasses(vector2Source).get('Vector2'),
     attribute:normalClasses(attributeSource).get('BufferAttribute')};
@@ -21,11 +28,16 @@ export function deriveGeometryTangentKernel(geometrySource,vectorSource,vector2S
   const requirements={Vector3:new Set(),Vector2:new Set(),attribute:new Set()};
   const scalar=value=>typeof value==='string';
   const vector=(type,components)=>({kind:type,components});
-  const attr=(array,stride,offset='0')=>({kind:'attribute',array,stride,offset});
+  const attr=(array,stride,offset='0',normalization=null)=>({kind:'attribute',array,stride,offset,normalization});
   const layoutParameters='positionStride,positionOffset,normalStride,normalOffset,uvStride,uvOffset,tangentStride,tangentOffset';
-  const base=new Map([['positionAttribute',attr('positions','positionStride','positionOffset')],
-    ['normalAttribute',attr('normals','normalStride','normalOffset')],
-    ['uvAttribute',attr('uvs','uvStride','uvOffset')],['tangentAttribute',attr('tangents','tangentStride','tangentOffset')],
+  const normalizationParameters=denormalizers?',positionNormalization,normalNormalization,uvNormalization':'';
+  const triangleCaptures='positions,uvs,tan1,tan2,positionStride,positionOffset,uvStride,uvOffset'+
+    (denormalizers?',positionNormalization,uvNormalization':'');
+  const vertexCaptures='normals,tangents,tan1,tan2,normalStride,normalOffset,tangentStride,tangentOffset'+
+    (denormalizers?',normalNormalization':'');
+  const base=new Map([['positionAttribute',attr('positions','positionStride','positionOffset','positionNormalization')],
+    ['normalAttribute',attr('normals','normalStride','normalOffset','normalNormalization')],
+    ['uvAttribute',attr('uvs','uvStride','uvOffset','uvNormalization')],['tangentAttribute',attr('tangents','tangentStride','tangentOffset')],
     ['index',attr('indices','1')],
     ['groups',{kind:'groups'}],['tan1',{kind:'pool',array:'tan1'}],['tan2',{kind:'pool',array:'tan2'}]]);
   const number=(node,env,out)=>{const result=value(node,env,out);if(!scalar(result))throw new TypeError('A tangent object cannot escape');return result;};
@@ -34,14 +46,15 @@ export function deriveGeometryTangentKernel(geometrySource,vectorSource,vector2S
     if(node.type==='ThisExpression')return env.get('this');
     if(node.type==='Literal')return node.raw??JSON.stringify(node.value);
     if(node.type==='MemberExpression') {
-      // The guarded native accessors differ only in integer addresses. Keep
-      // source arithmetic and store conversions intact; no packed attribute
-      // copy or extra specialization family is needed for interleaved records.
+      // The guarded native accessors differ only in integer addresses and the
+      // source's optional constructor-specific denormalization. Integer reads
+      // widen exactly before the original f64 vector arithmetic.
       if(node.computed && node.object.type==='MemberExpression' && !node.object.computed && node.object.property.name==='array') {
         const owner=value(node.object.object,env,out);
         if(owner?.kind==='attribute') {
           const index=number(node.property,env,out);
-          return `${owner.array}[${owner.offset==='0'?index:`(${index} + ${owner.offset})`}]`;
+          const load=`${owner.array}[${owner.offset==='0'?index:`(${index} + ${owner.offset})`}]`;
+          return denormalizers && owner.normalization?`__f3d_denormalize(${load},${owner.normalization})`:load;
         }
       }
       const object=value(node.object,env,out),key=node.property.name;
@@ -76,8 +89,8 @@ export function deriveGeometryTangentKernel(geometrySource,vectorSource,vector2S
           // All admitted arguments are Numbers; the native global is guarded.
           return `(${arg}===${arg} && ${arg}!==(1/0) && ${arg}!==(-1/0))`;
         }
-        const captures=node.callee.name==='handleTriangle'?'positions,uvs,tan1,tan2,positionStride,positionOffset,uvStride,uvOffset':
-          node.callee.name==='handleVertex'?'normals,tangents,tan1,tan2,normalStride,normalOffset,tangentStride,tangentOffset':null;
+        const captures=node.callee.name==='handleTriangle'?triangleCaptures:
+          node.callee.name==='handleVertex'?vertexCaptures:null;
         if(!captures)throw new TypeError('Unknown tangent helper');
         out.push(`${node.callee.name}(${captures},${args.join(',')});`);return null;
       }
@@ -93,8 +106,8 @@ export function deriveGeometryTangentKernel(geometrySource,vectorSource,vector2S
         }else scope.set(parameter.name,argument);
       });
       for(const statement of called.body.body) {
-        // The only attribute branches normalize input/output. The runtime
-        // requires normalized === false and the source's exact accessors.
+        // Input normalization is lowered at the source load above. Output and
+        // index normalization stay guarded off; source stores remain typed.
         if(receiver.kind==='attribute' && statement.type==='IfStatement')continue;
         if(statement.type==='ReturnStatement')return value(statement.argument,scope,out);
         emit(statement,scope,out);
@@ -150,12 +163,22 @@ export function deriveGeometryTangentKernel(geometrySource,vectorSource,vector2S
     return `function ${node.id.name}(${captures},${node.params.map(param=>param.name).join(',')}){${output.join('')}}`;
   }
   const helperSources=new Map([
-    ['handleTriangle',helper(triangle,'positions,uvs,tan1,tan2,positionStride,positionOffset,uvStride,uvOffset')],
-    ['handleVertex',helper(vertex,'normals,tangents,tan1,tan2,normalStride,normalOffset,tangentStride,tangentOffset')],
+    ['handleTriangle',helper(triangle,triangleCaptures)],
+    ['handleVertex',helper(vertex,vertexCaptures)],
   ]);
+  if(denormalizers) {
+    // A runtime type code selects the verified switch's exact return expression.
+    // This keeps arbitrary mixed quantized inputs to four additional kernels,
+    // instead of multiplying all position/normal/UV storage combinations.
+    let code=0;
+    const branches=[...denormalizers.values()].map(({parameter,expression})=>
+      `if(type===${++code}){let ${parameter}=input;return ${expression};}`).join('');
+    helperSources.set('__f3d_denormalize',`function __f3d_denormalize(input,type){${branches}return input;}`);
+  }
   const output=[];for(const pass of passes)emit(pass,new Map(base),output);
-  const source=`function computeTangents(positions,normals,uvs,indices,tangents,groups,tan1,tan2,groupCount,${layoutParameters}){`+output.join('')+'}';
+  const source=`function computeTangents(positions,normals,uvs,indices,tangents,groups,tan1,tan2,groupCount,${layoutParameters}${normalizationParameters}){`+output.join('')+'}';
   return {source,helperSources,span:{start:body[start].start,end:body[end-1].end},
+    normalizationTypes:denormalizers?[...denormalizers.keys()]:null,
     requirements:Object.fromEntries(Object.entries(requirements).map(([kind,names])=>[kind,[...names]]))};
 }
 
@@ -171,5 +194,13 @@ export function compileGeometryTangentKernels(derived,{maxMemoryPages=2048,maxIt
         sourceName:'pinned BufferGeometry.computeTangents'});
       variants.push({types,base64:Buffer.from(artifact.wasm).toString('base64')});
     }
+  if(derived.packed)for(const tangent of ['f32[]','f64[]'])for(const index of ['u16[]','u32[]']) {
+    const types=['f64[]','f64[]','f64[]',index,tangent];
+    const artifact=compileNumericKernel(derived.packed.source,{parameterTypes:[...types,'f64[]','f64[]','f64[]',...Array(12).fill('f64')],
+      helperSources:derived.packed.helperSources,generalControl:true,allowMath:true,maxMemoryPages,maxIterations,
+      sourceName:'pinned BufferGeometry.computeTangents quantized inputs'});
+    variants.push({types,packedInputs:true,normalizationTypes:derived.packed.normalizationTypes,
+      base64:Buffer.from(artifact.wasm).toString('base64')});
+  }
   return variants;
 }

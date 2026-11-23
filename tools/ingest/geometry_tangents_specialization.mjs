@@ -9,26 +9,32 @@ const fresh=(source,name)=>{let value='__f3d_tangent_'+name;while(source.include
 export function geometryTangentSourceRole(source) {
   return sourceBlob(source)===vector2Blob?'vector2':geometryNormalSourceRole(source);
 }
-export function specializeGeometryTangents(source,{runtimeModule,vectorSource,vector2Source,attributeSource,
+export function specializeGeometryTangents(source,{runtimeModule,vectorSource,vector2Source,attributeSource,mathUtilsSource,
   maxMemoryPages=2048,maxIterations=100000000}={}) {
   const role=geometryTangentSourceRole(source);
   if(!role)return {changed:false,edits:[],header:'',tail:''};
   const classes=normalClasses(source),edits=[],headers=[],tails=[],register=fresh(source,'class');
   const report={sourceBlob:sourceBlob(source),upstreamCommit:'148ef33ecb6d2502ff796d4554abd1549c95d519',role,
     compiledMethods:[],accelerationClaim:false};
+  const normalizationPinned=role==='core' || geometryTangentSourceRole(mathUtilsSource??'')==='math-utils';
+  const normalizationProof=normalizationPinned?'()=>denormalize':'null';
   headers.push(`import {registerGeometryTangentClass as ${register}} from ${JSON.stringify(runtimeModule)};`);
   if(role==='core' || role==='vector')tails.push(`${register}('Vector3',Vector3);`);
   if(role==='core' || role==='vector2')tails.push(`${register}('Vector2',Vector2);`);
   if(role==='core' || role==='attributes')
-    tails.push(`${register}('attribute',BufferAttribute,[Float32BufferAttribute,Uint16BufferAttribute,Uint32BufferAttribute]);`);
+    tails.push(`${register}('attribute',BufferAttribute,[Float32BufferAttribute,Uint16BufferAttribute,Uint32BufferAttribute,`+
+      `Int8BufferAttribute,Uint8BufferAttribute,Uint8ClampedBufferAttribute,Int16BufferAttribute,Int32BufferAttribute],"contiguous",${normalizationProof});`);
   if(role==='core' || role==='interleaved-attributes')
-    tails.push(`${register}('attribute',InterleavedBufferAttribute,[],"interleaved");`);
+    tails.push(`${register}('attribute',InterleavedBufferAttribute,[],"interleaved",${normalizationProof});`);
   if(role==='core' || role==='geometry') {
-    if(role==='core'){vectorSource=source;vector2Source=source;attributeSource=source;}
+    if(role==='core'){vectorSource=source;vector2Source=source;attributeSource=source;mathUtilsSource=source;}
     else if(geometryTangentSourceRole(vectorSource??'')!=='vector' || geometryTangentSourceRole(vector2Source??'')!=='vector2' ||
         geometryTangentSourceRole(attributeSource??'')!=='attributes')
       return {changed:false,edits:[],header:'',tail:'',report:{...report,reason:'DEPENDENCY_PIN_MISMATCH'}};
-    const derived=deriveGeometryTangentKernel(source,vectorSource,vector2Source,attributeSource);
+    // Modified helpers cannot authorize constructor-dependent decoding. The
+    // existing unnormalized float family does not depend on MathUtils.
+    if(!normalizationPinned)mathUtilsSource=undefined;
+    const derived=deriveGeometryTangentKernel(source,vectorSource,vector2Source,attributeSource,mathUtilsSource);
     const variants=compileGeometryTangentKernels(derived,{maxMemoryPages,maxIterations});
     const attempt=fresh(source,'try'),create=fresh(source,'create'),token=fresh(source,'dispatch'),allocation=fresh(source,'allocation');
     headers.push(`import {tryGeometryTangents as ${attempt},createGeometryTangentDispatch as ${create},`+

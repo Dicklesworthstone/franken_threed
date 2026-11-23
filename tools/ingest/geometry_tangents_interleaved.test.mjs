@@ -219,13 +219,13 @@ test('nonfinite tangent results preserve source payloads before any interleaved 
   }
 });
 
-test('normalized or noncanonical interleaved layouts retain the original method',()=>{
+test('normalized tangent output or noncanonical interleaved layouts retain the original method',()=>{
   const {api}=fixtures[0];
   for(const kind of ['normalized','offset','fractional-stride','count']) {
     const a=geometry(api),b=geometry(reference);
     for(const value of [a,b]) {
       const record=value.records.uv;
-      if(kind==='normalized')record.attribute.normalized=true;
+      if(kind==='normalized')value.records.tangent.attribute.normalized=true;
       if(kind==='offset')record.attribute.offset=record.stride;
       if(kind==='fractional-stride')record.data.stride=4.5;
       if(kind==='count')record.data.count=4;
