@@ -7,6 +7,7 @@ import {rollup} from 'rollup';
 import {marchingCubesRollupPlugin} from './marching_cubes_rollup.mjs';
 import {specializeTransformBatch} from './transform_batch_specialization.mjs';
 import {specializeMatrixMultiply} from './matrix_multiply_specialization.mjs';
+import {specializeMarchingCubesBase} from './marching_cubes_specialization.mjs';
 import * as reference from '../../upstream/three.js/build/three.core.js';
 import {BundleGroup as ReferenceBundleGroup} from '../../upstream/three.js/build/three.webgpu.js';
 
@@ -14,19 +15,20 @@ const upstream=fileURLToPath(new URL('../../upstream/three.js/',import.meta.url)
 async function fixture(options={},withBundleGroup=false) {
   const entry='\0transform-batch-fixture',plugin=marchingCubesRollupPlugin(options);
   const reports=[];
-  // Exercise these two production source transforms directly. Unrelated asset,
-  // geometry and animation compilers do not belong in every matrix fixture;
+  // Include the real non-derived allocation witness with these two transforms.
+  // Unrelated asset, geometry and animation compilers stay outside this fixture;
   // transform_batch_application.test.mjs still runs the complete production build.
   plugin.transform=(code,id)=>{
     if(!code.includes('class Matrix4'))return null;
     const matrix=specializeMatrixMultiply(code,{...options,runtimeModule:'\0f3d-matrix-multiply-adapter'});
     const batch=specializeTransformBatch(code,{...options,runtimeModule:'\0f3d-transform-batch-adapter'});
+    const base=specializeMarchingCubesBase(code,{runtimeModule:'\0f3d-marching-cubes-adapter'});
     if(!matrix.changed && !batch.changed)return null;
     if(batch.report)reports.push({id,...batch.report});
     let transformed=code;
-    for(const edit of [...matrix.edits,...batch.edits].sort((a,b)=>b.start-a.start))
+    for(const edit of [...matrix.edits,...batch.edits,...(base.edits??[])].sort((a,b)=>b.start-a.start))
       transformed=transformed.slice(0,edit.start)+edit.text+transformed.slice(edit.end);
-    return {code:matrix.header+batch.header+transformed+matrix.tail+batch.tail,map:null};
+    return {code:matrix.header+batch.header+(base.header??'')+transformed+matrix.tail+batch.tail,map:null};
   };
   const source='export {Object3D,Group,Scene,Bone,Mesh,InstancedMesh,Matrix4,Euler,Vector3,Quaternion,BufferGeometry,MeshBasicMaterial,Camera,SkinnedMesh,Light,AmbientLight,DirectionalLight,HemisphereLight,LightProbe,PointLight,RectAreaLight,SpotLight,Line,LineLoop,LineSegments,Points,Sprite,LOD} from '+
     JSON.stringify(path.join(upstream,'build/three.core.js'))+';'+

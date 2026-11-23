@@ -7,6 +7,7 @@ import {rollup} from 'rollup';
 import {marchingCubesRollupPlugin} from './marching_cubes_rollup.mjs';
 import {specializeTransformBatch,transformBatchSourceRole} from './transform_batch_specialization.mjs';
 import {specializeMatrixMultiply} from './matrix_multiply_specialization.mjs';
+import {specializeMarchingCubesBase} from './marching_cubes_specialization.mjs';
 import * as reference from '../../upstream/three.js/src/Three.Core.js';
 
 const upstream=fileURLToPath(new URL('../../upstream/three.js/',import.meta.url));
@@ -21,10 +22,11 @@ const paths={Object3D:'core/Object3D',Group:'objects/Group',Scene:'scenes/Scene'
   Camera:'cameras/Camera',SkinnedMesh:'objects/SkinnedMesh'};
 async function fixture(options={},changedMatrix=false,withCore=false,production=false) {
   const entry='\0source-world-transform',plugin=marchingCubesRollupPlugin(options),reports=[];
-  // Isolate the two production transforms here; application tests exercise the
-  // complete compiler and its resolved dependency seam after relocation.
+  // Include the real non-derived allocation witness with the isolated transforms.
+  // Application tests exercise the complete compiler after relocation.
   if(!production)plugin.transform=(code,id)=>{
-    if(!transformBatchSourceRole(code))return null;
+    const base=specializeMarchingCubesBase(code,{runtimeModule:'\0f3d-marching-cubes-adapter'});
+    if(!transformBatchSourceRole(code))return base.changed?{code:base.code,map:null}:null;
     if(changedMatrix && id.endsWith('/src/math/Matrix4.js'))return {code:code+`
       Matrix4 = new Proxy(Matrix4, {getOwnPropertyDescriptor(...args) {
         globalThis.__f3dSourceMatrixDescriptorCalls++;
@@ -36,9 +38,9 @@ async function fixture(options={},changedMatrix=false,withCore=false,production=
     const batch=specializeTransformBatch(code,{...options,matrixSource,runtimeModule:'\0f3d-transform-batch-adapter'});
     if(batch.report)reports.push({id,...batch.report});
     let transformed=code;
-    for(const edit of [...matrix.edits,...batch.edits].sort((a,b)=>b.start-a.start))
+    for(const edit of [...matrix.edits,...batch.edits,...(base.edits??[])].sort((a,b)=>b.start-a.start))
       transformed=transformed.slice(0,edit.start)+edit.text+transformed.slice(edit.end);
-    return {code:matrix.header+batch.header+transformed+matrix.tail+batch.tail,map:null};
+    return {code:matrix.header+batch.header+(base.header??'')+transformed+matrix.tail+batch.tail,map:null};
   };
   const source=Object.entries(paths).map(([name,file])=>'export {'+name+'} from '+
     JSON.stringify(path.join(upstream,'src',file+'.js'))+';').join('\n')+
@@ -77,6 +79,28 @@ function same(actual,expected) {
 }
 const update=(root,method,force)=>method==='updateWorldMatrix'
   ?root.updateWorldMatrix(false,true,force):root.updateMatrixWorld(force);
+
+function foreignObject(api,trace) {
+  const parent=Object.getPrototypeOf(api.Object3D);
+  class ReturningParent extends parent {
+    constructor(...args) {
+      super(...args);
+      return new Proxy(this,{
+        get(target,key,receiver) {
+          trace.push('get:'+String(key));
+          return Reflect.get(target,key,receiver);
+        },
+        getOwnPropertyDescriptor(target,key) {
+          trace.push('descriptor:'+String(key));
+          return Reflect.getOwnPropertyDescriptor(target,key);
+        },
+      });
+    }
+  }
+  Object.setPrototypeOf(api.Object3D,ReturningParent);
+  try {return new api.Object3D();}
+  finally {Object.setPrototypeOf(api.Object3D,parent);}
+}
 
 test('source Object3D batching requires exact object and Matrix4 inputs',()=>{
   const object=fs.readFileSync(path.join(upstream,'src/core/Object3D.js'),'utf8');
@@ -184,6 +208,28 @@ test('source module spans preserve camera and skin barriers between ordinary obj
     const field=kind==='Camera'?'matrixWorldInverse':'bindMatrixInverse';
     assert.deepEqual(actual.barrier[field].elements,expected.barrier[field].elements);
     assert.deepEqual(api.diagnostics(actual.root),{wasmCalls:2,objects:8,fallbackCalls:1,lastFailure:null});
+  }
+});
+
+test('a superclass-returned Proxy remains an observation barrier for both world-update methods',()=>{
+  const {api}=native;
+  for(const method of ['updateMatrixWorld','updateWorldMatrix']) {
+    const actual=tree(api),expected=tree(reference),traces=[[],[]];
+    for(const [index,root] of [actual,expected].entries()) {
+      const T=index===0?api:reference,node=foreignObject(T,traces[index]);
+      node.position.set(.5,-.25,2);
+      node.rotation.set(.2,-.4,.7);
+      root.add(node);
+    }
+    traces[0].length=0;traces[1].length=0;
+    update(actual,method);update(expected,method);
+    assert.deepEqual(traces[0],traces[1]);
+    assert.ok(traces[0].length>0,'The reference actually observes the Proxy');
+    same(actual,expected);
+    assert.equal(api.diagnostics(actual).wasmCalls,1,
+      'The ordinary subtree before the Proxy still executes natively');
+    assert.equal(api.diagnostics(actual).objects,5);
+    assert.equal(api.diagnostics(actual).fallbackCalls,1);
   }
 });
 

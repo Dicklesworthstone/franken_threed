@@ -53,6 +53,27 @@ const snapshot=root=>root.children.map(child=>[child.rotation.toArray(),child.qu
 function advance(api,actual,expected) {
   api.update(actual);updateReference(expected);assert.deepEqual(snapshot(actual),snapshot(expected));
 }
+function foreignObject(api,trace) {
+  const parent=Object.getPrototypeOf(api.Object3D);
+  class ReturningParent extends parent {
+    constructor(...args) {
+      super(...args);
+      return new Proxy(this,{
+        get(target,key,receiver) {
+          trace.push('get:'+String(key));
+          return Reflect.get(target,key,receiver);
+        },
+        getOwnPropertyDescriptor(target,key) {
+          trace.push('descriptor:'+String(key));
+          return Reflect.getOwnPropertyDescriptor(target,key);
+        },
+      });
+    }
+  }
+  Object.setPrototypeOf(api.Object3D,ReturningParent);
+  try {return new api.Object3D();}
+  finally {Object.setPrototypeOf(api.Object3D,parent);}
+}
 let compiled,limited;
 before(async()=>{compiled=await fixture();limited=await fixture({maxIterations:1});});
 
@@ -109,6 +130,24 @@ test('modified imported classes remain source-owned without probing replacement 
     }
     assert.equal(globalThis.__f3dEulerSourceProbes,0);
   } finally {delete globalThis.__f3dEulerSourceProbes;}
+});
+
+test('a superclass-returned Proxy retains source Euler reads without speculative descriptor probes',()=>{
+  const {api}=compiled,actual=group(api,3),expected=group(reference,3),traces=[[],[]];
+  for(const [index,root] of [actual,expected].entries()) {
+    const T=index===0?api:reference,node=foreignObject(T,traces[index]);
+    node.rotation.set(.2,-.4,.7);
+    node.userData.speed=new T.Euler(.03,-.02,.01);
+    root.add(node);
+  }
+  traces[0].length=0;traces[1].length=0;
+  api.update(actual);updateReference(expected);
+  assert.deepEqual(traces[0],traces[1]);
+  assert.deepEqual(traces[0],['get:userData','get:rotation','get:rotation','get:rotation','get:rotation']);
+  assert.deepEqual(snapshot(actual),snapshot(expected));
+  assert.equal(api.diagnostics(actual).wasmCalls,0);
+  assert.equal(api.diagnostics(actual).fallbackCalls,1);
+  assert.equal(api.diagnostics(actual).lastFailure,'EULER_UPDATE_GUARD');
 });
 
 test('source-module callbacks, aliases and exhausted native budgets preserve original effects',()=>{

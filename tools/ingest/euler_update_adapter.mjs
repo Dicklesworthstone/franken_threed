@@ -4,6 +4,7 @@
 import {instantiateNumericKernel} from './numeric_kernel_runtime.mjs';
 import {matrixNumericPlatformIntact} from './matrix_multiply_adapter.mjs';
 import {isTransformChildren} from './transform_batch_adapter.mjs';
+import {isNumericObject} from './numeric_objects.mjs';
 const host=globalThis,apply=Reflect.apply,descriptor=Object.getOwnPropertyDescriptor,prototype=Object.getPrototypeOf;
 const hasOwn=Object.hasOwn,freeze=Object.freeze,create=Object.create,source=Function.prototype.toString;
 const get=WeakMap.prototype.get,set=WeakMap.prototype.set,has=WeakSet.prototype.has,add=WeakSet.prototype.add;
@@ -42,7 +43,9 @@ export function registerEulerUpdateNumeric(object,token,name,Class=null){
   apply(set,numbers,[object,{record:lookup(kernels,token),name,Class}]);
 }
 export function registerEulerUpdateOwner(object,rotation,quaternion,callback,token){
-  apply(set,owners,[object,{record:lookup(kernels,token),rotation,quaternion,callback}]);
+  // Object3D is derived: an altered superclass can return a Proxy as `this`.
+  // Only its verified non-derived allocation may authorize descriptor guards.
+  if(isNumericObject(object))apply(set,owners,[object,{record:lookup(kernels,token),rotation,quaternion,callback}]);
 }
 export function registerEulerUpdateData(object){apply(add,dataObjects,[object]);return object;}
 export function createEulerUpdatePlan(metadata){

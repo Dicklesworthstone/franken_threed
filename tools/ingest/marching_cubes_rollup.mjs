@@ -53,7 +53,7 @@ export function marchingCubesRollupPlugin(options={}) {
       if (importer===EULER_UPDATES && source==='./transform_batch_adapter.mjs') return TRANSFORMS;
       if (importer===INSTANCE_UPDATES && source==='./euler_update_adapter.mjs') return EULER_UPDATES;
       if (importer===PROPERTY_MIXER && source==='./quaternion_flat_adapter.mjs') return QUATERNIONS;
-      if ([ADAPTER,NORMALS,ATTRIBUTE_TRANSFORMS,INSTANCE_UPDATES,BOUNDS,TANGENTS].includes(importer) && source==='./numeric_objects.mjs') return OBJECTS;
+      if ([ADAPTER,NORMALS,TRANSFORMS,EULER_UPDATES,ATTRIBUTE_TRANSFORMS,INSTANCE_UPDATES,BOUNDS,TANGENTS].includes(importer) && source==='./numeric_objects.mjs') return OBJECTS;
       return null;
     },
     load(id) {

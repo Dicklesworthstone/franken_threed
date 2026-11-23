@@ -3,6 +3,7 @@
  * operation, then guard the following span again. This is not a dirty plan. */
 import {instantiateNumericKernel} from './numeric_kernel_runtime.mjs';
 import {matrixNumericElements,matrixNumericPlatformIntact} from './matrix_multiply_adapter.mjs';
+import {isNumericObject} from './numeric_objects.mjs';
 const host=globalThis,apply=Reflect.apply,descriptor=Object.getOwnPropertyDescriptor,prototype=Object.getPrototypeOf;
 const ownKey=Object.hasOwn,freeze=Object.freeze,create=Object.create,F64=Float64Array,U8=Uint8Array,S=Set;
 const weakHas=WeakSet.prototype.has,weakAdd=WeakSet.prototype.add,mapGet=WeakMap.prototype.get,mapSet=WeakMap.prototype.set;
@@ -16,7 +17,11 @@ const nodeKinds=['Object3D','Group','Scene','Bone','Mesh','InstancedMesh',
   'Line','LineLoop','LineSegments','Points','Sprite','LOD'];
 const matrixKinds=['Matrix4'],fields=['position','quaternion','scale'];
 const xyz=['x','y','z'],xyzw=['_x','_y','_z','_w'];
-export function registerTransformObject(object){apply(weakAdd,objects,[object]);}
+export function registerTransformObject(object){
+  // The derived Object3D constructor can receive a foreign object from super().
+  // A pinned non-derived allocation must establish ordinary identity first.
+  if(isNumericObject(object))apply(weakAdd,objects,[object]);
+}
 export function registerTransformNumeric(object){apply(weakAdd,numbers,[object]);}
 export function registerTransformChildren(array){apply(weakAdd,arrays,[array]);return array;}
 // Shared by source update islands; inspection never invokes a Proxy trap.
