@@ -180,6 +180,9 @@ export async function buildModuleGraph(entryPath, options = {}) {
     const item = queue.shift();
     const moduleId = item.id;
     const sourceUrl = item.sourceUrl ?? moduleId;
+    // Synthetic fragments distinguish inline source/cache entries. The HTML
+    // document's effective base, without that fragment, is its import referrer.
+    const resolutionBaseUrl = item.isInline ? mapBaseUrl : sourceUrl;
     const moduleType = item.moduleType ?? "javascript";
 
     if (modules.has(moduleId) || externalModules.has(moduleId)) {
@@ -242,7 +245,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
     const sourceFormat = !nativeResource ? commonjsFormat(sourceUrl, moduleSources, {inline: item.isInline}) : 'module';
     const commonJS = sourceFormat !== 'module';
     const analysis = analyzeModuleAst(nativeResource || commonJS ? "" : sourceCode, sourceUrl,
-      item.offsets || {}, null, importedStrings(sourceUrl));
+      item.offsets || {}, null, importedStrings(resolutionBaseUrl));
     if (!nativeResource && !commonJS) sourceInputs.set(moduleId, {code: sourceCode, sourceUrl, offsets: item.offsets || {}});
     if (moduleType === "json") analysis.staticExports.push({type: "default", local_name: null, localName: null});
 
@@ -264,7 +267,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
     const resolvedStaticImports = [];
     for (const imp of staticRequests) {
       const targetType = imp.module_type ?? "javascript";
-      const resolvedUrl = resolveModuleSpecifier(imp.specifier, sourceUrl, importMap, {
+      const resolvedUrl = resolveModuleSpecifier(imp.specifier, resolutionBaseUrl, importMap, {
         target,
         mapBaseUrl,
         documentRoot,
@@ -317,7 +320,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
         let resolvedTarget = null;
         let resolvedUrl = null;
         try {
-          resolvedUrl = resolveModuleSpecifier(dyn.specifier, sourceUrl, importMap, {
+          resolvedUrl = resolveModuleSpecifier(dyn.specifier, resolutionBaseUrl, importMap, {
             target,
             mapBaseUrl,
             documentRoot,
@@ -376,7 +379,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
 
         for (const cand of candidates) {
           try {
-            const resolvedUrl = resolveModuleSpecifier(cand, sourceUrl, importMap, {
+            const resolvedUrl = resolveModuleSpecifier(cand, resolutionBaseUrl, importMap, {
               target,
               mapBaseUrl,
               documentRoot,

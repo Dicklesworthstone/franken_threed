@@ -317,7 +317,7 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
   // 1. Try import map
   const mapped = matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl, documentRoot);
   const threePackage = specifier === "three" || specifier.startsWith("three/");
-  const browserTarget = mapped || (threePackage && options.packageRootUrl)
+  const browserTarget = options._nativeImportsOnly || mapped || (threePackage && options.packageRootUrl)
     ? null : resolvePackageBrowserMapping(specifier, referrerUrl, packageOptions);
   if (mapped) {
     if (typeof mapped === "object" && mapped.blocked) {
@@ -354,6 +354,11 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
         span,
       );
     }
+  } else if (options._nativeImportsOnly) {
+    // Admission for source-owned browser modules must not borrow the bundler's
+    // installed-package, Three.js fallback or package browser replacements.
+    throw new IngestionResolutionError(`Native browser import "${specifier}" requires an import-map entry`,
+      specifier, referrerUrl, span);
   } else if (threePackage) {
     // Preserve the application's actual installed version and package instance.
     // Explicit overrides remain deliberate pin choices; an absent installation

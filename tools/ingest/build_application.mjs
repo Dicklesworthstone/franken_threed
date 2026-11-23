@@ -44,8 +44,9 @@ import {
   stripHtmlComments,
   stripScriptAndStyleBodies,
 } from "./html_parser.mjs";
-import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
+import { normalizeSpecifierKey, resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { buildModuleGraph } from "./module_graph.mjs";
+import { IngestionParseError } from "./types.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
 import { assertUnbundledModule } from "./commonjs_modules.mjs";
 import { moduleWorkerRollupPlugin, workerGlobalBindings } from "./module_workers.mjs";
@@ -495,6 +496,7 @@ export function extractJsModuleDependencies(code, contextUrl = "script.js") {
 
   const moduleSpecifiers = new Set();
   const moduleRequests = new Map();
+  let runtimeImports = false;
   const addModule = (specifier, moduleType = "javascript") => {
     moduleSpecifiers.add(specifier);
     moduleRequests.set(JSON.stringify([specifier, moduleType]), {specifier, moduleType});
@@ -517,6 +519,7 @@ export function extractJsModuleDependencies(code, contextUrl = "script.js") {
       }
       if (Array.isArray(analysis.dynamicImports)) {
         for (const dyn of analysis.dynamicImports) {
+          if (dyn.classification === "nonliteral" || dyn.module_type === "unknown") runtimeImports = true;
           if (dyn.classification === "literal" && dyn.specifier) {
             addModule(dyn.specifier, dyn.module_type);
           } else if (dyn.classification === "finite_set" && Array.isArray(dyn.candidates)) {
@@ -537,6 +540,7 @@ export function extractJsModuleDependencies(code, contextUrl = "script.js") {
         moduleSpecifiers: Array.from(moduleSpecifiers),
         moduleRequests: Array.from(moduleRequests.values()),
         assetSpecifiers: Array.from(assetSpecifiers),
+        runtimeImports,
       };
     }
   } catch (err) {
@@ -560,6 +564,7 @@ export function extractJsModuleDependencies(code, contextUrl = "script.js") {
   walk.simple(scriptAst, {
     ImportExpression(node) {
       if (!node.source) return;
+      if (classifyDynamicImportArgument(node.source).classification === "nonliteral") runtimeImports = true;
       const moduleType = classifyImportType(node);
       if (node.source.type === "Literal" && typeof node.source.value === "string") {
         addModule(node.source.value, moduleType);
@@ -585,6 +590,7 @@ export function extractJsModuleDependencies(code, contextUrl = "script.js") {
     moduleSpecifiers: Array.from(moduleSpecifiers),
     moduleRequests: Array.from(moduleRequests.values()),
     assetSpecifiers: Array.from(assetSpecifiers),
+    runtimeImports,
   };
 }
 
@@ -819,6 +825,7 @@ export function rewriteLinkTagAttributes(
  */
 export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = {}, options = {}) {
   let moduleScriptIndex = 0;
+  let sourceModuleIndex = 0;
   const preloadChunkMap = options.preloadChunkMap || null;
   const entryDir = options.entryDir || "";
   const documentUrl =
@@ -866,6 +873,19 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
         const scriptType = (attrs.type || "text/javascript").toLowerCase();
 
         if (scriptType === "module") {
+          const sourceScript = parsedHtml.moduleScripts[sourceModuleIndex++];
+          const retained = options.retainedHtmlModules?.get(sourceScript.id);
+          if (retained !== undefined) {
+            if (sourceScript.inlineContent !== null) {
+              // Inline imports use the document's native base and import-map
+              // scope. Moving this code into a chunk changes runtime imports.
+              if (/<\/script[\t\n\f\r />]/i.test(retained))
+                throw new Error("A transformed retained inline module contains an HTML script end tag");
+              return `<script${scriptAttrs}>${retained}</script>`;
+            }
+            if (!options.changedRetainedModules?.has(sourceScript.id)) return match;
+            return `<script${rewriteScriptTagAttributes(scriptAttrs, attrs.src, retained, "")}>${scriptBody}</script>`;
+          }
           // Keep the browser's empty-src error and ignored body, including handlers.
           if (attrs.src === "") return match;
           if (attrs.src && isExternalUrl(attrs.src)) {
@@ -1024,9 +1044,45 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     targetFiles.set("package.json", JSON.stringify({ type: "module" }, null, 2) + "\n");
   }
   const retainedModuleUrls = new Map(); // exact source URL -> relative output URL
+  const retainedHtmlModules = new Map(), runtimeModuleUrls = new Set(), changedRetainedModules = new Set();
+  let hasRuntimeImports = false;
+  let runtimeGraph;
+  let nativeMapRouting = false;
   const classicWorkerSources = new Map(), classicScriptRewrites = new Map();
   const documentWorkerGlobals = new Set();
   const workerNumericUnits = new Map();
+
+  if (isHtml) {
+    // Opaque runtime imports retain their source URL: bundling into a different
+    // directory changes relative imports and scoped import-map selection. This
+    // is a networked route, not a proof that the dynamic module graph closes.
+    const parsed = parseHtmlEntries(fs.readFileSync(resolvedEntryAbs, "utf8"), pathToFileURL(resolvedEntryAbs).href, {documentRoot});
+    if (Object.keys(parsed.importMap.imports ?? {}).length || Object.keys(parsed.importMap.scopes ?? {}).length) {
+      const graph = runtimeGraph = await buildModuleGraph(resolvedEntryAbs, {documentRoot,
+        _moduleSources: moduleSources, packageRootUrl: options.packageRootUrl});
+      // Keep compiler-only package inputs on the established bundler path.
+      // A conservative document-wide check also covers parents later retained
+      // to avoid resolving an import-map target a second time.
+      nativeMapRouting = Object.values(graph.modules).every(node => {
+        if (node.source_format && node.source_format !== 'module') return false;
+        const requests = [...node.static_imports, ...node.dynamic_imports.flatMap(request => request.resolved_targets ?? [request])];
+        return requests.every(request => {
+          if (!request.resolved_url) return true;
+          try { return resolveModuleSpecifier(request.specifier, node.is_inline ? parsed.baseUrl : node.source_url,
+            parsed.importMap, {mapBaseUrl: parsed.baseUrl, documentRoot, _nativeImportsOnly: true}) === request.resolved_url; }
+          catch { return false; }
+        });
+      });
+      if (nativeMapRouting) {
+        const inline = new Map(parsed.moduleScripts.filter(script => script.inlineContent !== null).map(script => [script.id, script]));
+        for (const node of Object.values(graph.modules)) {
+          if (!node.dynamic_imports.some(request => request.classification === "nonliteral" || request.module_type === "unknown")) continue;
+          if (node.is_inline) retainedHtmlModules.set(node.id, moduleSources.read(node.id, {source: inline.get(node.id).inlineContent}).code);
+          else runtimeModuleUrls.add(node.source_url);
+        }
+      }
+    }
+  }
 
   if (isHtml) {
     const rawHtml = fs.readFileSync(resolvedEntryAbs, "utf8"), documentUrl = pathToFileURL(resolvedEntryAbs).href;
@@ -1130,6 +1186,46 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     // Bounded asset processing queue: handles direct HTML assets, transitive CSS/model children,
     // and literal dynamic imports in retained classic scripts and modules.
     const assetQueue = [];
+    let runtimeTargetsQueued = false;
+    const retainRuntimeTargets = () => {
+      if (runtimeTargetsQueued || !nativeMapRouting) return;
+      runtimeTargetsQueued = true;
+      hasRuntimeImports = true;
+      // Exact import-map addresses are finite even when the selected name is
+      // supplied by a user or live data. Prefix mappings remain open routes.
+      for (const entries of [importMap.imports, ...Object.values(importMap.scopes ?? {})]) {
+        if (!entries || typeof entries !== "object") continue;
+        const keys = new Set(Object.keys(entries).map(key => normalizeSpecifierKey(key, parsedHtml.baseUrl, documentRoot)));
+        for (const key of keys) {
+          if (key === null || key.endsWith("/")) continue;
+          let url;
+          try {
+            url = resolveModuleSpecifier(key, parsedHtml.baseUrl, {imports: entries}, {
+              mapBaseUrl: parsedHtml.baseUrl, documentRoot, _moduleSources: moduleSources, allowCommonJS: true});
+          } catch (error) {
+            if (error.code?.startsWith("F3D_DOCUMENT_") || error.code === "F3D_SOURCE_TRANSFORM") throw error;
+            // Blocked, invalid and missing targets must still reject at the
+            // native import() boundary, rather than failing an unused branch.
+            continue;
+          }
+          if (url.startsWith("file:")) assetQueue.push({specifier: key, resolvedUrl: url,
+            referrerUrl: parsedHtml.baseUrl, isModuleSpecifier: true, runtimeModule: true});
+        }
+      }
+    };
+    for (const url of runtimeModuleUrls) assetQueue.push({specifier: url, resolvedUrl: url,
+      referrerUrl: parsedHtml.baseUrl, isModuleSpecifier: true, runtimeModule: true});
+    for (const [id, source] of retainedHtmlModules) {
+      const script = parsedHtml.moduleScripts.find(script => script.id === id);
+      if (script?.inlineContent === null) continue;
+      const {moduleRequests, assetSpecifiers} = extractJsModuleDependencies(source, id);
+      for (const {specifier, moduleType} of moduleRequests) assetQueue.push({specifier, moduleType,
+        referrerUrl: parsedHtml.baseUrl, isModuleSpecifier: true, runtimeModule: true});
+      for (const relUrl of assetSpecifiers) assetQueue.push({relUrl, referrerDir: effectiveBaseDir,
+        referrerPath: resolvedEntryAbs, runtimeModule: true});
+      copyFetchResources(source, "module");
+    }
+    if (runtimeModuleUrls.size || retainedHtmlModules.size) retainRuntimeTargets();
     for (const relUrl of relativeAssetUrls) {
       assetQueue.push({
         relUrl,
@@ -1152,10 +1248,11 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       if (!scriptBody || !scriptBody.trim()) continue;
       copyFetchResources(scriptBody, "script");
 
-      const { moduleRequests, assetSpecifiers } = extractJsModuleDependencies(
+      const { moduleRequests, assetSpecifiers, runtimeImports } = extractJsModuleDependencies(
         scriptBody,
         parsedHtml.baseUrl,
       );
+      if (runtimeImports) retainRuntimeTargets();
       for (const {specifier, moduleType} of moduleRequests) {
         assetQueue.push({
           specifier,
@@ -1179,6 +1276,8 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     const visitedCssPaths = new Set();
     const visitedJsUrls = new Set();
     const visitedModelPaths = new Set();
+    const runtimeFiles = new Set();
+    let runtimeBytes = 0;
 
     while (assetQueue.length > 0) {
       const item = assetQueue.shift();
@@ -1194,13 +1293,16 @@ export async function buildApplication(entryPath, outDir, options = {}) {
 
         let resolvedUrl;
         try {
-          resolvedUrl = resolveModuleSpecifier(trimmedSpecifier, item.referrerUrl, importMap, {
+          resolvedUrl = item.resolvedUrl ?? resolveModuleSpecifier(trimmedSpecifier, item.referrerUrl, importMap, {
             mapBaseUrl: parsedHtml.baseUrl,
             _moduleSources: moduleSources,
             packageRootUrl: options.packageRootUrl,
             documentRoot,
+            allowCommonJS: item.runtimeModule === true,
           });
         } catch (err) {
+          if (err.code === "F3D_SOURCE_TRANSFORM") throw err;
+          if (item.runtimeModule && !err.code?.startsWith("F3D_DOCUMENT_")) continue;
           let context = "";
           if (referrerPath !== resolvedEntryAbs) {
             context = referrerPath.endsWith(".css")
@@ -1281,6 +1383,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
 
       // Explicitly reject unresolved relative resources before output
       if (!fs.existsSync(srcAssetAbs) || !fs.statSync(srcAssetAbs).isFile()) {
+        if (item.runtimeModule) continue;
         const target = item.isModuleSpecifier ? item.specifier : item.relUrl;
         let context = "";
         if (referrerPath !== resolvedEntryAbs) {
@@ -1293,11 +1396,18 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         );
       }
 
+      if (item.runtimeModule && !runtimeFiles.has(srcAssetAbs)) {
+        documentRelativePath(srcAssetAbs, applicationRoot);
+        if (runtimeFiles.size >= 4096 || (runtimeBytes += fs.statSync(srcAssetAbs).size) > 256 * 1024 * 1024)
+          throw new Error("F3D_RUNTIME_IMPORT_LIMIT: retained import-map closure exceeds its file/byte bound");
+        runtimeFiles.add(srcAssetAbs);
+      }
+
       const javascript = !item.modelResource && item.moduleType !== "json" && path.extname(srcAssetAbs).toLowerCase() !== ".json" &&
         (item.isModuleSpecifier || /\.(?:mjs|cjs|js)$/.test(srcAssetAbs));
       // Retained scripts must use the same frontend output as bundled imports.
       // URL variants can share a physical output only when their bytes agree.
-      if (javascript && item.isModuleSpecifier) assertUnbundledModule(moduleUrl, moduleSources);
+      if (javascript && item.isModuleSpecifier && !item.runtimeModule) assertUnbundledModule(moduleUrl, moduleSources);
       let assetData = javascript ? moduleSources.read(moduleUrl || pathToFileURL(srcAssetAbs).href,
         {sourceType: item.isModuleSpecifier ? "module" : "script"}).bytes : fs.readFileSync(srcAssetAbs);
       const workerSource = classicWorkerSources.get(srcAssetAbs);
@@ -1327,6 +1437,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
             referrerPath: srcAssetAbs,
             isModuleSpecifier: false,
             modelResource: true,
+            runtimeModule: item.runtimeModule,
           });
         }
       }
@@ -1343,6 +1454,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
             referrerDir: cssDir,
             referrerPath: srcAssetAbs,
             isModuleSpecifier: false,
+            runtimeModule: item.runtimeModule,
           });
         }
       }
@@ -1356,11 +1468,15 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         const fileUrl = moduleUrl || pathToFileURL(srcAssetAbs).href;
         visitedJsUrls.add(fileUrl);
         const jsContent = assetData.toString("utf-8");
+        let dependencies;
+        try { dependencies = extractJsModuleDependencies(jsContent, fileUrl); }
+        catch (error) {
+          if (!item.runtimeModule || !(error instanceof IngestionParseError)) throw error;
+          continue; // Preserve a lazy module's native syntax rejection.
+        }
         copyFetchResources(jsContent, item.isModuleSpecifier ? "module" : "script");
-        const { moduleRequests, assetSpecifiers } = extractJsModuleDependencies(
-          jsContent,
-          fileUrl,
-        );
+        const {moduleRequests, assetSpecifiers, runtimeImports} = dependencies;
+        if (runtimeImports) retainRuntimeTargets();
         const jsDir = path.dirname(srcAssetAbs);
 
         for (const {specifier, moduleType} of moduleRequests) {
@@ -1371,6 +1487,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
             referrerDir: jsDir,
             referrerPath: srcAssetAbs,
             isModuleSpecifier: true,
+            runtimeModule: item.runtimeModule,
           });
         }
 
@@ -1380,6 +1497,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
             referrerDir: jsDir,
             referrerPath: srcAssetAbs,
             isModuleSpecifier: false,
+            runtimeModule: item.runtimeModule,
           });
         }
       }
@@ -1387,6 +1505,63 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   }
 
   collectHtmlAssets(null, new Set(htmlFileName ? [htmlFileName] : []), true);
+  if (isHtml && hasRuntimeImports) {
+    const parsed = parseHtmlEntries(fs.readFileSync(resolvedEntryAbs, "utf8"), pathToFileURL(resolvedEntryAbs).href, {documentRoot});
+    const nodes = new Map(Object.values(runtimeGraph.modules).map(node => [node.source_url, node]));
+    const incoming = new Map(), children = new Map();
+    for (const node of nodes.values()) {
+      const targets = [...node.static_imports, ...node.dynamic_imports.flatMap(request => request.resolved_targets ?? [request])]
+        .map(request => request.resolved_url).filter(Boolean);
+      children.set(node.source_url, targets);
+      for (const url of targets) {
+        if (!incoming.has(url)) incoming.set(url, new Set());
+        incoming.get(url).add(node.source_url);
+      }
+    }
+    const entries = [parsed.importMap.imports, ...Object.values(parsed.importMap.scopes ?? {})].filter(Boolean);
+    const remapped = new Map();
+    const needsOriginalImport = url => {
+      if (!remapped.has(url)) {
+        // A generated canonical URL can match a second map key after an alias
+        // was already resolved. Output chunks also have different scopes, so
+        // conservatively keep the source importer if any scope can remap it.
+        try { remapped.set(url, entries.some(imports => resolveModuleSpecifier(url, parsed.baseUrl, {imports}, {
+          mapBaseUrl: parsed.baseUrl, documentRoot, _moduleSources: moduleSources, allowCommonJS: true,
+          packageRootUrl: options.packageRootUrl,
+        }) !== url)); } catch (error) {
+          if (error.code === "F3D_SOURCE_TRANSFORM") throw error;
+          remapped.set(url, true);
+        }
+      }
+      return remapped.get(url);
+    };
+    const pending = [...retainedModuleUrls.keys(), ...retainedHtmlModules.keys()], visited = new Set();
+    let expanded = false;
+    while (pending.length) {
+      const url = pending.pop();
+      if (visited.has(url)) continue;
+      visited.add(url);
+      const node = nodes.get(url);
+      if (node) {
+        if (node.is_inline && !retainedHtmlModules.has(url)) {
+          const script = parsed.moduleScripts.find(script => script.id === node.id);
+          retainedHtmlModules.set(url, moduleSources.read(url, {source: script.inlineContent}).code);
+          expanded = true;
+        } else if (!node.is_inline && !runtimeModuleUrls.has(url)) {
+          runtimeModuleUrls.add(url); expanded = true;
+        }
+        // Reuse proved graph edges too: imported finite selectors can name
+        // dependencies that a source-local retained-resource scan cannot see.
+        pending.push(...children.get(url));
+      }
+      if (needsOriginalImport(url)) pending.push(...incoming.get(url) ?? []);
+    }
+    if (expanded) collectHtmlAssets(null, new Set(htmlFileName ? [htmlFileName] : []), true);
+    for (const script of parsed.moduleScripts) if (script.inlineContent === null && retainedModuleUrls.has(script.id)) {
+      retainedHtmlModules.set(script.id, moduleSources.read(script.id).code);
+      if (moduleSources.changed(script.id)) changedRetainedModules.add(script.id);
+    }
+  }
   const rendererRoute =
     options.routeWebGPURenderer || options.routeWebGLRenderer
       ? await decideRendererRoutes(resolvedEntryAbs, options.packageRootUrl, {
@@ -1401,6 +1576,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     documentRoot,
     workerHostBindings: documentWorkerGlobals,
     retainedModuleUrls,
+    retainedHtmlModules,
     specializeNumeric: options.specializeNumeric,
     _workerNumericUnits: workerNumericUnits,
     prepareStandaloneLoaders: options.prepareStandaloneLoaders,
@@ -1438,7 +1614,8 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         fs.readFileSync(resolvedEntryAbs, "utf-8"),
         bundleResult.entryFiles,
         bundleResult.files,
-        { preloadChunkMap, entryDir, documentUrl: entryBaseUrl, documentRoot, classicScriptRewrites },
+        { preloadChunkMap, entryDir, documentUrl: entryBaseUrl, documentRoot, classicScriptRewrites,
+          retainedHtmlModules, changedRetainedModules },
       ),
     );
   }

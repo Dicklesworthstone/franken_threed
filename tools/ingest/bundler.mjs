@@ -117,7 +117,7 @@ export function f3dRollupPlugin(options = {}) {
   const importedStrings = createImportedStringResolver({
     readModule: url => url.startsWith('file:') && path.extname(urlToFilePath(url)).toLowerCase() !== '.json' &&
       commonjsFormat(url, moduleSources) === 'module' ? moduleSources.read(url).code : null,
-    resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, importMap, {
+    resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, inlineModules.has(from) ? mapBaseUrl : from, importMap, {
       target, mapBaseUrl, documentRoot, _moduleSources: moduleSources, packageRootUrl: options.packageRootUrl,
     }),
   });
@@ -320,7 +320,7 @@ export function f3dRollupPlugin(options = {}) {
         return source;
       }
 
-      const referrerUrl = importer
+      const referrerUrl = inlineModules.has(importer) ? mapBaseUrl : importer
         ? importer.startsWith("file://")
           ? importer
           : pathToFileURL(path.resolve(importer)).href
@@ -388,7 +388,7 @@ export function f3dRollupPlugin(options = {}) {
       if (!code || typeof code !== "string") return null;
 
       const moduleDir = getModuleDir(id, mapBaseUrl);
-      const referrerUrl = id.startsWith("file://")
+      const referrerUrl = inlineModules.has(id) ? mapBaseUrl : id.startsWith("file://")
         ? id
         : path.isAbsolute(id)
           ? pathToFileURL(id).href
@@ -805,7 +805,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
 
     // Empty src is a browser script error, never an inline module or an HTML import.
     const localModuleScripts = parsed.moduleScripts.filter(
-      (s) => s.src !== "" && !isExternalUrl(s.id),
+      (s) => s.src !== "" && !isExternalUrl(s.id) && !options.retainedHtmlModules?.has(s.id),
     );
 
     // Classic-only documents use the retained script/resource closure in the

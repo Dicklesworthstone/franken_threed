@@ -61,6 +61,33 @@ fragments keep their module identities. Protocol-relative and explicit remote
 URLs retain their host routes; this option never downloads them. Omitting the
 option preserves the existing local path and host-resource behavior.
 
+## Runtime imports in ordinary module builds
+
+HTML applications with an import map and an open `import(name)` can keep the
+browser's native module route. The build retains those callers at their original relative URLs,
+copies finite exact local import-map targets and their known dependencies, and
+preserves inline callers in the document. Import maps, document bases, scoped
+selection, query/fragment identities, lazy errors and shared module instances
+remain source-owned. An affected importer chain also stays native when rewriting
+an already resolved target would apply an import map a second time. Unaffected
+closed entries still bundle and share retained dependencies with native callers.
+Applications whose discovered dependencies require compiler-only npm resolution,
+package replacements or CommonJS stay on their existing bundler route.
+
+The project frontend still supplies retained JavaScript bytes; valid external
+script integrity metadata follows changed bytes. Optional missing, blocked or
+syntax-invalid modules keep their native lazy failures. A failing frontend hook
+or escaping local resource remains a build error. The retained module/asset walk,
+including CSS and model sidecars, is bounded to 4,096 physical files and 256 MiB.
+Document fetch resources keep their existing independent collection bounds.
+
+Exact map entries are finite addresses, not proof that every possible runtime
+name is known. Prefix mappings, remote targets and arbitrary relative names keep
+their network routes; the build does not enumerate directories or fetch remote
+modules. Serve the retained source paths and any additional live resources the
+application selects. Strict standalone packing still refuses an open dynamic
+import rather than claiming a complete single-file graph.
+
 ## Classic-only HTML applications
 
 An HTML application does not need an ESM script entry. With only classic scripts,
