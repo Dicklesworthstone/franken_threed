@@ -14,7 +14,10 @@ import {GLTFLoader} from '../../upstream/three.js/examples/jsm/loaders/GLTFLoade
 
 const upstream=fileURLToPath(new URL('../../upstream/three.js/',import.meta.url));
 const exports={BufferAttribute:'core/BufferAttribute.js',Float32BufferAttribute:'core/BufferAttribute.js',
-  Uint16BufferAttribute:'core/BufferAttribute.js',BufferGeometry:'core/BufferGeometry.js',
+  Uint16BufferAttribute:'core/BufferAttribute.js',Uint32BufferAttribute:'core/BufferAttribute.js',
+  Uint8BufferAttribute:'core/BufferAttribute.js',Uint8ClampedBufferAttribute:'core/BufferAttribute.js',
+  Int8BufferAttribute:'core/BufferAttribute.js',Int16BufferAttribute:'core/BufferAttribute.js',Int32BufferAttribute:'core/BufferAttribute.js',
+  BufferGeometry:'core/BufferGeometry.js',
   InterleavedBuffer:'core/InterleavedBuffer.js',InterleavedBufferAttribute:'core/InterleavedBufferAttribute.js',
   Matrix4:'math/Matrix4.js',Matrix3:'math/Matrix3.js',Vector3:'math/Vector3.js'};
 const methods=['applyMatrix4','applyMatrix3','applyNormalMatrix','transformDirection'];
@@ -32,7 +35,7 @@ async function fixture(core,options={}) {
   }finally{await bundle.close();}
 }
 let fixtures;
-before(async()=>{fixtures=await Promise.all([fixture(false),fixture(true)]);});
+before(async()=>{fixtures=[await fixture(false),await fixture(true)];});
 const values=[-1.275,2.625,.375,2.15,-.125,.8125,.05,2.75,-1.875,3.01,1.025,2.15];
 function matrix(api,name,seed=0) {
   const value=name==='applyMatrix3' || name==='applyNormalMatrix'?new api.Matrix3():new api.Matrix4();
@@ -61,7 +64,7 @@ test('source and core routes compile contiguous and interleaved Wasm variants fr
     const modules=report.modules.filter(value=>value.compiledMethods.length);
     assert.deepEqual(modules.flatMap(module=>module.compiledMethods).sort(),
       [...methods,...methods.filter(name=>name!=='applyMatrix3').map(name=>'InterleavedBufferAttribute.'+name)].sort());
-    assert.equal(modules.reduce((sum,module)=>sum+module.wasmVariants,0),14);
+    assert.equal(modules.reduce((sum,module)=>sum+module.wasmVariants,0),119);
     assert.ok(modules.every(module=>module.wasmBytes>0&&module.sourceDerived));
   }
 });
@@ -76,6 +79,77 @@ test('all four fluent methods retain exact f32/f64 results, identity and method 
     }
     assert.equal(actual.array,identity);assert.equal(actual[name],method);
     assert.deepEqual(api.diagnostics(actual)[name],{wasmCalls:16,fallbackCalls:0,lastFailure:null});
+  }
+});
+
+const integerTypes=[Uint32Array,Uint16Array,Uint8Array,Uint8ClampedArray,Int32Array,Int16Array,Int8Array];
+const quantizedValues=[-2147483648,-32768,-128,-1,0,1,127,128,255,32767,65535,4294967295];
+test('integer and normalized transforms match pinned source stores across every ordinary component type',()=>{
+  for(const {api}of fixtures)for(const Type of [Float32Array,...integerTypes])for(const normalized of [false,true])
+    for(const name of methods)for(const named of [false,true]) {
+      const make=library=>named?new library[Type.name.replace('Array','BufferAttribute')](quantizedValues,3,normalized):
+        new library.BufferAttribute(new Type(quantizedValues),3,normalized);
+      const actual=make(api),expected=make(reference),identity=actual.array;
+      for(let frame=0;frame<5;frame++) {
+        assert.equal(actual[name](matrix(api,name,frame)),actual);expected[name](matrix(reference,name,frame));compare(actual,expected);
+      }
+      assert.equal(actual.array,identity);
+      assert.deepEqual(api.diagnostics(actual)[name],{wasmCalls:5,fallbackCalls:0,lastFailure:null});
+    }
+});
+
+test('source normalization rounds before clamped stores while raw clamped half ties remain even',()=>{
+  for(const {api}of fixtures) {
+    for(const normalized of [false,true]) {
+      const actual=new api.Uint8ClampedBufferAttribute([0,1,2],3,normalized),
+        expected=new reference.Uint8ClampedBufferAttribute([0,1,2],3,normalized);
+      const translation=normalized?.5/255:.5;
+      actual.applyMatrix4(new api.Matrix4().makeTranslation(translation,translation,translation));
+      expected.applyMatrix4(new reference.Matrix4().makeTranslation(translation,translation,translation));compare(actual,expected);
+      assert.deepEqual([...actual.array],normalized?[1,2,3]:[0,2,2]);
+      assert.equal(api.diagnostics(actual).applyMatrix4.wasmCalls,1);
+    }
+    const actual=new api.Int16BufferAttribute([-32768,-1,0,32767,1,2],3,true),
+      expected=new reference.Int16BufferAttribute([-32768,-1,0,32767,1,2],3,true);
+    for(const normalized of [true,false,true]) {
+      actual.normalized=expected.normalized=normalized;
+      actual.applyMatrix4(matrix(api,'applyMatrix4'));expected.applyMatrix4(matrix(reference,'applyMatrix4'));compare(actual,expected);
+    }
+    assert.equal(api.diagnostics(actual).applyMatrix4.wasmCalls,3);
+  }
+});
+
+test('integer transforms preserve overflow, nonfinite conversion and signed half-rounding boundaries',()=>{
+  for(const {api}of fixtures)for(const Type of integerTypes)for(const normalized of [false,true])
+    for(const factor of [-.5,NaN,Infinity,-Infinity,2**40]) {
+      const actual=new api.BufferAttribute(new Type(quantizedValues),3,normalized),
+        expected=new reference.BufferAttribute(new Type(quantizedValues),3,normalized);
+      const a=new api.Matrix4().makeScale(factor,factor,factor),b=new reference.Matrix4().makeScale(factor,factor,factor);
+      actual.applyMatrix4(a);expected.applyMatrix4(b);compare(actual,expected);
+      assert.equal(api.diagnostics(actual).applyMatrix4.wasmCalls,1);
+    }
+});
+
+test('normalized constructor observations and changed Math conversions preserve original calls and exceptions',()=>{
+  for(const {api}of fixtures)for(const mode of ['constructor','wrong-constructor','round','max']) {
+    const actual=new api.Int16BufferAttribute(quantizedValues,3,true),expected=new reference.Int16BufferAttribute(quantizedValues,3,true);
+    const logs=[[],[]],errors=[],selected=mode==='max'?'max':'round',original=Math[selected];
+    for(const [index,attribute,library]of [[0,actual,api],[1,expected,reference]]) {
+      if(mode==='constructor')Object.defineProperty(attribute.array,'constructor',{get(){logs[index].push('constructor');return Int16Array;}});
+      if(mode==='wrong-constructor')Object.defineProperty(attribute.array,'constructor',{value:Float64Array});
+      if(mode==='round'||mode==='max')Math[selected]=function(...args){logs[index].push(args);return original(...args);};
+      try {attribute.applyMatrix4(matrix(library,'applyMatrix4'));}catch(error){errors[index]=[error.name,error.message];}
+      finally{Math[selected]=original;}
+    }
+    assert.deepEqual(logs[0],logs[1]);assert.deepEqual(errors[0],errors[1]);compare(actual,expected);
+    assert.equal(api.diagnostics(actual).applyMatrix4.wasmCalls,0,mode);
+    // Unnormalized storage never consults its constructor or MathUtils.
+    if(mode==='round'||mode==='max') {
+      const raw=new api.Int16BufferAttribute(quantizedValues,3,false);
+      try {Math[selected]=()=>{throw new Error('unused conversion');};raw.applyMatrix4(matrix(api,'applyMatrix4'));}
+      finally{Math[selected]=original;}
+      assert.equal(api.diagnostics(raw).applyMatrix4.wasmCalls,1);
+    }
   }
 });
 
@@ -128,17 +202,21 @@ test('custom attribute methods and source-visible matrix getters execute exactly
   }
 });
 
-test('normalized, integer, two-component and changed-prototype attributes retain their original path',()=>{
-  for(const {api}of fixtures)for(const mode of ['normalized','integer','uv','subclass']) {
+test('normalized Float64, two-component and changed-prototype attributes retain their original path',()=>{
+  for(const {api}of fixtures)for(const mode of ['normalized-f64','uv','subclass']) {
     let actual,expected;
     for(const [library,which]of [[api,0],[reference,1]]) {
-      const value=mode==='integer'?new library.Uint16BufferAttribute(values.map(value=>Math.abs(value)*100),3):
-        new library.BufferAttribute(new Float32Array(values),mode==='uv'?2:3,mode==='normalized');
+      const value=new library.BufferAttribute(new (mode==='normalized-f64'?Float64Array:Float32Array)(values),
+        mode==='uv'?2:3,mode==='normalized-f64');
       if(mode==='subclass')Object.setPrototypeOf(value,Object.create(Object.getPrototypeOf(value)));
       if(which===0)actual=value;else expected=value;
     }
     const name=mode==='uv'?'applyMatrix3':'applyMatrix4';
-    actual[name](matrix(api,name));expected[name](matrix(reference,name));compare(actual,expected);
+    if(mode==='normalized-f64') {
+      assert.throws(()=>actual[name](matrix(api,name)),/Invalid component type/);
+      assert.throws(()=>expected[name](matrix(reference,name)),/Invalid component type/);
+    }else {actual[name](matrix(api,name));expected[name](matrix(reference,name));}
+    compare(actual,expected);
     assert.equal(api.diagnostics(actual)[name].wasmCalls,0);
   }
 });
@@ -225,6 +303,43 @@ test('interleaved transforms keep exact strided stores, unrelated bytes, subview
     }
 });
 
+test('quantized strided transforms preserve sibling channels and four-component tangent handedness',()=>{
+  for(const {api}of fixtures)for(const Type of integerTypes)for(const normalized of [false,true])
+    for(const name of interleavedMethods)for(const packed of [false,true]) {
+      const make=library=>{
+        const storage=new Type(4*8+4).fill(19),array=storage.subarray(2,2+4*8);
+        const attribute=packed?new library.InterleavedBufferAttribute(new library.InterleavedBuffer(array,8),4,2,normalized):
+          new library.BufferAttribute(array,8,normalized);
+        for(let i=0;i<4;i++)for(let c=0;c<3;c++)array[i*8+(packed?2:0)+c]=quantizedValues[i*3+c];
+        return {storage,array,attribute};
+      };
+      const a=make(api),b=make(reference),before=a.storage.slice();
+      a.attribute[name](matrix(api,name));b.attribute[name](matrix(reference,name));
+      assert.deepEqual(new Uint8Array(a.storage.buffer),new Uint8Array(b.storage.buffer));
+      for(let i=0;i<a.storage.length;i++) {
+        const component=(i-2)%8;
+        if(i>=2&&i<34&&component>=(packed?2:0)&&component<(packed?5:3))continue;
+        assert.equal(a.storage[i],before[i]);
+      }
+      assert.equal(api.diagnostics(a.attribute)[name].wasmCalls,1);
+    }
+});
+
+test('normalized interleaved array getters preserve source observations without speculative reads',()=>{
+  for(const {api}of fixtures) {
+    const pair=[api,reference].map(library=>new library.InterleavedBufferAttribute(
+      new library.InterleavedBuffer(new Int8Array(quantizedValues),3),3,0,true)),logs=[[],[]];
+    for(const [index,library]of [api,reference].entries()) {
+      const attribute=pair[index],array=attribute.data.array;
+      Object.defineProperty(attribute,'array',{get(){logs[index].push('array');return array;}});
+      attribute.applyNormalMatrix(matrix(library,'applyNormalMatrix'));
+    }
+    assert.deepEqual(logs[0],logs[1]);assert.equal(logs[0].length,24);
+    assert.deepEqual(pair[0].data.array,pair[1].data.array);
+    assert.equal(api.diagnostics(pair[0]).applyNormalMatrix.wasmCalls,0);
+  }
+});
+
 test('shared position, normal and tangent streams retain geometry update order, version increments and current bounds',()=>{
   for(const {api}of fixtures) {
     const make=library=>{
@@ -255,7 +370,7 @@ test('shared position, normal and tangent streams retain geometry update order, 
 });
 
 test('interleaved count/data observations and throwing methods retain original order and partial effects',()=>{
-  for(const {api}of fixtures)for(const mode of ['count','data-count','data-proxy','attribute-proxy','component','throw','subclass','normalized']) {
+  for(const {api}of fixtures)for(const mode of ['count','data-count','data-proxy','attribute-proxy','component','throw','subclass']) {
     const pair=[interleaved(api),interleaved(reference)],logs=[[],[]],errors=[];
     for(let i=0;i<2;i++) {
       const {attribute,data}=pair[i],library=i===0?api:reference;let receiver=attribute;
@@ -270,7 +385,6 @@ test('interleaved count/data observations and throwing methods retain original o
         attribute.setXYZ=function(index,...args){logs[i].push([index,...this.array]);if(mode==='throw'&&index===1)throw new RangeError('second vertex');return original.call(this,index,...args);};
       }
       if(mode==='subclass')Object.setPrototypeOf(attribute,Object.create(Object.getPrototypeOf(attribute)));
-      if(mode==='normalized')attribute.normalized=true;
       try{receiver.applyNormalMatrix(matrix(library,'applyNormalMatrix'));}catch(error){errors[i]=[error.name,error.message];}
     }
     assert.deepEqual(logs[0],logs[1]);assert.deepEqual(errors[0],errors[1]);assert.deepEqual(pair[0].array,pair[1].array);
@@ -306,16 +420,20 @@ test('interleaved budget failures and no-Wasm hosts run the source loop without 
   }
 });
 
-function interleavedGLB() {
-  const array=new Float32Array(3*12);
-  for(let i=0;i<3;i++)array.set([i-1,i%2,0,.2,.3,.9,1,0,0,i%2?-1:1,.2,.7],i*12);
+function interleavedGLB(quantized=false) {
+  const array=new (quantized?Int16Array:Float32Array)(3*12),width=array.BYTES_PER_ELEMENT;
+  for(let i=0;i<3;i++)array.set([i-1,i%2,0,.2,.3,.9,1,0,0,i%2?-1:1,.2,.7]
+    .map(value=>quantized?Math.round(value*32767):value),i*12);
+  const component={componentType:quantized?5122:5126,...(quantized?{normalized:true}:{})};
   const json={asset:{version:'2.0'},scene:0,scenes:[{nodes:[0]}],nodes:[{mesh:0}],
+    ...(quantized?{extensionsUsed:['KHR_mesh_quantization'],extensionsRequired:['KHR_mesh_quantization']}:{}),
     meshes:[{primitives:[{attributes:{POSITION:0,NORMAL:1,TANGENT:2,TEXCOORD_0:3}}]}],
-    accessors:[{bufferView:0,byteOffset:0,componentType:5126,type:'VEC3',count:3,min:[-1,0,0],max:[1,1,0]},
-      {bufferView:0,byteOffset:12,componentType:5126,type:'VEC3',count:3},
-      {bufferView:0,byteOffset:24,componentType:5126,type:'VEC4',count:3},
-      {bufferView:0,byteOffset:40,componentType:5126,type:'VEC2',count:3}],
-    bufferViews:[{buffer:0,byteOffset:0,byteLength:array.byteLength,byteStride:48}],buffers:[{byteLength:array.byteLength}]};
+    accessors:[{bufferView:0,byteOffset:0,...component,type:'VEC3',count:3,
+      min:[quantized?-32767:-1,0,0],max:[quantized?32767:1,quantized?32767:1,0]},
+      {bufferView:0,byteOffset:3*width,...component,type:'VEC3',count:3},
+      {bufferView:0,byteOffset:6*width,...component,type:'VEC4',count:3},
+      {bufferView:0,byteOffset:10*width,...component,type:'VEC2',count:3}],
+    bufferViews:[{buffer:0,byteOffset:0,byteLength:array.byteLength,byteStride:12*width}],buffers:[{byteLength:array.byteLength}]};
   const encoded=Buffer.from(JSON.stringify(json)),size=(encoded.length+3)&~3,output=Buffer.alloc(28+size+array.byteLength);
   output.writeUInt32LE(0x46546c67,0);output.writeUInt32LE(2,4);output.writeUInt32LE(output.length,8);
   output.writeUInt32LE(size,12);output.writeUInt32LE(0x4e4f534a,16);output.fill(32,20,20+size);encoded.copy(output,20);
@@ -323,14 +441,16 @@ function interleavedGLB() {
   return output.buffer.slice(output.byteOffset,output.byteOffset+output.byteLength);
 }
 
-test('ordinary specialized application transforms GLTFLoader byteStride geometry through the native path',async()=>{
+test('ordinary specialized application transforms float and quantized GLTFLoader byteStride geometry through the native path',async()=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'f3d-interleaved-transform-')),entry=path.join(root,'main.mjs'),out=path.join(root,'out');
   fs.writeFileSync(entry,`import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
     export {Matrix4} from 'three';export {geometryTransformsDiagnostics as diagnostics} from ${JSON.stringify('\0f3d-geometry-transforms-adapter')};
     export async function load(bytes){return (await new GLTFLoader().parseAsync(bytes,'')).scene.children[0].geometry;}`);
   const built=await buildApplication(entry,out,{specializeNumeric:true,packageRootUrl:pathToFileURL(upstream+path.sep).href});
-  const api=await import(pathToFileURL(path.join(out,built.entryFiles[0]))),a=await api.load(interleavedGLB());
-  const b=(await new GLTFLoader().parseAsync(interleavedGLB(),'')).scene.children[0].geometry;
+  const api=await import(pathToFileURL(path.join(out,built.entryFiles[0])));
+  for(const quantized of [false,true]) {
+  const a=await api.load(interleavedGLB(quantized));
+  const b=(await new GLTFLoader().parseAsync(interleavedGLB(quantized),'')).scene.children[0].geometry;
   const positions=a.attributes.position,data=positions.data,identity=data.array;
   assert.ok(positions.isInterleavedBufferAttribute);assert.equal(a.attributes.normal.data,data);assert.equal(a.attributes.tangent.data,data);
   for(const geometry of [a,b]){geometry.computeBoundingBox();geometry.computeBoundingSphere();}
@@ -342,6 +462,7 @@ test('ordinary specialized application transforms GLTFLoader byteStride geometry
   assert.equal(data.version,b.attributes.position.data.version);assert.equal(data.version,3);
   assert.deepEqual(a.boundingBox.min.toArray(),b.boundingBox.min.toArray());assert.deepEqual(a.boundingBox.max.toArray(),b.boundingBox.max.toArray());
   assert.deepEqual(a.boundingSphere.center.toArray(),b.boundingSphere.center.toArray());assert.equal(a.boundingSphere.radius,b.boundingSphere.radius);
+  }
   assert.ok(built.numericSpecialization.libraryKernels.geometryTransforms.modules.some(module=>
     module.compiledMethods.includes('InterleavedBufferAttribute.applyMatrix4')));
 });

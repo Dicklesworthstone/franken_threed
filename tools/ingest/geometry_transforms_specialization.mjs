@@ -2,7 +2,7 @@
  * bodies. The source owns constructors, method identity and conservative paths;
  * only the guarded numeric loop executes in native Wasm. */
 import {sourceBlob} from './marching_cubes_specialization.mjs';
-import {normalClasses,normalMethod} from './geometry_normals_compile.mjs';
+import {normalClasses,normalMethod,deriveAttributeDenormalizers,deriveAttributeNormalizers} from './geometry_normals_compile.mjs';
 import {geometryNormalSourceRole} from './geometry_normals_specialization.mjs';
 import {compileNumericKernel} from './numeric_kernel.mjs';
 
@@ -21,7 +21,7 @@ export function geometryTransformSourceRole(source) {
 
 /** Inline only the verified vector/attribute calls. Arithmetic, component loads,
  * store order, perspective division and normalization come from those bodies. */
-export function deriveGeometryTransformKernels(attributeSource,vectorSource,{interleaved=false}={}) {
+export function deriveGeometryTransformKernels(attributeSource,vectorSource,{interleaved=false,normalized=false}={}) {
   const attribute=normalClasses(attributeSource).get(interleaved?'InterleavedBufferAttribute':'BufferAttribute'),
     vector=normalClasses(vectorSource).get('Vector3');
   if(!attribute || !vector)throw new TypeError('Missing verified attribute-transform classes');
@@ -44,7 +44,7 @@ export function deriveGeometryTransformKernels(attributeSource,vectorSource,{int
       const object=value(node.object,env),key=node.property.name;
       if(object===vec && !node.computed && ['x','y','z'].includes(key))return 'v_'+key;
       if(object===attr && !node.computed) {
-        if(key==='array')return 'values';if(key==='count')return 'count';if(key==='itemSize')return '3';
+        if(key==='array')return 'values';if(key==='count')return 'count';if(key==='itemSize')return 'stride';
         if(interleaved && key==='offset')return 'offset';
       }
       if(object===buffer && !node.computed && ['array','count','stride'].includes(key))return key==='array'?'values':key;
@@ -56,13 +56,16 @@ export function deriveGeometryTransformKernels(attributeSource,vectorSource,{int
       return `(${expression(node.left,env)} ${node.operator} ${expression(node.right,env)})`;
     if(node.type==='UpdateExpression')return node.prefix?node.operator+expression(node.argument,env):expression(node.argument,env)+node.operator;
     if(node.type==='UnaryExpression')return `(${node.operator}${expression(node.argument,env)})`;
+    if(normalized && node.type==='CallExpression' && node.callee.type==='Identifier' && node.callee.name==='normalize')
+      return `__f3d_normalize(${expression(node.arguments[0],env)})`;
     if(node.type==='CallExpression' && node.callee.type==='MemberExpression' && !node.callee.computed) {
       const receiver=value(node.callee.object,env),name=node.callee.property.name;
       if(receiver==='Math')return `Math.${name}(${node.arguments.map(arg=>expression(arg,env)).join(',')})`;
       if(receiver===attr && ['getX','getY','getZ'].includes(name)) {
         requirements.attribute.add(name);const method=normalMethod(attribute,name);
         const scope=new Map(env).set('this',attr).set(method.params[0].name,expression(node.arguments[0],env));
-        return expression(method.body.body[0].declarations[0].init,scope);
+        const load=expression(method.body.body[0].declarations[0].init,scope);
+        return normalized?`__f3d_denormalize(${load})`:load;
       }
       if(receiver===vec && name==='length') {
         requirements.vector.add(name);
@@ -89,7 +92,9 @@ export function deriveGeometryTransformKernels(attributeSource,vectorSource,{int
       }else scope.set(param.name,argument);
     });
     const code=method.body.body.map(statement=>{
-      if(kind==='attribute' && statement.type==='IfStatement')return ''; // normalized=false guard
+      // The guard fixes the normalization branch, but its assignments and
+      // source MathUtils conversions keep their original order before stores.
+      if(kind==='attribute' && statement.type==='IfStatement')return normalized?emit(statement.consequent,scope):'';
       if(statement.type==='ReturnStatement')return statement.argument.type==='ThisExpression'?'':call(statement.argument,scope).code;
       return emit(statement,scope);
     }).join('');
@@ -116,19 +121,24 @@ export function deriveGeometryTransformKernels(attributeSource,vectorSource,{int
     const loop=name==='applyMatrix3'?body[0].alternate.consequent.body[0]:body[0];
     const scratch=loop.body.body[0].expression.callee.object.name;
     const env=new Map([['this',attr],[method.params[0].name,matrix],[scratch,vec]]);
-    const source=`function transform(values,elements,scratch,count${interleaved?',stride,offset':''}){let v_x=scratch[0],v_y=scratch[1],v_z=scratch[2];`+
+    const source=`function transform(values,elements,scratch,count,stride,offset){let v_x=scratch[0],v_y=scratch[1],v_z=scratch[2];`+
       emit(loop,env)+'scratch[0]=v_x;scratch[1]=v_y;scratch[2]=v_z;}';
     derived.push({name,source,scratch,span:{start:body[0].start,end:body.at(-1).start}});
   }
   return {methods:derived,requirements:{attribute:[...requirements.attribute],vector:[...requirements.vector]}};
 }
 
-export function specializeGeometryTransforms(source,{runtimeModule,objectsModule,vectorSource,maxMemoryPages=2048,maxIterations=100000000}={}) {
+export function specializeGeometryTransforms(source,{runtimeModule,objectsModule,vectorSource,mathUtilsSource,maxMemoryPages=2048,maxIterations=100000000}={}) {
   const role=geometryTransformSourceRole(source);
   if(!role)return {changed:false,edits:[],header:'',tail:''};
   const classes=normalClasses(source),edits=[],imports=[],tail=[];
   const report={sourceBlob:sourceBlob(source),upstreamCommit:'148ef33ecb6d2502ff796d4554abd1549c95d519',
     role,compiledMethods:[],sourceDerived:true,accelerationClaim:false};
+  if(role==='core')mathUtilsSource=source;
+  const normalizationPinned=role==='core' || geometryNormalSourceRole(mathUtilsSource??'')==='math-utils';
+  const denormalizers=normalizationPinned?deriveAttributeDenormalizers(mathUtilsSource):null;
+  const normalizers=normalizationPinned?deriveAttributeNormalizers(mathUtilsSource):null;
+  const normalizationProof=normalizationPinned?'()=>[normalize,denormalize]':'null';
   if(role==='matrix3' || role==='core') {
     const ctor=normalMethod(classes.get('Matrix3'),'constructor');
     const allocation=ctor.body.body.find(node=>node.expression?.left?.property?.name==='elements').expression.right;
@@ -158,15 +168,21 @@ export function specializeGeometryTransforms(source,{runtimeModule,objectsModule
       return {changed:false,edits:[],header:'',tail:'',report:{...report,reason:'DEPENDENCY_PIN_MISMATCH'}};
     const interleaved=className==='InterleavedBufferAttribute',layout=interleaved?'interleaved':'contiguous';
     const derived=deriveGeometryTransformKernels(source,vectorSource,{interleaved}),variants=[];
-    for(const method of derived.methods)for(const type of ['f32[]','f64[]']) {
-      const artifact=compileNumericKernel(method.source,{parameterTypes:[type,'f64[]','f64[]','f64',...(interleaved?['f64','f64']:[])],
-        generalControl:true,allowMath:true,maxMemoryPages,maxIterations,sourceName:'pinned '+className+'.'+method.name});
-      variants.push({method:method.name,type,layout,base64:Buffer.from(artifact.wasm).toString('base64')});
+    for(const normalized of normalizationPinned?[false,true]:[false]) {
+      const kernels=normalized?deriveGeometryTransformKernels(source,vectorSource,{interleaved,normalized}):derived;
+      const types=normalized?[...denormalizers.keys()]:['f32[]','f64[]','u32[]','u16[]','u8[]','u8c[]','i32[]','i16[]','i8[]'];
+      for(const method of kernels.methods)for(const type of types) {
+        const helperSources=normalized?new Map([['__f3d_denormalize',denormalizers.get(type).source],
+          ['__f3d_normalize',normalizers.get(type).source]]):undefined;
+        const artifact=compileNumericKernel(method.source,{parameterTypes:[type,'f64[]','f64[]','f64','f64','f64'],
+          helperSources,generalControl:true,allowMath:true,maxMemoryPages,maxIterations,sourceName:'pinned '+className+'.'+method.name});
+        variants.push({method:method.name,type,layout,normalized,base64:Buffer.from(artifact.wasm).toString('base64')});
+      }
     }
     const prefix=interleaved?'interleaved_':'',register=fresh(source,prefix+'register'),create=fresh(source,prefix+'create'),
       token=fresh(source,prefix+'dispatch'),attempt=fresh(source,prefix+'try');
     imports.push(`import {registerGeometryTransformAttributes as ${register},createGeometryTransformDispatch as ${create},tryGeometryTransform as ${attempt}} from ${JSON.stringify(runtimeModule)};var ${token};`);
-    tail.push(`${register}(${className},[${interleaved?'':'Float32BufferAttribute'}],${JSON.stringify(layout)});`,
+    tail.push(`${register}(${className},[${interleaved?'':'Float32BufferAttribute,Uint32BufferAttribute,Uint16BufferAttribute,Uint8BufferAttribute,Uint8ClampedBufferAttribute,Int32BufferAttribute,Int16BufferAttribute,Int8BufferAttribute'}],${JSON.stringify(layout)},${normalizationProof});`,
       `${token}=${create}(${JSON.stringify(variants)},Vector3,()=>Math);`);
     for(const method of derived.methods)edits.push({...method.span,text:`if (!${attempt}(this,${token},${JSON.stringify(method.name)},m,${method.scratch})) {\n`+
       source.slice(method.span.start,method.span.end)+'\n}\n'});

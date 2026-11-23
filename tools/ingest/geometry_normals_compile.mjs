@@ -19,27 +19,36 @@ export const normalMethod=(cls,name)=>cls.body.body.find(node=>node.key?.name===
  * Float64Array is deliberately absent: normalized Float64 input throws upstream.
  */
 export function deriveAttributeDenormalizers(mathUtilsSource) {
+  return deriveAttributeConversions(mathUtilsSource,'denormalize');
+}
+
+/** The matching source conversion for normalized integer attribute stores. */
+export function deriveAttributeNormalizers(mathUtilsSource) {
+  return deriveAttributeConversions(mathUtilsSource,'normalize');
+}
+
+function deriveAttributeConversions(mathUtilsSource,name) {
   const ast=acorn.parse(mathUtilsSource,{ecmaVersion:'latest',sourceType:'module'});
-  const fn=ast.body.find(node=>node.type==='FunctionDeclaration' && node.id.name==='denormalize');
+  const fn=ast.body.find(node=>node.type==='FunctionDeclaration' && node.id.name===name);
   const dispatch=fn?.body.body[0],types={Float32Array:'f32[]',Uint32Array:'u32[]',Uint16Array:'u16[]',
     Uint8Array:'u8[]',Uint8ClampedArray:'u8c[]',Int32Array:'i32[]',Int16Array:'i16[]',Int8Array:'i8[]'};
-  if(dispatch?.type!=='SwitchStatement' || fn.params.length!==2)throw new TypeError('Missing verified denormalize switch');
+  if(dispatch?.type!=='SwitchStatement' || fn.params.length!==2)throw new TypeError('Missing verified '+name+' switch');
   const result=new Map(),pending=[];
   for(const entry of dispatch.cases) {
     if(!entry.test)continue;
     const constructor=entry.test.name,type=types[constructor];
-    if(!type)throw new TypeError('Unknown verified denormalize constructor');
+    if(!type)throw new TypeError('Unknown verified '+name+' constructor');
     pending.push({constructor,type});
     if(!entry.consequent.length)continue;
     if(entry.consequent.length!==1 || entry.consequent[0].type!=='ReturnStatement')
-      throw new TypeError('Unsupported verified denormalize branch');
+      throw new TypeError('Unsupported verified '+name+' branch');
     const value=entry.consequent[0].argument,parameter=fn.params[0].name;
     const expression=mathUtilsSource.slice(value.start,value.end);
     for(const item of pending)result.set(item.type,{constructor:item.constructor,parameter,expression,
-      source:`function __f3d_denormalize(${parameter}){return ${expression};}`});
+      source:`function __f3d_${name}(${parameter}){return ${expression};}`});
     pending.length=0;
   }
-  if(pending.length || result.size!==Object.keys(types).length)throw new TypeError('Incomplete verified denormalize switch');
+  if(pending.length || result.size!==Object.keys(types).length)throw new TypeError('Incomplete verified '+name+' switch');
   return result;
 }
 

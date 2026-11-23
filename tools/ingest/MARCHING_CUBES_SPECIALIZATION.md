@@ -158,21 +158,29 @@ prefixes/tails retain their exact bytes. The original geometry algorithm still
 requests uploads between position, normal and tangent transforms, preserving
 the shared buffer's version increments and any `needsUpdate` observations.
 
-The admitted profile is a genuine source-created BufferAttribute or
-Float32BufferAttribute with three unnormalized Float32/Float64 components per
-item, or a source-created InterleavedBufferAttribute with at least three
-components in a witnessed InterleavedBuffer with fixed Float32/Float64 storage.
+The admitted profile is a genuine source-created BufferAttribute, its ordinary
+typed subclasses, or InterleavedBufferAttribute backed by a witnessed
+InterleavedBuffer. Fixed Float32/Float64 and signed/unsigned 8-, 16- and 32-bit
+integer storage, including Uint8ClampedArray, are supported. At least three
+components are required; contiguous `applyMatrix3` retains its exact three-component
+branch. Four-component tangents keep their original W channel.
+Normalized attributes derive both decoding and encoding from the exact resolved
+MathUtils source, preserving signed minimum clamping, `Math.round` and every
+integer or clamped typed store. Separate variants leave unnormalized transforms
+independent of unused normalization intrinsics. Normalized Float64 retains the
+source error; changed helper sources, constructor observations and replaced
+normalization intrinsics retain source execution.
 Matrices must be witnessed Matrix3/Matrix4 objects with ordinary numeric elements. The
 compiler retains source expression order, perspective division, normalization,
-every Float32 store and the original private scratch vector's final unrounded
+every typed store and the original private scratch vector's final unrounded
 values. Methods, attribute/array identities, synchronous return values,
 `needsUpdate` behavior and geometry bounds remain source-owned. Shared,
 resizable, detached, subclassed or unsupported storage, custom accessors and
 methods, proxies, modified source and failed memory/work budgets retain the
 original loop before any native result is published. Interleaved count/data
 accessors and proxies keep their original reads and partial effects; the guard
-never invokes a user getter speculatively. Two-component matrix transforms and
-normalized/integer attributes remain on their ordinary JavaScript path.
+never invokes a user getter speculatively. Two-component matrix transforms
+remain on their ordinary JavaScript path.
 
 Run `node tools/ingest/geometry_transforms.test.mjs` for actual emitted Wasm
 differentials against pinned r186, including normal/position composition through
