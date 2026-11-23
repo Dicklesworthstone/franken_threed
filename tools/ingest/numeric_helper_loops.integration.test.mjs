@@ -194,6 +194,81 @@ test('cross-module registrations admit exported scalar roots with only transitiv
   assert.equal(app.diagnostics().find(item => item.name === 'delegated').kernel.wasmCalls, 1);
 });
 
+for (const crossModule of [false, true]) {
+  for (const rootFirst of [false, true]) {
+    test(`admitted declaration bodies remain original with ${crossModule ? 'shared' : 'local'} dispatch and ${rootFirst ? 'root' : 'helper'} first`, async t => {
+      const helper = `export function add(out,input,count){for(let i=0;i<count;i++)out[i]+=input[i];}`;
+      const root = `export function update(out,input,count){out[0]+=2;add(out,input,count);return out[0];}`;
+      const source = `${(rootFirst ? [root, helper] : [helper, root]).join('\n')}
+        export const identity=update, events=[];
+        export function frame(out,input,count){events.push('before');const result=update(out,input,count);events.push(result);return result;}`;
+      const app = await application(t, source, {crossModule, loopIslands:true});
+      assert.equal(app.module.update, app.module.identity);
+      for (const name of ['add', 'update'])
+        assert.equal(app.module[name].toString(), app.reference[name].toString(), name);
+      assert.equal(app.result.report.absorbedCalls, 1);
+      assert.equal(app.result.report.rewrittenCalls, 1);
+      assert.equal(app.result.report.candidates.find(item => item.functionName === 'add').calls.length, 0);
+      assert.equal(app.result.report.loopIslands.compiledKernels, 0);
+      for (const Type of [Float32Array, Float64Array]) {
+        const values = new Type([1, 2, 3, 4, 5]), expected = values.slice();
+        for (let step = 0; step < 3; step++) {
+          // Shifted aliases exercise source-ordered writes inside the helper.
+          assert.equal(app.module.frame(values.subarray(1), values.subarray(0, 4), 4),
+            app.reference.frame(expected.subarray(1), expected.subarray(0, 4), 4));
+          assert.deepEqual(values, expected);
+        }
+        assert.equal(app.diagnostics().find(item => item.name === 'update').kernel.wasmCalls, 3);
+      }
+      assert.deepEqual(app.module.events, app.reference.events);
+      assert.equal(app.diagnostics().find(item => item.name === 'add').initialized, false);
+      if (crossModule) {
+        const {dispatchImportedNumericCall} = await import(dispatchURL);
+        const actual = new Float64Array([10, 20]), expected = actual.slice(), input = new Float64Array([3, 4]);
+        assert.equal(dispatchImportedNumericCall(app.module.update, [actual, input, 2]),
+          app.reference.update(expected, input, 2));
+        assert.deepEqual(actual, expected);
+        assert.equal(app.diagnostics().find(item => item.name === 'update').kernel.wasmCalls, 4);
+        assert.equal(app.diagnostics().find(item => item.name === 'add').initialized, false);
+      }
+    });
+  }
+}
+
+test('a failed outer declaration resumes untouched helper source without nested native attempts', async t => {
+  const source = `
+    export function add(out,input,count){for(let i=0;i<count;i++)out[i]+=input[i];}
+    export function update(out,input,count){out[0]+=2;add(out,input,count);return out[0];}
+    export const events=[];
+    export function frame(out,input,count){events.push('before');const result=update(out,input,count);events.push(result);return result;}`;
+  const app = await application(t, source, {crossModule:true, maxIterations:2});
+  const values = new Float64Array([1, 2, 3, 4]), expected = values.slice(), input = new Float64Array([0.5, 1, 1.5, 2]);
+  assert.equal(app.module.frame(values, input, 4), app.reference.frame(expected, input, 4));
+  assert.deepEqual(values, expected, 'speculative writes roll back before the original update');
+  assert.deepEqual(app.module.events, app.reference.events);
+  const stats = () => app.diagnostics().find(item => item.name === 'update');
+  assert.equal(stats().kernel.fallbackCalls, 1);
+  assert.equal(stats().kernel.wasmCalls, 0);
+  assert.equal(app.diagnostics().find(item => item.name === 'add').initialized, false);
+
+  // A source accessor observes exactly the original partial publication and
+  // throws the same object; a nested dispatcher must never inspect it first.
+  const marker = {}, seen = [], referenceSeen = [];
+  const observed = (output, log) => ({0:3, get 1(){log.push([...output]);throw marker;}});
+  assert.throws(() => app.module.frame(values, observed(values, seen), 2), error => error === marker);
+  assert.throws(() => app.reference.frame(expected, observed(expected, referenceSeen), 2), error => error === marker);
+  assert.deepEqual(values, expected);
+  assert.deepEqual(seen, referenceSeen);
+  assert.deepEqual(app.module.events, app.reference.events);
+  assert.equal(app.diagnostics().find(item => item.name === 'add').initialized, false);
+  assert.equal(app.module.update.toString(), app.reference.update.toString());
+
+  assert.equal(app.module.frame(values, input, 1), app.reference.frame(expected, input, 1));
+  assert.deepEqual(values, expected);
+  assert.equal(stats().kernel.wasmCalls, 1, 'the failed transaction does not poison later dispatch');
+  assert.equal(app.diagnostics().find(item => item.name === 'add').initialized, false);
+});
+
 test('a relocated generated package closes iterative helpers without parser, source tree, or host imports', async t => {
   const dir = fixture(t), entry = path.join(dir, 'source.mjs'), build = path.join(dir, 'build'), relocated = path.join(dir, 'relocated');
   const source = `${helper}\nexport function root(n){return count(n)*2+1;}`;

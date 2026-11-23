@@ -430,7 +430,7 @@ export function specializeNumericModule(
   if (crossModule) expressionCandidates.sort((a, b) => priority(a) - priority(b));
   const candidates = [...orderedCandidates.filter(candidate => directLoops.has(candidate)),
     ...orderedCandidates.filter(candidate => !directLoops.has(candidate)), ...expressionCandidates];
-  const expressionRegions = [];
+  const preservedSourceRegions = [];
   const inside = (region, node) => region.start <= node.start && region.end >= node.end;
   for (const candidate of candidates) {
     const {fn, name} = candidate, expressionRoot = fn.type !== "FunctionDeclaration";
@@ -665,8 +665,8 @@ export function specializeNumericModule(
     item.guardFallback = "retained-original-js";
     if (expressionRoot) {
       item.bindingSemantics = "immutable-module-expression-after-initialization";
-      expressionRegions.push(item.sourceSpan, ...(item.scalarHelpers ?? []).map(helper => helper.sourceSpan));
     }
+    preservedSourceRegions.push(item.sourceSpan, ...(item.scalarHelpers ?? []).map(helper => helper.sourceSpan));
     if (crossModule) {
       item.dispatchSemantics = "shared-original-function-identity-v1";
       item.exportReachable = exportedBindings.has(name);
@@ -675,13 +675,14 @@ export function specializeNumericModule(
     report.compiledKernels++;
     report.rewrittenCalls += sites.length;
   }
-  // A newly admitted expression may contain an earlier declaration's call
-  // site. Keep the original root and helper bodies byte-for-byte intact: the
-  // native root already owns those calls, and fallback must use original JS.
-  const absorbedExpressionCalls = report.candidates.flatMap(item => item.calls)
-    .filter(call => expressionRegions.some(region => region && inside(region, call)));
-  if (absorbedExpressionCalls.length) {
-    const absorbed = new Set(absorbedExpressionCalls.map(call => call.start));
+  // Roots and their helpers may be discovered in either source order. Their
+  // bodies must stay byte-for-byte intact regardless of declaration shape:
+  // native execution already owns the helper calls, and a rejected transaction
+  // must resume the original JS without attempting nested native transactions.
+  const absorbedSourceCalls = report.candidates.flatMap(item => item.calls)
+    .filter(call => preservedSourceRegions.some(region => region && inside(region, call)));
+  if (absorbedSourceCalls.length) {
+    const absorbed = new Set(absorbedSourceCalls.map(call => call.start));
     // A semicolon-free concise arrow may end at the call's end coordinate.
     // Its registration shares that offset but is not part of the call edit.
     for (let index = edits.length - 1; index >= 0; index--)
@@ -693,8 +694,8 @@ export function specializeNumericModule(
         item.calls = item.calls.filter(call => !absorbed.has(call.start));
       }
     }
-    report.rewrittenCalls -= absorbedExpressionCalls.length;
-    report.absorbedCalls = absorbedExpressionCalls.length;
+    report.rewrittenCalls -= absorbedSourceCalls.length;
+    report.absorbedCalls = absorbedSourceCalls.length;
   }
   // Consumer-only chunks need no kernel or Wasm bytes of their own. The source
   // dependency still initializes on the normal ESM schedule; do not import or
@@ -709,8 +710,7 @@ export function specializeNumericModule(
       ast, fresh, sourceName, maxKernels: maxKernels - report.compiledKernels,
       maxMemoryPages, maxIterations, reservedEdits: edits, helperSources, helperDeclarations, helperInitializers, helperCapturePlan,
       replaceableCalls: report.candidates.flatMap(item => item.calls),
-      excludedSpans: [...report.candidates.filter(item => item.route === "guarded-numeric-wasm").map(item => item.sourceSpan),
-        ...expressionRegions.filter(Boolean)],
+      excludedSpans: preservedSourceRegions.filter(Boolean),
     });
     // Replace smaller direct-call token edits only after a larger original
     // statement has passed full closure. Its JS fallback is already embedded
@@ -740,7 +740,7 @@ export function specializeNumericModule(
   }
   if (crossModule) {
     const sites = calls.filter(call => importedBindings.has(call.callee.name) &&
-      !expressionRegions.some(region => region && inside(region, call)));
+      !preservedSourceRegions.some(region => region && inside(region, call)));
     if (sites.length) {
       const importedDispatchName = fresh("imported_dispatch"), helperName = fresh("imported_call");
       runtimeImports.push(`dispatchImportedNumericCall as ${importedDispatchName}`);
