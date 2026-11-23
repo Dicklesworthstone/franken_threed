@@ -899,6 +899,9 @@ export async function bundleWithRollup(entryPath, options = {}) {
           documentRoot,
           unavailableGlobals: options.workerHostBindings,
           ...(isHtml ? { documentUrl: entryUrl, documentBaseUrl: mapBaseUrl } : {}),
+          resolveSourceModule: (specifier, from) => resolveModuleSpecifier(specifier, from, importMap, {
+            target, mapBaseUrl, documentRoot, packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources,
+          }),
           resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, {}, {
             target,
             packageRootUrl: options.packageRootUrl,

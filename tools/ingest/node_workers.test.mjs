@@ -106,6 +106,34 @@ test('nested Node workers preserve aliases, native entry suffixes, symlink ident
   assert.deepEqual(expected,{runs:1,self:true,same:true,entrySuffix:'',value:41,read:41,result:{answer:27,suffix:''}});
 });
 
+test('imported Node worker resource selectors preserve nested threads, effects and module-relative assets', async () => {
+  const f=fixture({
+    'main.mjs':`import {Worker as Thread} from 'node:worker_threads';import {parent,log} from './config/routes.mjs';
+      export default async()=>{const worker=new Thread(new URL((log.push('select'),parent),import.meta.url),
+        {name:(log.push('options'),'imported-entry')});
+        const value=await new Promise((resolve,reject)=>{worker.once('message',resolve);worker.once('error',reject)});
+        await worker.terminate();return {value,parent,log};};`,
+    'config/routes.mjs':`export const log=[];
+      export const parent=(log.push('configuration'),'./jobs/parent.mjs?ignored#entry');
+      export {default as child,asset} from './values.mjs';`,
+    'config/values.mjs':`export default './child.mjs?ignored';export const asset='../payload.bin';`,
+    'jobs/parent.mjs':`import {Worker as Child,parentPort} from 'node:worker_threads';
+      import {child,asset,log} from '../config/routes.mjs';import {readFileSync} from 'node:fs';
+      const bytes=[...readFileSync(new URL((log.push('asset'),asset),import.meta.url))];
+      const worker=new Child(new URL((log.push('child'),child),import.meta.url),{workerData:bytes});
+      const value=await new Promise((resolve,reject)=>{worker.once('message',resolve);worker.once('error',reject)});
+      await worker.terminate();parentPort.postMessage({bytes,value,child,asset,log});`,
+    'jobs/child.mjs':`import {parentPort,workerData} from 'node:worker_threads';
+      parentPort.postMessage({sum:workerData.reduce((a,b)=>a+b,0),dom:typeof document});`,
+    'payload.bin':Buffer.from([7,11,24]),
+  });
+  const expected=execute(f),built=await buildApplication(f.entry,f.out,{target:'node'});
+  assert.deepEqual(execute(f,relocate(f,built)),expected);
+  assert.deepEqual(expected,{parent:'./jobs/parent.mjs?ignored#entry',log:['configuration','select','options'],
+    value:{bytes:[7,11,24],value:{sum:42,dom:'undefined'},child:'./child.mjs?ignored',asset:'../payload.bin',
+      log:['configuration','asset','child']}});
+});
+
 test('Node Worker constructor errors, option effects and asynchronous failures stay native after relocation', async () => {
   const f=fixture({
     'main.mjs':`import {Worker,MessageChannel} from 'node:worker_threads';
@@ -173,13 +201,21 @@ test('Node worker open and CommonJS graphs retain explicit boundaries before out
 });
 
 test('Node worker plugin rebuilds use fresh sources and retain the deployment target', () => {
-  const f=fixture({'main.mjs':'','job.mjs':`import {basename} from 'node:path';export const value=basename('/a/first');`});
+  const f=fixture({'main.mjs':'','config.mjs':`export const entry='./job.mjs';`,
+    'job.mjs':`import {basename} from 'node:path';export const value=basename('/a/first');`,
+    'next.mjs':`export const value='next';`});
   const plugin=moduleWorkerRollupPlugin({target:'node'}),files=[];
-  const context={emitFile:file=>{files.push(file);return String(files.length)},addWatchFile(){}};
-  const source=`import {Worker} from 'node:worker_threads';export const start=()=>new Worker(new URL('./job.mjs',import.meta.url));`;
+  const watched=new Set();
+  const context={emitFile:file=>{files.push(file);return String(files.length)},addWatchFile:file=>watched.add(file)};
+  const source=`import {Worker} from 'node:worker_threads';import {entry} from './config.mjs';
+    export const start=()=>new Worker(new URL(entry,import.meta.url));`;
   plugin.buildStart();plugin.transform.call(context,source,pathToFileURL(f.entry).href);
   const first=files[0].fileName;
+  assert.ok(watched.has(path.join(f.source,'config.mjs')));
   fs.writeFileSync(path.join(f.source,'job.mjs'),`import {basename} from 'node:path';export const value=basename('/a/second');`);
   files.length=0;plugin.buildStart();plugin.transform.call(context,source,pathToFileURL(f.entry).href);
   assert.notEqual(files[0].fileName,first);assert.match(files[0].source,/second/);
+  fs.writeFileSync(path.join(f.source,'config.mjs'),`export const entry='./next.mjs';`);
+  files.length=0;plugin.buildStart();plugin.transform.call(context,source,pathToFileURL(f.entry).href);
+  assert.equal(files.length,1);assert.match(files[0].source,/next/);
 });

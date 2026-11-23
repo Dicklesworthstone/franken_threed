@@ -708,6 +708,89 @@ test("imported worker selectors use one frontend snapshot and remain part of wor
   }}),{code:'F3D_SOURCE_TRANSFORM'});
 });
 
+test("imported worker resource selectors preserve document, realm and module bases through deployment and packing", async (t) => {
+  const root=fixture({
+    'index.html':`<base href="site/base.html"><script type="importmap">{"imports":{
+      "page-routes":"../config/page.mjs","worker-routes":"../page-only.mjs"}}</script>
+      <script type="module" src="../modules/app.mjs"></script>`,
+    'page-only.mjs':`throw new Error('worker imports must not use the document map');`,
+    'config/page.mjs':`export const log=[];
+      export const documentEntry=(log.push('configuration'),'./tasks/main.mjs');
+      export const moduleEntry='../site/tasks/main.mjs';`,
+    'modules/app.mjs':`import {documentEntry,moduleEntry,log} from 'page-routes';
+      export const start=module=>new Worker(module
+        ?new URL((log.push('module'),moduleEntry),import.meta.url)
+        :(log.push('document'),documentEntry),{type:'module',name:(log.push('options'),'resources')});
+      export const observations=()=>({documentEntry,moduleEntry,log:log.slice()});`,
+    'site/tasks/main.mjs':`import '../../shared/resources.mjs';`,
+    'shared/resources.mjs':`import {body,other,asset,wasm,nested,log} from 'worker-routes';
+      const initial=log.slice(), load=flag=>fetch((log.push('select:'+flag),flag?body:other),
+        {headers:(log.push('headers'),{})});
+      const first=await(await load(true)).text(),second=await(await load(false)).text();
+      const bytes=await(await fetch(new URL((log.push('asset'),asset),import.meta.url))).text();
+      const compiled=await WebAssembly.instantiateStreaming(fetch((log.push('wasm'),wasm)));
+      const spawn=()=>new Worker(nested,{type:'module'});
+      const failures=[];
+      for(const operation of [()=>{fetch(selected);const selected=body;},
+        ()=>{new URL(selected,import.meta.url);const selected=asset;},
+        ()=>{new Worker(selected,{type:'module'});const selected=nested;}])
+        try{operation()}catch(error){failures.push(error.name)}
+      postMessage({initial,first,second,bytes,wasm:Object.keys(compiled.instance.exports),
+        paths:[body,asset,wasm,nested],log,failures});`,
+    'node_modules/worker-routes/package.json':'{"name":"worker-routes","type":"module","exports":"./index.mjs"}',
+    'node_modules/worker-routes/index.mjs':`export {body,other,asset,wasm,nested,log} from './values.mjs';`,
+    'node_modules/worker-routes/values.mjs':`export const log=[];
+      export const body=(log.push('worker-configuration'),'./body.txt?copy=1#bytes');
+      export const other='./other.txt',asset='./payload.txt',wasm='./solver.wasm',nested='./nested.mjs';`,
+    'site/tasks/body.txt':'realm-relative first','site/tasks/other.txt':'realm-relative second',
+    'site/tasks/solver.wasm':Buffer.from([0,97,115,109,1,0,0,0]),
+    'site/tasks/nested.mjs':`postMessage('nested');`,
+    'shared/payload.txt':'module-relative asset',
+  });
+  const output=root+'-output',relocated=output+'-relocated',packed=root+'-packed.html';
+  workerHost(t,pathToFileURL(path.join(relocated,'site/base.html')));
+  const expected=await new Worker(pathToFileURL(path.join(root,'site/tasks/main.mjs')),{type:'module'}).result;
+  assert.deepEqual(expected,{initial:['worker-configuration'],first:'realm-relative first',second:'realm-relative second',
+    bytes:'module-relative asset',wasm:[],paths:['./body.txt?copy=1#bytes','./payload.txt','./solver.wasm','./nested.mjs'],
+    log:['worker-configuration','select:true','headers','select:false','headers','asset','wasm'],
+    failures:['ReferenceError','ReferenceError','ReferenceError']});
+  const built=await buildApplication(path.join(root,'index.html'),output);
+  assert.ok(built.emittedFiles.some(file=>file.startsWith('f3d-workers/')));
+  packHtml(path.join(output,'index.html'),packed);
+  fs.renameSync(root,root+'-source-unavailable');fs.renameSync(output,relocated);
+  const application=await import(pathToFileURL(path.join(relocated,built.entryFiles[0])).href);
+  const first=application.start(false),second=application.start(true);
+  assert.equal(first.url.href,second.url.href,'equivalent imported document/module selectors share one native entry');
+  assert.deepEqual(await first.result,expected);assert.deepEqual(await second.result,expected);
+  assert.deepEqual(application.observations(),{documentEntry:'./tasks/main.mjs',moduleEntry:'../site/tasks/main.mjs',
+    log:['configuration','document','options','module','options']});
+  const html=fs.readFileSync(packed,'utf8'),standaloneUrl=/<script type="module" src="([^"]+)"/.exec(html)[1];
+  fs.renameSync(relocated,relocated+'-unavailable');
+  const standalone=await import(standaloneUrl);
+  assert.deepEqual(await standalone.start(false).result,expected);
+  assert.deepEqual(await standalone.start(true).result,expected);
+});
+
+test("imported worker resource selectors reject mutable paths and retain frontend errors and budgets", () => {
+  for(const use of ['fetch(entry);','new URL(entry,import.meta.url);','new Worker(entry,{type:"module"});']) {
+    const root=fixture({'worker.mjs':`import {entry} from './config.mjs';${use}`,
+      'config.mjs':`export let entry='./resource.mjs';`,'resource.mjs':'export const value=42;'});
+    assert.throws(()=>buildModuleWorkerGraph(pathToFileURL(path.join(root,'worker.mjs')).href,
+      {requireClosedRuntimeUrls:true}),{code:'F3D_WORKER_DYNAMIC_RESOURCE'});
+  }
+  const root=fixture({'worker.mjs':`import {entry} from './config.ts';fetch(entry);`,
+    'config.ts':`export const entry: string='./body.txt';`,'body.txt':'bytes'});
+  const entry=pathToFileURL(path.join(root,'worker.mjs')).href,visits=new Map();
+  const transformModule=(source,{url})=>{visits.set(url,(visits.get(url)??0)+1);return source.replace(': string','');};
+  const graph=buildModuleWorkerGraph(entry,{transformModule,requireClosedRuntimeUrls:true});
+  assert.equal(graph.assetCount,1);assert.ok(graph.watchFiles.includes(path.join(root,'config.ts')));
+  assert.equal(visits.get(pathToFileURL(path.join(root,'config.ts')).href),1);
+  assert.throws(()=>buildModuleWorkerGraph(entry,{transformModule,maxBytes:32}),{code:'F3D_WORKER_BUDGET'});
+  assert.throws(()=>buildModuleWorkerGraph(entry,{transformModule(source,{url}){
+    if(url.endsWith('/config.ts'))throw new Error('frontend failed');return source;
+  }}),{code:'F3D_SOURCE_TRANSFORM'});
+});
+
 test("imported worker selectors keep mutable and open exports outside relocation", () => {
   for(const [imported, config, selected] of [
     ["{entry}","export let entry='./lazy.mjs';",'entry'],

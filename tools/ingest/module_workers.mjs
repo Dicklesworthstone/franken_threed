@@ -18,7 +18,7 @@ import * as walk from 'acorn-walk';
 import {moduleSourcesFor} from './module_sources.mjs';
 import {resolveModuleSpecifier} from './resolver.mjs';
 import {createImportedStringResolver} from './module_string_constants.mjs';
-import {assertUnbundledModule} from './commonjs_modules.mjs';
+import {assertUnbundledModule, commonjsFormat} from './commonjs_modules.mjs';
 import {createDynamicImportClassifier} from './ast_analyzer.mjs';
 import {isRootRelativeDocumentUrl, normalizeDocumentRoot, resolveDocumentUrl} from './document_urls.mjs';
 import {numericApplicationSettings, specializeNumericModule} from './numeric_specialization.mjs';
@@ -220,8 +220,9 @@ function scopedGlobals(ast, nativeImports = new Set()) {
       ...(ancestors.some(parent => parent.type === 'WithStatement') ? ['Worker', 'SharedWorker', 'URL'] : [])]);
   };
 }
-function sitesIn(ast, changed, {classic = false, relative = false, withConstructors = false} = {}) {
-  const sites = [], classify = createDynamicImportClassifier(ast);
+function sitesIn(ast, changed, {classic = false, relative = false, withConstructors = false,
+  classify = createDynamicImportClassifier(ast)} = {}) {
+  const sites = [];
   walk.simple(ast, {NewExpression(node) {
     const unavailable = typeof changed === 'function' ? changed(node) : changed;
     const kind = node.callee.type === 'Identifier' ? node.callee.name : null;
@@ -256,10 +257,12 @@ export function findModuleWorkerSites(source) {
 }
 
 /** URL-form workers; literal URLs when their document or worker realm is known. */
-export function findWorkerSites(source, {sourceType = 'module', relative = false, unavailableGlobals = []} = {}) {
+export function findWorkerSites(source, {sourceType = 'module', relative = false, unavailableGlobals = [],
+  resolveImportedString = null} = {}) {
   const ast = typeof source === 'string' ? parse(source, null, sourceType) : source;
   const globals = scopedGlobals(ast);
-  return sitesIn(ast, node => new Set([...globals(node), ...unavailableGlobals]), {classic: true, relative});
+  return sitesIn(ast, node => new Set([...globals(node), ...unavailableGlobals]), {classic: true, relative,
+    classify: createDynamicImportClassifier(ast, resolveImportedString)});
 }
 
 /** Native worker URL operands belong to the worker transform, including host
@@ -285,7 +288,7 @@ export function findWorkerUrlOperands(source, {sourceType = 'module', unavailabl
 // Node workers are imported host constructors, not browser globals. Exclude
 // only those actual import bindings from scope lookup; nested parameters and
 // local declarations still shadow them. Never infer a Worker from its spelling.
-function nodeWorkerAnalysis(source, {resolveModule, moduleUrl} = {}) {
+function nodeWorkerAnalysis(source, {resolveModule, moduleUrl, resolveImportedString = null} = {}) {
   const ast = typeof source === 'string' ? parse(source, moduleUrl) : source;
   const named = new Set(), namespaces = new Set(), defaults = new Set();
   for (const node of ast.body) {
@@ -299,7 +302,7 @@ function nodeWorkerAnalysis(source, {resolveModule, moduleUrl} = {}) {
     }
   }
   const globals = scopedGlobals(ast, new Set([...named, ...namespaces, ...defaults]));
-  const classify = createDynamicImportClassifier(ast), sites = [], urls = [], unresolved = [];
+  const classify = createDynamicImportClassifier(ast, resolveImportedString), sites = [], urls = [], unresolved = [];
   walk.simple(ast, {NewExpression(node) {
     const unavailable = globals(node), callee = node.callee;
     const native = callee.type === 'Identifier' ? named.has(callee.name) && !unavailable.has(callee.name)
@@ -609,14 +612,17 @@ export function buildWorkerGraph(entryUrl, {
       continue;
     }
     const ast = parse(source, record.url, record.sourceType), changed = changedGlobals(ast), edits = [];
-    const classify = createDynamicImportClassifier(ast);
     const resolveImported = importedStrings(record.url);
-    const classifyImport = createDynamicImportClassifier(ast, (...args) => {
+    const resolveImportedString = (...args) => {
       selectorFailure = null;
       const candidates = resolveImported(...args);
       if (selectorFailure) throw selectorFailure;
       return candidates;
-    });
+    };
+    // Resource operands and executable dependencies share the same source
+    // snapshot and bounded primitive-string proof. The importer's URL still
+    // determines module-relative values; fetch/worker strings keep the realm.
+    const classify = createDynamicImportClassifier(ast, resolveImportedString);
     const root = roots.get(record.realm);
     record.changed = changed;
     function replace(choice, target, fetch = false) {
@@ -659,10 +665,12 @@ export function buildWorkerGraph(entryUrl, {
         (callee.type === 'MemberExpression' && !callee.computed && callee.property.name === name &&
           callee.object.type === 'Identifier' && ['globalThis', 'self'].includes(callee.object.name) && !changed.has(callee.object.name));
     }
-    const nodeWorkers = target === 'node' ? nodeWorkerAnalysis(ast, {resolveModule, moduleUrl: record.url}) : null;
+    const nodeWorkers = target === 'node' ? nodeWorkerAnalysis(ast, {resolveModule, moduleUrl: record.url,
+      resolveImportedString}) : null;
     if (nodeWorkers?.unresolved.length)
       fail('DYNAMIC_RESOURCE', 'A Node worker needs a bounded module-relative entry URL', record.url);
-    const workers = nodeWorkers?.sites ?? sitesIn(ast, changed, {classic: true, relative: true, withConstructors: true});
+    const workers = nodeWorkers?.sites ?? sitesIn(ast, changed, {classic: true, relative: true,
+      withConstructors: true, classify});
     const workerConstructors = new Set(workers.map(site => site.constructorNode));
     const workerURLs = new Set((nodeWorkers?.urls ?? workers.map(site => site.urlNode)).map(node => node.start));
     if (requireClosedRuntimeUrls && !compilerOwned) {
@@ -696,7 +704,7 @@ export function buildWorkerGraph(entryUrl, {
     // operands first so executable dependencies cannot also become raw assets.
     walk.simple(ast, {
       ImportExpression(node) {
-        const choices = urlChoices(node.source, changed, true, [], 0, classifyImport);
+        const choices = urlChoices(node.source, changed, true, [], 0, classify);
         if (!choices) fail('DYNAMIC_IMPORT', 'Use bounded string/URL import choices in a relocated worker', record.url);
         imports.set(node, choices);
         for (const choice of choices) if (choice.base === 'module') workerURLs.add(choice.urlNode.start);
@@ -898,12 +906,37 @@ export function moduleWorkerRollupPlugin(options = {}) {
   const maxModules = options.maxModules ?? 4096, maxAssets = options.maxAssets ?? 4096;
   const numericUnits = options._workerNumericUnits ?? new Map();
   const ownedNumericUnits = new Map();
+  const selectorInputs = new Set();
+  let importedStrings = null, selectorFailure = null;
+  function sourceStrings() {
+    return importedStrings ??= createImportedStringResolver({
+      readModule(url) {
+        if (!url.startsWith('file:') || path.extname(fileURLToPath(url)).toLowerCase() === '.json') return null;
+        selectorInputs.add(fileURLToPath(url));
+        try {
+          return commonjsFormat(url, options._moduleSources) === 'module'
+            ? options._moduleSources.read(url).code : null;
+        } catch (error) { selectorFailure ??= error; return null; }
+      },
+      resolveModule(specifier, from) {
+        try {
+          // A constructor is analyzed in its source realm. Document import
+          // maps can select configuration modules, but never worker imports.
+          const resolve = options.resolveSourceModule;
+          return resolve ? resolve(specifier, from) : resolveModuleSpecifier(specifier, from, {}, {
+            target: options.target, documentRoot: options.documentRoot, _moduleSources: options._moduleSources,
+          });
+        } catch (error) { selectorFailure ??= error; return null; }
+      },
+    });
+  }
   return {
     name: 'f3d-module-workers',
     api: {getNumericReport: () => workerNumericReport(numericUnits)},
     buildStart() {
       emitted.clear(); references.clear(); filesByName.clear(); closedRealmEntries.clear();
       totalBytes = totalModules = totalAssets = 0;
+      importedStrings = null; selectorFailure = null; selectorInputs.clear();
       // Watch rebuilds must re-read edited inputs, while every realm within a
       // build shares one frontend result. An externally supplied snapshot is
       // owned by the application build and may already contain another pass.
@@ -924,11 +957,20 @@ export function moduleWorkerRollupPlugin(options = {}) {
       const nodeTarget = options.target === 'node';
       if (!code.includes(nodeTarget ? 'worker_threads' : 'Worker')) return null;
       const base = id.startsWith('file:') ? id : path.isAbsolute(id) ? pathToFileURL(id).href : null;
-      const nodeWorkers = nodeTarget ? nodeWorkerAnalysis(code, {resolveModule: options.resolveModule, moduleUrl: base}) : null;
+      const resolveImported = base ? sourceStrings()(base) : null;
+      const resolveImportedString = resolveImported && ((...args) => {
+        selectorFailure = null;
+        const candidates = resolveImported(...args);
+        if (selectorFailure) throw selectorFailure;
+        return candidates;
+      });
+      const nodeWorkers = nodeTarget ? nodeWorkerAnalysis(code, {resolveModule: options.resolveModule, moduleUrl: base,
+        resolveImportedString}) : null;
       if (nodeWorkers?.unresolved.length)
         fail('DYNAMIC_RESOURCE', 'A Node worker needs a bounded module-relative entry URL', id);
       const sites = nodeWorkers?.sites ?? findWorkerSites(code, {sourceType: options.sourceType ?? 'module',
-        relative: Boolean(options.documentUrl), unavailableGlobals: options.unavailableGlobals});
+        relative: Boolean(options.documentUrl), unavailableGlobals: options.unavailableGlobals, resolveImportedString});
+      for (const filename of selectorInputs) this.addWatchFile?.(filename);
       if (!sites.length) return null;
       if (!base) fail('ENTRY', 'A module worker URL needs a local source module', id);
       const edits = [];

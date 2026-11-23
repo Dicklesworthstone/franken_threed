@@ -435,8 +435,14 @@ select proved primitive exports without evaluating configuration code. Runtime
 member/key reads and effects stay intact; a namespace's exported objects are not
 assumed immutable. Unknown keys, star reexports, mutable bindings,
 opaque values, JSON/CommonJS imports and unresolved external modules do not prove
-a finite selector. Ordinary worker graphs share this proof for lazy imports;
-loader/fetch discovery keeps its existing local-selector requirements.
+a finite selector. Ordinary worker graphs share this proof for lazy imports,
+worker entries, fetch requests, module-relative URL assets and nested worker
+constructors. Document worker configuration uses the document import map; imports
+inside worker graphs retain their independent package resolution. Imported URL
+strings keep their original values and resolve at the consuming document, worker
+realm or module boundary. Inspected configuration files are watched, and each
+build refreshes the selector cache before discovering worker outputs. Other
+loader/document-fetch discovery keeps its existing selector requirements.
 
 Parameters, mutable bindings, unproved imported values, opaque property/call results,
 array patterns, rest/default/nested/computed patterns and escaped tables are
