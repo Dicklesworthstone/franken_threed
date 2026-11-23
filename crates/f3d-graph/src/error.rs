@@ -86,7 +86,10 @@ impl fmt::Display for GraphError {
                 write!(f, "pass {pass_id} is structurally invalid: {reason}")
             }
             Self::DuplicatePassId { pass_id } => {
-                write!(f, "pass {pass_id} already exists in graph; duplicate pass IDs are rejected")
+                write!(
+                    f,
+                    "pass {pass_id} already exists in graph; duplicate pass IDs are rejected"
+                )
             }
             Self::PassIdOverflow => write!(f, "pass ID allocation overflowed u32::MAX"),
             Self::EmptyGraph => write!(f, "cannot compile empty pass graph"),
@@ -123,6 +126,19 @@ pub enum HazardError {
         texture_id: u32,
         /// Pass where the conflict occurred.
         pass_id: u32,
+        /// Overlapping subresource range.
+        subresource: SubresourceRange,
+    },
+    /// Incompatible texture roles on overlapping subresources in a render pass.
+    TextureUsageConflict {
+        /// ID of the conflicting texture.
+        texture_id: u32,
+        /// Pass containing the incompatible usages.
+        pass_id: u32,
+        /// First declared access.
+        access_a: ResourceAccess,
+        /// Incompatible second declared access.
+        access_b: ResourceAccess,
         /// Overlapping subresource range.
         subresource: SubresourceRange,
     },
@@ -258,6 +274,19 @@ impl fmt::Display for HazardError {
                     f,
                     "texture {texture_id} in pass {pass_id} conflicts: subresource {subresource:?} \
                      cannot be both an attachment and sampled in the same render pass"
+                )
+            }
+            Self::TextureUsageConflict {
+                texture_id,
+                pass_id,
+                access_a,
+                access_b,
+                subresource,
+            } => {
+                write!(
+                    f,
+                    "texture {texture_id} in pass {pass_id} has incompatible usages \
+                     {access_a:?} and {access_b:?} at subresource {subresource:?}"
                 )
             }
             Self::ComputeWritableAlias {

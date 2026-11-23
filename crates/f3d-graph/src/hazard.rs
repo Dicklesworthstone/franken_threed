@@ -102,7 +102,9 @@ fn validate_render_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
                 if u1.subresource.overlaps(&u2.subresource) {
                     // Attachment vs Sampled conflict (writable attachments only; ReadOnlyDepthStencil is compatible, §8.5)
                     if (u1.access.is_write() && u1.access.is_attachment() && u2.access.is_sampled())
-                        || (u1.access.is_sampled() && u2.access.is_write() && u2.access.is_attachment())
+                        || (u1.access.is_sampled()
+                            && u2.access.is_write()
+                            && u2.access.is_attachment())
                     {
                         return Err(HazardError::AttachmentSamplingConflict {
                             texture_id: u1.resource_id.get(),
@@ -111,7 +113,12 @@ fn validate_render_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
                         });
                     }
 
-                    // Multiple writers conflict
+                    // Repeated storage writes across draws share a legal usage
+                    // scope. They still face the per-draw alias check below.
+                    if u1.access.is_compatible_with(&u2.access) {
+                        continue;
+                    }
+
                     if u1.access.is_write() && u2.access.is_write() {
                         return Err(HazardError::MultipleWriters {
                             resource_id: u1.resource_id.get(),
@@ -119,6 +126,13 @@ fn validate_render_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
                             subresource: u1.subresource.clone(),
                         });
                     }
+                    return Err(HazardError::TextureUsageConflict {
+                        texture_id: u1.resource_id.get(),
+                        pass_id: pass.id.get(),
+                        access_a: u1.access,
+                        access_b: u2.access,
+                        subresource: u1.subresource.clone(),
+                    });
                 }
             }
         }
@@ -151,6 +165,21 @@ fn validate_render_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
                             subresource: SubresourceRange::WholeBuffer,
                         });
                     }
+                }
+
+                if matches!(u1.kind, ResourceKind::Texture | ResourceKind::CanvasOutput)
+                    && matches!(u2.kind, ResourceKind::Texture | ResourceKind::CanvasOutput)
+                    && (u1.access.is_write() || u2.access.is_write())
+                    && u1.subresource.overlaps(&u2.subresource)
+                {
+                    // Bundle use records have no internal draw boundaries.
+                    // Keep the existing conservative writable-alias rule for
+                    // those opaque command groups as well.
+                    return Err(HazardError::DrawWritableAlias {
+                        resource_id: u1.resource_id.get(),
+                        draw_id: draw.draw_id,
+                        subresource: u1.subresource.clone(),
+                    });
                 }
             }
         }
@@ -338,7 +367,7 @@ fn validate_copy_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
     Ok(())
 }
 
-/// Whether sequential output-preserving passes can resolve cross-draw buffer usage conflicts.
+/// Whether sequential output-preserving passes can resolve cross-draw usage conflicts.
 ///
 /// Color attachment slots apply to every draw. Without per-draw output declarations,
 /// sampling an attachment cannot justify removing that attachment from a later segment.
@@ -353,7 +382,7 @@ fn output_preserving_split(pass: &Pass) -> Option<Vec<Pass>> {
         || !pass.dispatches.is_empty()
         || !matches!(
             validate_pass_hazards(pass),
-            Err(HazardError::WholeBufferConflict { .. })
+            Err(HazardError::WholeBufferConflict { .. } | HazardError::TextureUsageConflict { .. })
         )
     {
         return None;
@@ -363,15 +392,22 @@ fn output_preserving_split(pass: &Pass) -> Option<Vec<Pass>> {
     let mut start = 0;
     for (idx, draw) in pass.draws.iter().enumerate() {
         let conflicts_with_prefix = draw.uses.iter().any(|current| {
-            current.kind == ResourceKind::Buffer
-                && pass.draws[start..idx]
-                    .iter()
-                    .flat_map(|prior| &prior.uses)
-                    .any(|prior| {
-                        prior.kind == ResourceKind::Buffer
-                            && prior.resource_id == current.resource_id
-                            && !prior.access.is_compatible_with(&current.access)
-                    })
+            pass.draws[start..idx]
+                .iter()
+                .flat_map(|prior| &prior.uses)
+                .any(|prior| {
+                    prior.resource_id == current.resource_id
+                        && (prior.kind == current.kind
+                            || matches!(
+                                prior.kind,
+                                ResourceKind::Texture | ResourceKind::CanvasOutput
+                            ) && matches!(
+                                current.kind,
+                                ResourceKind::Texture | ResourceKind::CanvasOutput
+                            ))
+                        && prior.subresource.overlaps(&current.subresource)
+                        && !prior.access.is_compatible_with(&current.access)
+                })
         });
         if conflicts_with_prefix {
             ranges.push(start..idx);
