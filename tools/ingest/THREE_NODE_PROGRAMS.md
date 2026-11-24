@@ -1894,9 +1894,11 @@ As in r186, changing `highPrecision` alone does not reconstruct an existing
 native shader. Neither does `material.needsUpdate` alone when its construction
 key is unchanged. Set `renderer.contextNode.needsUpdate = true`, or replace the
 renderer context, when the new matrix mode should affect an existing graph.
-The cache omits only the two canonical matrix values from that retention check;
-live context validation, identity/version, other hooks and resource keys remain
-active. The first promotion of a previously fixed scene requires this explicit
+For unshared native constructions, that retention check omits only the two
+canonical matrix values; live context validation, identity/version, other hooks
+and resource keys remain active. Shared material profiles also retain unversioned
+context hooks according to their source render-object key. The first promotion
+of a previously fixed scene requires this explicit
 context invalidation and otherwise reports `THREE_NODE_PROGRAM_CONTEXT_CACHE`;
 it does not reconstruct the fixed shader's earlier matrix graph.
 
@@ -2551,6 +2553,22 @@ uniform bytes. Focused pinned-source comparisons cover complete WGSL, callback
 ordering, graph sharing, replacement and lighting transitions for all three
 material ownership forms.
 
+Renderer `ContextNode` chains also compose with these shared material profiles.
+The admitted source hooks include `getAO`, `getGI`, `getUV`, `getTextureLevel`,
+boolean `forceUVContext`, and the canonical high-precision model/view matrices.
+Nested context values keep their source precedence. Hooks execute during source
+construction, with their original builder and texture arguments; admission does
+not evaluate them.
+
+The root renderer context's identity and version participate in the live source
+render-object key. Replacing that root or advancing its version selects the
+corresponding construction. Unversioned hook, high-precision and nested-context
+changes retain the already constructed graph until a source key changes.
+Accepted context changes from key, construction and successful NodeFrame update
+callbacks preserve their original timing. Each draw keeps its own uniform bytes, including draws queued
+before asynchronous GPU preparation. The existing bounded-chain and data-field
+validation still applies to every accepted context.
+
 Key callbacks execute during the source draw lifecycle, after that object's
 before hook and before its node updates. Ordinary companions use the same
 ordered capture. Public `compileAsync` retains its separate ordering: object
@@ -2568,8 +2586,8 @@ an override's original source material follows the same rule.
 The callback must keep its admitted shared construction profile and cannot
 replace its selected geometry. Authored color/output graphs and existing
 material maps can be selected by the callback before source construction.
-Custom material lighting/context and geometry combinations and multiview
-retain the shared owner's existing
+Material-owned custom lighting/context graphs, geometry combinations and
+multiview retain the shared owner's existing
 admission boundaries. ArrayCamera follows the shared view-count profile above. Accessor-backed key properties
 are not admitted. A callback that leaves this domain keeps its JavaScript
 effects and fails before publishing a new GPU descriptor.
@@ -3493,8 +3511,10 @@ AO clamp, GI normalization, material-AO composition and transparent-material
 bypass. Ordinary Basic and lit mesh materials select the native source builder
 when they consume such a context; authored dummy node slots are unnecessary.
 Material context values retain precedence over renderer values, and scene passes
-retain the source versioned merged-context cache. Hook replacement or context
-version changes require a fresh graph; uniform values remain live per draw.
+retain the source versioned merged-context cache. Shared inherited, registered
+and custom-key materials use the root context identity/version boundary described
+above; change that boundary when replacing a hook should affect an existing
+construction. Uniform values remain live per draw.
 Other custom context fields and custom traversal implementations remain refused.
 
 ```js

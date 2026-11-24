@@ -299,7 +299,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return entry && nodeStates.get(entry.descriptor)?.preparedPrototype;
   }
   function materialExtension(material) {
-    return materialExtensions.has(material) || extensionMaterialTypes.has(threeNativeMaterialExtensionKey(three, material)) ||
+    return materialExtensions.has(material) || !(material instanceof three.NodeMaterial) &&
+      extensionMaterialTypes.has(threeNativeMaterialExtensionKey(three, material)) ||
       hasThreeNativeMaterialExtension(three, material, renderer.library);
   }
   function prepareMaterial(material, preparedPrototype = null) {
@@ -1668,7 +1669,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           attribute.isStorageBufferAttribute && !geometrySetup && !ordinaryGeometryExtension && !primitiveExtension) ||
         !extension && (context.scene?.environment || context.scene?.environmentNode || context.scene?.fog || context.scene?.fogNode) ||
         !extension && context.camera?.isArrayCamera || context.lightsNode || !extension && (context.lights?.length || lights.length ||
-          context.lightingEnabled === false || renderer.lighting?.enabled === false) || rendererContextSignature !== null ||
+          context.lightingEnabled === false || renderer.lighting?.enabled === false || rendererContextSignature !== null) ||
         !extension && (context.clippingContext?.unionPlanes?.length || context.clippingContext?.intersectionPlanes?.length) ||
         !extension && ((context.colorAttachmentCount ?? 1) !== 1 || renderer.getMRT?.() != null) ||
         renderer.getOutputRenderTarget?.()?.multiview) return null;
@@ -1848,6 +1849,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       state.environmentGraph = environmentGraphKey(prepared, context);
       state.basicEnvironmentSignature = basicEnvironmentSignature(prepared, environment);
       state.mrtSignature = inspectThreeMRT(three, renderer, prepared)?.key ?? null;
+      state.rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
+      state.rendererContextCache = inspectThreeLightingContext(three, renderer.contextNode, 'GRAPH', false);
       state.clippingSignature = inspectThreeNodeClipping(three, context, maxNodes, fail);
       state.sharedClippingKey = construction.clippingKey;
       return record.entry.descriptor;
@@ -1896,8 +1899,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const batchSignature = inspectThreeNativeBatch(three, object, fail);
     const skinSignature = inspectSkinning(object);
     const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object, effects);
-    const rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
-    const rendererContextCache = inspectThreeLightingContext(three, renderer.contextNode, 'GRAPH', false);
+    let rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
+    let rendererContextCache = inspectThreeLightingContext(three, renderer.contextNode, 'GRAPH', false);
     const construction = sharedConstruction(material, preparedMaterial, object, context, lights, rendererContextSignature,
       false, sourceKey?.geometrySetup === true, sourceKey?.materialProfile === true);
     const fogKey = fogSignature(preparedMaterial, context), alphaHash = preparedMaterial.alphaHash === true;
@@ -1944,6 +1947,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // Accept this draw's current targets/graph metadata without replaying setup;
       // capture still rejects mutations made by later node-update callbacks.
       previousState.mrtSignature = mrtKey;
+      // Source RenderObject keys only the root context identity/version.
+      // Unversioned hook, child-context and highPrecision changes retain the
+      // constructed graph; accept their current metadata for this draw while
+      // keeping capture's checks for later callback mutations.
+      previousState.rendererContextSignature = rendererContextSignature;
+      previousState.rendererContextCache = rendererContextCache;
       previousState.clippingSignature = clippingKey;
       previousState.sharedClippingKey = construction.clippingKey;
       return previous.descriptor;
@@ -2068,8 +2077,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     assertBatch(object, batchSignature);
     assertSkinning(object, skinSignature);
     assertMorphs(object, morphSignature);
-    if (inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED') !== rendererContextSignature)
+    const acceptedRendererContext = inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED');
+    if (!construction?.materialProfile && acceptedRendererContext !== rendererContextSignature)
       fail('CHANGED', 'Native lighting context changed during source graph construction');
+    // Context construction hooks may update the root context themselves.
+    // The source keeps this builder for the current draw and observes the
+    // resulting identity/version on the next RenderObject comparison.
+    rendererContextSignature = acceptedRendererContext;
+    rendererContextCache = inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED', false);
     if ((inspectThreeMRT(three, renderer, material)?.key ?? null) !== mrtKey)
       fail('CHANGED', 'Native MRT context changed during source graph construction');
     const currentPrepared = prepareMaterial(material, materialPrototype(preparedMaterial));
@@ -2350,7 +2365,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     entries.add(entry);
     if (extension) {
       materialExtensions.add(material);
-      const type = threeNativeMaterialExtensionKey(three, material);
+      // Native subclasses inherit their family's type. They must not turn an
+      // ordinary same-family output material into a registered conversion.
+      const type = material instanceof three.NodeMaterial ? undefined : threeNativeMaterialExtensionKey(three, material);
       if (type !== undefined) extensionMaterialTypes.add(type);
     }
     material.addEventListener('dispose', entry.onDispose);
@@ -2627,13 +2644,24 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return history.bytes;
   }
   function checkPipelineContext(state, object = state.object) {
-    if (inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED') !== state.rendererContextSignature &&
+    const changed = inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED') !== state.rendererContextSignature;
+    if (state.sharedBuilder?.materialProfile ? changed ||
+        inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED', false) !== state.rendererContextCache : changed &&
         inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED', false) !== state.rendererContextCache)
       fail('CHANGED', 'Native renderer lighting context changed; compile the material graph again');
     if (inspectThreePipelineContext(three, renderer, state.material, object, effects) !== state.pipelineSignature)
       fail('CHANGED', 'Native render-pipeline context changed; compile its output graph again');
     if ((inspectThreeMRT(three, renderer, state.material)?.key ?? null) !== state.mrtSignature)
       fail('CHANGED', 'Native MRT graph or attachment layout changed; compile its output graph again');
+  }
+  function acceptRendererContext(state) {
+    if (!state.sharedBuilder?.materialProfile) return;
+    const signature = inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED');
+    const cache = inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED', false);
+    // Source selects its render object before NodeFrame callbacks. Context
+    // edits during a successful update affect the following draw, while this
+    // draw keeps the selected graph and the remaining source update nodes.
+    state.rendererContextSignature = signature; state.rendererContextCache = cache;
   }
   function checkFog(state, context) {
     // Shared source render-object invalidation owns material-profile fog selection.
@@ -2760,6 +2788,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // recursion runs outside draw-resource capture at its source boundary.
       checkPMREM(state);
     }
+    acceptRendererContext(state);
   }
   function before(descriptor, context = {}) {
     const state = stateOf(descriptor), record = bundleRecord(state, context), kind = bundleRefresh(record, context);
@@ -2776,6 +2805,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (kind === three.RenderObjectRefreshType.SHARED) {
         if (!context.beforeDone) runBefore(state);
         for (const node of state.builder.updateNodes) { frame.updateNode(node); checkPMREM(state); }
+        acceptRendererContext(state);
       }
       const previous = record.packet;
       const uniforms = state.bindings.map((group, index) => {
@@ -2832,6 +2862,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         frame.updateNode(node);
         checkPMREM(state);
       }
+      acceptRendererContext(state);
       assertInstances(object, state.instanceSignature);
       assertBatch(object, state.batchSignature);
       assertSkinning(object, state.skinSignature);
