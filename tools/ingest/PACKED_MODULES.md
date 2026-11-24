@@ -1001,6 +1001,38 @@ execution rejects non-embedded requests. The Node host supplies image completion
 without decoding PNG/JPEG pixels, so this establishes retained-loader packaging,
 not browser image-decoder, rendering or performance parity.
 
+## VRML scenes and external images
+
+Finite pinned `VRMLLoader.load()` and `loadAsync()` requests now package the
+original VRML model and the external images its retained parser actually loads.
+Named imports, aliases and addon imports use the same discovery. Default image
+paths are captured when loading starts, while finite `setResourcePath()` changes
+remain live for a pending response. Image URLs retain literal prefixing,
+percent-encoded paths and query/fragment identity.
+
+A bounded lexical reader follows the source's selected scene fields and
+DEF/USE references, including last-definition lookup and standalone image
+nodes. Each image URL field contributes its first entry only when nonempty; later
+entries are not fallback requests. Unsupported node fields, collision proxies,
+background URLs and a direct `Appearance.texture USE` remain ignored exactly as
+in the pinned loader. Quote removal, literal backslashes, comments and Unicode
+line separators follow the native grammar. Model bytes, geometry, cameras,
+materials, embedded pixel textures, runtime parsing and native errors stay with
+the original VRML/Chevrotain parser. Byte, token, node and reference-depth limits
+report `VRML_BUDGET`; malformed metadata retains the source runtime error.
+
+`three_vrml_loader_assets.test.mjs` compares actual source HTTP loading with
+relocated output and offline packed execution after the original and build
+directories become unavailable. It covers the pinned textured mesh, house,
+cameras, extrusion and pixel-texture examples plus a textured DEF/USE scene.
+Exact geometry, materials, camera projections, cloned/shared identities,
+independent reloads, callbacks, progress, pending image-path changes and runtime
+parse/error behavior match. All five external image requests retain their
+original bytes, and packed execution rejects non-embedded requests. The Node
+image host records completion and bytes without browser pixel decoding, so
+these checks establish resource closure and retained parser behavior rather
+than image-decoder, rendering or performance parity.
+
 ## FBX scenes, textures and animation
 
 Finite pinned `FBXLoader.load()` and `loadAsync()` requests now package their

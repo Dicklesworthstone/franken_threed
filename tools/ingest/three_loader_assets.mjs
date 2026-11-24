@@ -14,6 +14,7 @@ import { gltfAssetUris } from "./pack_gltf.mjs";
 import { fbxAssetUris } from "./pack_fbx.mjs";
 import { colladaAssetUris } from "./pack_collada.mjs";
 import { tdsAssetUris } from "./pack_tds.mjs";
+import { vrmlAssetUris } from "./pack_vrml.mjs";
 import { collectLDrawPartAssets } from "./pack_ldraw.mjs";
 import { isRootRelativeDocumentUrl, normalizeDocumentRoot, resolveDocumentUrl } from "./document_urls.mjs";
 
@@ -81,6 +82,7 @@ const ADDON_SETTINGS = new Map([
   ["FBXLoader", new Set()],
   ["ColladaLoader", new Set()],
   ["TDSLoader", new Set()],
+  ["VRMLLoader", new Set()],
   // Self-contained USDZ archives keep their layers and images inside the ZIP.
   // Loose USD layers may still need runtime resources, so these are not in the
   // single-file family above. Their retained parsers also accept runtime bytes.
@@ -103,6 +105,7 @@ const ADDON_USES = new Map([
   ["FBXLoader", new Set(["parse"])],
   ["ColladaLoader", new Set(["parse"])],
   ["TDSLoader", new Set(["parse"])],
+  ["VRMLLoader", new Set(["parse"])],
   ["USDLoader", new Set(["parse"])],
   ["USDZLoader", new Set(["parse"])],
   ["LDrawLoader", new Set(["parse", "preloadMaterials"])],
@@ -649,7 +652,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
         }
       }
       let materialGroup;
-      if (["MTLLoader", "FBXLoader", "ColladaLoader", "TDSLoader"].includes(value.loader)) {
+      if (["MTLLoader", "FBXLoader", "ColladaLoader", "TDSLoader", "VRMLLoader"].includes(value.loader)) {
         // These loaders capture their default path when load() starts, but resourcePath is
         // read later by parse(). Each pending request keeps its own fallback.
         if (!materialLoads.has(value.origin)) materialLoads.set(value.origin, { paths: new Set(), requests: [], unknown: false });
@@ -880,6 +883,18 @@ export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUr
       for (const uri of tdsAssetUris(asset.source, fail)) {
         for (const base of request.texturePaths) add(base + uri);
       }
+      continue;
+    }
+    if (request.loader === "VRMLLoader") {
+      if (!request.texturePaths) continue;
+      let uris;
+      try { uris = vrmlAssetUris(asset.source); }
+      catch (error) {
+        if (error.code === "VRML_PARSE") continue; // Keep malformed bytes and the native parse error.
+        if (error.code === "VRML_BUDGET") fail?.(error.code, error.message);
+        throw error;
+      }
+      for (const uri of uris) for (const base of request.texturePaths) add(base + uri);
       continue;
     }
     if (request.loader === "ObjectLoader") {
