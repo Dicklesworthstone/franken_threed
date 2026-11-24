@@ -931,6 +931,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   const integerTextureType = texture => texture?.isDepthTexture === true ? null : three.IntType !== undefined && texture?.type === three.IntType ? 'sint'
     : three.UnsignedIntType !== undefined && texture?.type === three.UnsignedIntType ? 'uint' : null;
+  const normalized16Texture = texture => texture?.normalized === true &&
+    [three.ShortType, three.UnsignedShortType].some(type => type !== undefined && texture.type === type);
   function inspectIntegerRead(node, texture = node.value) {
     if (!integerTextureType(texture)) return;
     // Integer IDs and bitfields must stay integer shader values. The source
@@ -1033,7 +1035,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const packed = three.RGBFormat !== undefined && texture.format === three.RGBFormat &&
       (three.UnsignedInt101111Type !== undefined && texture.type === three.UnsignedInt101111Type ||
         three.UnsignedInt5999Type !== undefined && texture.type === three.UnsignedInt5999Type);
-    if (!depth && !integerType && (!packed && ![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
+    const normalized16 = normalized16Texture(texture);
+    const normalized = renderer.hasFeature('texture-formats-tier1') &&
+      (three.ByteType !== undefined && texture.type === three.ByteType || normalized16);
+    if (!depth && !integerType && (!packed && !normalized && ![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
         [three.RedIntegerFormat, three.RGIntegerFormat, three.RGBAIntegerFormat, three.RGBIntegerFormat].includes(texture.format)))
       fail('TEXTURE', 'Native graphics texture formats must have floating-point samples');
     if (depth && texture.compareFunction !== null && typeof renderer.hasCompatibility !== 'function')
@@ -1045,9 +1050,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // Compressed block formats (including BC6H HDR) have filterable float
     // samples independently of the source's upload type. The shared owner
     // validates source classes, mip blocks, color space and device features.
-    const sampleType = compressed ? compressedLayout.texture.sampleType : integerType ?? (depth ? 'depth' : texture.type === three.FloatType && !renderer.hasFeature('float32-filterable')
+    const sampleType = compressed ? compressedLayout.texture.sampleType : integerType ?? (depth ? 'depth' : normalized16 || texture.type === three.FloatType && !renderer.hasFeature('float32-filterable')
       ? 'unfilterable-float' : 'float');
-    if (sampleType === 'unfilterable-float' &&
+    if (sampleType === 'unfilterable-float' && !normalized16 &&
         (texture.magFilter !== three.NearestFilter ||
          ![three.NearestFilter, three.NearestMipmapNearestFilter].includes(texture.minFilter)))
       fail('TEXTURE', 'Native float32 texture filtering requires the float32-filterable feature; nearest texel reads remain available');
@@ -1422,6 +1427,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         if ((node.isTexture3DNode === true) !== (node.value?.is3DTexture === true || node.value?.isData3DTexture === true))
           fail('TEXTURE', 'Native volume samples require matching Texture3DNode and source 3D texture dimensions');
         inspectIntegerRead(node);
+        if (normalized16Texture(node.value) && (node.isCubeTextureNode || node.biasNode != null ||
+            node.gradNode != null || node.gatherNode != null || node.isTexture3DNode && node.sampler !== false &&
+            node.levelNode != null && [three.LinearFilter, three.LinearMipmapNearestFilter,
+              three.NearestMipmapLinearFilter, three.LinearMipmapLinearFilter].some(filter =>
+              node.value.minFilter === filter || node.value.magFilter === filter)))
+          fail('TEXTURE', 'Normalized 16-bit graphics inputs require source texel loads without cube sampling, bias, gradients, gather or filtered 3D levels');
         const layout = inspectTexture(node.value);
         if (layout.multisampled && (node.isSampleCompare?.() === true || node.biasNode != null ||
             node.gradNode != null || node.gatherNode != null || node.sampler !== false && node.levelNode != null &&

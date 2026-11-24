@@ -106,6 +106,9 @@ function textureInspector(T,{
     ['ShortType',Int16Array,'16sint','sint'],['UnsignedShortType',Uint16Array,'16uint','uint'],
     ['IntType',Int32Array,'32sint','sint'],['UnsignedIntType',Uint32Array,'32uint','uint'],
   ].filter(([name])=>Number.isInteger(T[name])).map(([name,Kind,suffix,sampleType])=>[T[name],{Kind,suffix,sampleType}]));
+  const normalizedTypes=new Map([
+    ['ByteType',Int8Array,'8snorm'],['ShortType',Int16Array,'16snorm'],['UnsignedShortType',Uint16Array,'16unorm'],
+  ].filter(([name])=>Number.isInteger(T[name])).map(([name,Kind,suffix])=>[T[name],{Kind,suffix}]));
   // Pinned r186 compressed formats. Block geometry belongs to storage, never
   // to unpackAlignment. BC6H/RGTC/EAC do not have an sRGB view variant.
   const compressedFormats=new Map([
@@ -262,10 +265,20 @@ function textureInspector(T,{
     // Normalized/float and integer formats have distinct shader sample types.
     // Copy integer bits verbatim; never normalize or cast them through Float32.
     const integral=integerChannels.has(t.format),kind=integral?integerTypes.get(t.type):null;
+    const norm=integral?null:normalizedTypes.get(t.type);
+    const norm16=norm?.Kind.BYTES_PER_ELEMENT===2;
+    // r186 selects normalized 16-bit storage only with both the public flag
+    // and the enabled feature. Its integer fallback is not a float sampler.
+    // Its native allocation also requests renderability for signed 8-bit data.
+    if(norm&&!features.has('texture-formats-tier1'))
+      fail('FORMAT','Normalized integer textures require the source texture-formats-tier1 device feature');
+    if(norm16&&t.normalized!==true)
+      fail('FORMAT','16-bit normalized textures require normalized=true');
+    if(norm16&&cube)fail('FORMAT','Normalized 16-bit cubes require a source-compatible sampler path');
     const packed=t.format===T.RGBFormat&&T.RGBFormat!==undefined
       ?T.UnsignedInt5999Type!==undefined&&t.type===T.UnsignedInt5999Type?'rgb9e5ufloat'
         :T.UnsignedInt101111Type!==undefined&&t.type===T.UnsignedInt101111Type?'rg11b10ufloat':null:null;
-    const bpc=packed?4:integral?(kind?.Kind.BYTES_PER_ELEMENT??0):t.type===T.UnsignedByteType?1:t.type===T.HalfFloatType?2:t.type===T.FloatType?4:0;
+    const bpc=packed?4:integral?(kind?.Kind.BYTES_PER_ELEMENT??0):norm?norm.Kind.BYTES_PER_ELEMENT:t.type===T.UnsignedByteType?1:t.type===T.HalfFloatType?2:t.type===T.FloatType?4:0;
     if(!bpc||t.internalFormat!==null||t.compareFunction!=null)
       fail('FORMAT','Expected supported non-depth storage without internal overrides');
     // channels/bpc describe the physical array elements, not shader components:
@@ -274,7 +287,7 @@ function textureInspector(T,{
     if(!channels)fail('FORMAT','Expected R, RG or RGBA storage, or packed RGB9E5/RGB11F data');
     if(integral&&t.colorSpace!==T.NoColorSpace)fail('COLOR','Integer textures carry data, not color-space transfers');
     if(![T.NoColorSpace,T.LinearSRGBColorSpace,T.SRGBColorSpace].includes(t.colorSpace)||
-        (t.colorSpace===T.SRGBColorSpace&&(channels!==4||bpc!==1)))fail('COLOR','Unsupported transfer function or channel format');
+        (t.colorSpace===T.SRGBColorSpace&&(channels!==4||bpc!==1||norm)))fail('COLOR','Unsupported transfer function or channel format');
     if(!Number.isSafeInteger(t.version)||t.version<(video||initialize||nativeAllocation?0:1)||!Number.isSafeInteger(t.source?.version)||t.source.version<0||
         !nativeAllocation&&t.source.dataReady!==true)
       fail('NOT_READY','Set needsUpdate after providing ready source data');
@@ -292,7 +305,7 @@ function textureInspector(T,{
       fail('SAMPLER','Anisotropic nearest minification requires an explicit sampler profile');
     const maxAnisotropy=mag[0]==='linear'&&t.minFilter===T.LinearMipmapLinearFilter?anisotropy:1;
     const data=layered||(cube?!nativeAllocation&&t.image[0]?.isDataTexture===true:t.isDataTexture===true);
-    if(!nativeAllocation&&(integral||bpc!==1)&&(!data||video))fail('FORMAT','Integer, half-float and float storage require data textures');
+    if(!nativeAllocation&&(integral||norm||bpc!==1)&&(!data||video))fail('FORMAT','Integer, signed normalized, half-float and float storage require data textures');
     if(integral&&(mag[0]!=='nearest'||filter[0]!=='nearest'||filter[1]!=='nearest'||anisotropy!==1))
       fail('SAMPLER','Integer textures require nearest sampling without anisotropy');
     if(integral&&t.generateMipmaps)fail('MIPS','Integer textures require authored mip levels, not filtered mip generation');
@@ -301,8 +314,10 @@ function textureInspector(T,{
     if(!integral&&!packed&&bpc===4&&t.generateMipmaps&&!float32Filterable)fail('MIPS','Generated float32 mipmaps need the float32-filterable device feature');
     // Float32 linear filtering needs the device's float32-filterable feature (WebGL
     // OES_texture_float_linear); never silently degrade to nearest.
-    const filterable=!integral&&(!!packed||bpc!==4||float32Filterable);
-    if(!filterable&&(mag[0]==='linear'||filter[0]==='linear'||filter[1]==='linear'))
+    const filterable=!integral&&!norm16&&(!!packed||bpc!==4||float32Filterable);
+    // The native node builder implements normalized-16 filtering with loads;
+    // its public controls do not require a hardware filtering sampler.
+    if(!filterable&&!(norm16&&nativeMedia)&&(mag[0]==='linear'||filter[0]==='linear'||filter[1]==='linear'))
       fail('SAMPLER','Linear filtering of float32 textures needs the float32-filterable device feature');
     const capturedImages=new WeakSet(),pendingImages=new WeakSet();let imagesPending=false;
     const unwrap=image=>{
@@ -343,7 +358,8 @@ function textureInspector(T,{
     // include the base level in mipmaps. Do not drop or duplicate either base.
     const levels=nativeAllocation==='default'?1:manual?t.mipmaps.length+Number(cube):t.generateMipmaps?full:1;
     if(levels>full||(filter[2]&&levels!==full))fail('MIPS','Mipmapped filtering requires a complete source pyramid');
-    const renderable=!packed||packed==='rg11b10ufloat'&&features.has('rg11b10ufloat-renderable');
+    if(norm16&&!manual&&levels>1)fail('MIPS','Normalized 16-bit mipmaps require authored source levels');
+    const renderable=norm?features.has('texture-formats-tier1'):!packed||packed==='rg11b10ufloat'&&features.has('rg11b10ufloat-renderable');
     if(packed&&!renderable&&!manual&&levels>1)
       fail('MIPS',packed==='rgb9e5ufloat'?'RGB9E5 mipmaps require authored source levels':
         'Generated RGB11F mipmaps need the rg11b10ufloat-renderable device feature');
@@ -383,7 +399,7 @@ function textureInspector(T,{
       const extent=mediaDefault?{width:1,height:1}:dimensions(image,data,video,volume);
       if(extent.width!==Math.max(1,width>>level)||extent.height!==Math.max(1,height>>level))fail('MIPS','Invalid face or authored mip dimensions');
       if(data){
-        const a=image.data,Kind=packed?Uint32Array:integral?kind.Kind:bpc===1?Uint8Array:bpc===2?Uint16Array:Float32Array;
+        const a=image.data,Kind=packed?Uint32Array:integral?kind.Kind:norm?norm.Kind:bpc===1?Uint8Array:bpc===2?Uint16Array:Float32Array;
         if(!(a instanceof Kind)||!(a.buffer instanceof ArrayBuffer)||a.buffer.resizable)fail('STORAGE',`Expected fixed, unshared ${Kind.name} source`);
         try{new Uint8Array(a.buffer,0,0);}catch{fail('STORAGE','Source pixels are detached');}
         const row=image.width*channels*bpc,pitch=Math.ceil(row/t.unpackAlignment)*t.unpackAlignment;
@@ -412,7 +428,7 @@ function textureInspector(T,{
         fail('RANGE','Partial layer uploads require tightly packed source rows');
     }
     const prefix=channels===4?'rgba':channels===2?'rg':'r';
-    const baseFormat=packed??(integral?prefix+kind.suffix:bpc===1?prefix+'8unorm':bpc===2?prefix+'16float':prefix+'32float');
+    const baseFormat=packed??(integral?prefix+kind.suffix:norm?prefix+norm.suffix:bpc===1?prefix+'8unorm':bpc===2?prefix+'16float':prefix+'32float');
     // r186's cube default helper constructs an ordinary byte CubeTexture; its
     // format argument keys the cache but is not forwarded to createTexture.
     const cubeDefault=cube&&nativeAllocation==='default';

@@ -2672,6 +2672,41 @@ alias isolation, bitmap readiness, default storage, origin failures and upload m
 recording host/GPU checks do not establish browser decoder or color-pixel
 parity.
 
+## Native normalized integer texture inputs
+
+Source `DataTexture`, `DataArrayTexture` and `Data3DTexture` inputs now support
+R, RG and RGBA signed normalized bytes and normalized 16-bit words through the
+existing sampled-texture owner:
+
+| Source type | Pixel storage | GPU format suffix | Sample layout |
+| --- | --- | --- | --- |
+| `ByteType` | `Int8Array` | `8snorm` | `float` |
+| `ShortType` with `normalized = true` | `Int16Array` | `16snorm` | `unfilterable-float` |
+| `UnsignedShortType` with `normalized = true` | `Uint16Array` | `16unorm` | `unfilterable-float` |
+
+These native profiles require the enabled `texture-formats-tier1` device
+feature. The pinned source requests renderable allocations even for sampled
+signed-byte data. For 16-bit inputs, both the feature and the public normalized
+flag are required; otherwise the source selects integer storage, outside this
+normalized profile. sRGB transfers and image/video storage remain excluded.
+
+Typed-array offsets, negative values and unsigned extrema retain their exact
+bits without a CPU conversion to floats. Queued draws keep their accepted image
+versions; later unmarked writes do not alter those captured bytes. The existing
+owner supplies matching 2D, array and 3D views and upload lifetimes.
+
+Normalized 16-bit graphs retain the pinned builder's sampler-free texel loads
+and source software filtering for authored 2D mip levels. Public linear controls
+do not turn these bindings into hardware-filterable textures. Generated 16-bit
+mips, cube sampling, gather/bias/gradient operations and filtered explicit-LOD
+volume sampling remain outside the source-compatible profile. Signed normalized
+bytes use the existing filterable path, including six-face cube data and
+generated mipmaps.
+
+`three_texture_normalized.test.mjs` compares exact source formats, typed upload
+bytes, complete WGSL, binding layouts and queued image histories. These
+recording-device checks do not establish browser pixel parity or performance.
+
 ## Native integer array texture inputs
 
 Source `DataArrayTexture` inputs support sampler-free `TSL.textureLoad()` calls
