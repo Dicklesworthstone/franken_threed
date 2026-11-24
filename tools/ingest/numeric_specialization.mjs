@@ -207,13 +207,21 @@ export function specializeNumericModule(
   };
   const unchanged = () => ({ code: source, changed: false, report });
   let ast;
-  const tokens = [];
+  const tokens = [], names = new Set();
   try {
     ast = acorn.parse(source, {
       ecmaVersion: "latest",
       sourceType: "module",
       locations: true,
-      onToken: tokens,
+      onToken(token) {
+        // Code generation needs every identifier spelling (including property
+        // names omitted by the semantic walker), but only opening delimiters
+        // need token offsets. Keeping all tokens and their location objects
+        // duplicates the linked renderer AST during whole-application builds.
+        if (token.type.label === "name") names.add(token.value);
+        else if (token.type.label === "(")
+          tokens.push({ type: token.type, start: token.start, end: token.end });
+      },
     });
   } catch (error) {
     report.refusal = { code: "MODULE_PARSE_UNSUPPORTED", message: error.message };
@@ -239,8 +247,7 @@ export function specializeNumericModule(
       constInitializations.add(variable);
     }
   }
-  const names = new Set(),
-    mutations = new Set(),
+  const mutations = new Set(),
     calls = [];
   let hasDirectEval = false;
   walk.full(ast, (node) => {
@@ -406,9 +413,6 @@ export function specializeNumericModule(
     helperInitializers.set(name, initializedAfter);
     helperOriginalSpans.set(name, normalized.originalSpan);
   }
-  // Include every identifier token, including binding/property positions skipped
-  // by a semantic walker. Generated bindings cannot collide in nested scopes.
-  for (const token of tokens) if (token.type.label === "name") names.add(token.value);
   let sequence = 0;
   function fresh(role) {
     let name;
@@ -427,7 +431,7 @@ export function specializeNumericModule(
   const edits = [],
     registrations = [],
     helpers = [];
-  const openingParens = tokens.filter((token) => token.type.label === "(");
+  const openingParens = tokens;
   function callParen(call) {
     // Callees may be parenthesized and comments may contain misleading '('s.
     let low = 0,

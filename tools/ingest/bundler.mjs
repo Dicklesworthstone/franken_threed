@@ -93,6 +93,37 @@ function isExternalUrl(url) {
   }
 }
 
+// A trusted compiler transform may change a pinned module while leaving its
+// loader's complete lexical owner intact. Retain the existing whole-source pin
+// and anchor approved hooks to that owner, never to stale module offsets.
+function loaderHookAnchors(source, ast, id, packageRootUrl) {
+  const edits = threeLoaderResourceEdits(source, ast, id, packageRootUrl), anchors = [];
+  for (const edit of edits) {
+    if (edit.type === 'insert' && edit.pos === 0) { anchors.push({edit}); continue; }
+    const owner = ast.body.find(node => node.start <= edit.pos && node.end >= edit.end);
+    if (!owner || edit.type !== 'replace') return [];
+    anchors.push({edit, type: owner.type, source: source.slice(owner.start, owner.end),
+      start: edit.pos - owner.start, end: edit.end - owner.start});
+  }
+  return anchors;
+}
+
+function relocateLoaderHooks(source, ast, anchors) {
+  const edits = [];
+  for (const anchor of anchors) {
+    if (anchor.source === undefined) { edits.push(anchor.edit); continue; }
+    const owners = ast.body.filter(node => node.type === anchor.type &&
+      source.slice(node.start, node.end) === anchor.source);
+    if (owners.length !== 1) return [];
+    edits.push({...anchor.edit, pos: owners[0].start + anchor.start, end: owners[0].start + anchor.end});
+  }
+  return edits;
+}
+
+// Only the production bundle pipeline can attest a compiler's before/after
+// pair. The exported resolver must not treat a caller-supplied Map as a pin.
+const compilerResourceSnapshots = new WeakSet();
+
 /**
  * Creates a Rollup plugin utilizing FrankenThreeD's W3C import-map resolver,
  * static module asset emission (new URL(..., import.meta.url)), and executable
@@ -114,6 +145,8 @@ export function f3dRollupPlugin(options = {}) {
   const mapBaseUrl = options.mapBaseUrl;
   const inlineModules = options.inlineModules || new Map();
   const retainedModuleUrls = options.retainedModuleUrls || new Map();
+  const resourceSnapshots = compilerResourceSnapshots.has(options._resourceSourceSnapshots)
+    ? options._resourceSourceSnapshots : null;
   const importedStrings = createImportedStringResolver({
     readModule: url => url.startsWith('file:') && path.extname(urlToFilePath(url)).toLowerCase() !== '.json' &&
       commonjsFormat(url, moduleSources) === 'module' ? moduleSources.read(url).code : null,
@@ -135,6 +168,32 @@ export function f3dRollupPlugin(options = {}) {
   let defaultManagerExposed = false;
   let managerConstructorExposed = false;
   let loaderResourceCalls = false;
+
+  function discoverDocumentResources(context, code, id, referrerUrl, ast = null) {
+    if (!options.documentUrl) return;
+    if (!ast) {
+      try { ast = context.parse(code); } catch { return; }
+    }
+    if (code.includes("fetch"))
+      documentFetchSites.push(...analyzeDocumentFetch(ast, {resolveImportedString: importedStrings(referrerUrl)}).sites);
+    // The compiler-owned facade forwards the pinned namespace to its known
+    // renderer factory; it contains no application loader calls or escapes.
+    if (!id.startsWith(ROUTED_RENDERER_PREFIX) && (code.includes("load") || code.includes("LoadingManager") ||
+        ast.body.some(node => node.type === "ImportDeclaration" &&
+          node.specifiers.some(specifier => specifier.type === "ImportNamespaceSpecifier") ||
+          ["ExportNamedDeclaration", "ExportAllDeclaration"].includes(node.type) && node.source))) {
+      const requests = findThreeLoaderRequests(ast, {
+        moduleUrl: id, source: code, resolveImportedString: importedStrings(referrerUrl),
+        resolveModule: (specifier) => resolveModuleSpecifier(specifier, referrerUrl, importMap, {
+          target, mapBaseUrl, documentRoot, packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources,
+        }),
+        packageRootUrl: options.packageRootUrl,
+        onDefaultManagerExposure: () => { defaultManagerExposed = true; },
+        onManagerConstructorExposure: () => { managerConstructorExposed = true; },
+      });
+      if (requests.length) documentRequests.push({ requests, id });
+    }
+  }
 
   function emitJsonModule(context, url) {
     if (emittedJsonByUrl.has(url)) return emittedJsonByUrl.get(url);
@@ -394,6 +453,26 @@ export function f3dRollupPlugin(options = {}) {
           ? pathToFileURL(id).href
           : mapBaseUrl;
 
+      // Trusted compiler instrumentation can wrap source arrays with private
+      // witnesses. Discover resources from its exact input so those wrappers
+      // cannot erase fresh-array/escape proofs. This analysis emits no edits:
+      // every source-span rewrite below still belongs to the current code.
+      const resourceWitness = resourceSnapshots?.get(id);
+      const resourceSource = resourceWitness?.after === code ? resourceWitness : undefined;
+      if (resourceWitness !== undefined) resourceSnapshots.delete(id);
+      let loaderHooks = [];
+      if (resourceSource !== undefined) {
+        // Release this AST before parsing the instrumented module below. Large
+        // linked sources need only the small unchanged owner anchors afterward.
+        let originalAst;
+        try { originalAst = this.parse(resourceSource.before); } catch { originalAst = null; }
+        if (originalAst) {
+          discoverDocumentResources(this, resourceSource.before, id, referrerUrl, originalAst);
+          if (options.prepareStandaloneLoaders && options.documentUrl && id.startsWith('file:'))
+            loaderHooks = loaderHookAnchors(resourceSource.before, originalAst, id, options.packageRootUrl);
+        }
+      }
+
       const edits = [];
 
       // 1. Asset reference replacements: new URL(..., import.meta.url)
@@ -462,31 +541,14 @@ export function f3dRollupPlugin(options = {}) {
       }
 
       if (ast) {
-        if (options.documentUrl && code.includes("fetch"))
-          documentFetchSites.push(...analyzeDocumentFetch(ast, {resolveImportedString: importedStrings(referrerUrl)}).sites);
+        if (resourceSource === undefined) discoverDocumentResources(this, code, id, referrerUrl, ast);
         const classifyImport = createDynamicImportClassifier(ast, importedStrings(referrerUrl));
         const inspectorImports = new Map(analysis.dynamicImports.filter(request => request.runtime_fallback === true)
           .map(request => [request.source_span.start.offset, request]));
         if (options.prepareStandaloneLoaders && options.documentUrl && id.startsWith("file:")) {
-          const loaderEdits = threeLoaderResourceEdits(code, ast, id, options.packageRootUrl);
+          const loaderEdits = loaderHooks.length ? relocateLoaderHooks(code, ast, loaderHooks)
+            : threeLoaderResourceEdits(code, ast, id, options.packageRootUrl);
           if (loaderEdits.length) { edits.push(...loaderEdits); loaderResourceCalls = true; }
-        }
-        // The compiler-owned facade forwards the pinned namespace to its known
-        // renderer factory; it contains no application loader calls or escapes.
-        if (options.documentUrl && !id.startsWith(ROUTED_RENDERER_PREFIX) && (code.includes("load") || code.includes("LoadingManager") ||
-            ast.body.some(node => node.type === "ImportDeclaration" &&
-              node.specifiers.some(specifier => specifier.type === "ImportNamespaceSpecifier") ||
-              ["ExportNamedDeclaration", "ExportAllDeclaration"].includes(node.type) && node.source))) {
-          const requests = findThreeLoaderRequests(ast, {
-            moduleUrl: id, source: code, resolveImportedString: importedStrings(referrerUrl),
-            resolveModule: (specifier) => resolveModuleSpecifier(specifier, referrerUrl, importMap, {
-              target, mapBaseUrl, documentRoot, packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources,
-            }),
-            packageRootUrl: options.packageRootUrl,
-            onDefaultManagerExposure: () => { defaultManagerExposed = true; },
-            onManagerConstructorExposure: () => { managerConstructorExposed = true; },
-          });
-          if (requests.length) documentRequests.push({ requests, id });
         }
         walk.simple(ast, {
           ImportExpression: (node) => {
@@ -775,13 +837,21 @@ export async function bundleWithRollup(entryPath, options = {}) {
         maxIterations: specialization === true ? undefined : specialization.maxIterations,
       })
     : null;
+  const resourceSourceSnapshots = new Map();
+  compilerResourceSnapshots.add(resourceSourceSnapshots);
   if (marchingPlugin) {
     const transform = marchingPlugin.transform;
     marchingPlugin.transform = function(code, id) {
       // These source transforms add ESM imports. Keep opaque CJS intact until
       // its compiler has established wrappers and require initialization.
       if (id.startsWith('file:') && commonjsFormat(id, moduleSources) !== 'module') return null;
-      return transform.call(this, code, id);
+      const preserve = result => {
+        if (isHtml && typeof result?.code === 'string' && result.code !== code)
+          resourceSourceSnapshots.set(id, {before: code, after: result.code});
+        return result;
+      };
+      const result = transform.call(this, code, id);
+      return result?.then ? result.then(preserve) : preserve(result);
     };
   }
   const resolvedEntryAbs = target === 'node' ? fs.realpathSync(path.resolve(entryPath)) : path.resolve(entryPath);
@@ -912,6 +982,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
         f3dRollupPlugin({
           target,
           _moduleSources: moduleSources,
+          _resourceSourceSnapshots: resourceSourceSnapshots,
           commonJS: true,
           importMap,
           mapBaseUrl,
