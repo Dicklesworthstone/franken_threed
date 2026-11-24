@@ -14,6 +14,7 @@ import { gltfAssetUris } from "./pack_gltf.mjs";
 import { fbxAssetUris } from "./pack_fbx.mjs";
 import { colladaAssetUris } from "./pack_collada.mjs";
 import { tdsAssetUris } from "./pack_tds.mjs";
+import { collectLDrawPartAssets } from "./pack_ldraw.mjs";
 import { isRootRelativeDocumentUrl, normalizeDocumentRoot, resolveDocumentUrl } from "./document_urls.mjs";
 
 const PINNED_ROOT = new URL("../../upstream/three.js/", import.meta.url).href;
@@ -85,8 +86,8 @@ const ADDON_SETTINGS = new Map([
   // single-file family above. Their retained parsers also accept runtime bytes.
   ["USDLoader", new Set()],
   ["USDZLoader", new Set()],
-  // Packed MPD files contain their own parts. Unpacked library references keep
-  // the source loader's trial-and-error host route; no part paths are guessed.
+  // Packed MPD sections and finite local part libraries retain the source
+  // loader's parser, cache and trial-and-error path search.
   ["LDrawLoader", new Set(["setConditionalLineMaterial", "setPartsLibraryPath", "setFileMap",
     "setMaterials", "addMaterials", "clearMaterials", "addDefaultMaterials", "addMaterial"])],
   ["GLTFLoader", new Set(["setDRACOLoader", "setKTX2Loader", "setMeshoptDecoder"])],
@@ -354,12 +355,32 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     }
     return [...values.values()].flat();
   };
+  const ldrawFileMap = node => {
+    if (node?.type !== "ObjectExpression" || node.properties.length > LIMIT) return null;
+    const entries = new Map();
+    for (const property of node.properties) {
+      if (property.type !== "Property" || property.kind !== "init" || property.method || property.computed) return null;
+      const key = property.key.name ?? property.key.value;
+      const values = finite(property.value);
+      if (typeof key !== "string" || key === "__proto__" || !values) return null;
+      entries.set(key, values);
+    }
+    return Object.fromEntries(entries);
+  };
   const setting = (value, method, call) => {
     if (!isSetting(value.loader, method)) return null;
     if (method === "setPath" || method === "setResourcePath") {
       const candidates = finite(call.arguments[0]);
       if (!candidates) return null;
       value[method === "setPath" ? "paths" : "resourcePaths"] = candidates;
+    } else if (method === "setPartsLibraryPath") {
+      // Unknown part configuration does not invalidate the primary model URL.
+      // Its external parts keep the loader's ordinary host route.
+      value.partPaths = finite(call.arguments[0]);
+    } else if (method === "setFileMap") {
+      // Only a newly created inline dictionary has a confined owner. Const
+      // aliases can still mutate while a model or any nested part is pending.
+      value.partFileMap = ldrawFileMap(call.arguments[0]);
     } else if (method === "setDRACOLoader" || method === "setKTX2Loader") {
       value.codecs.set(method, call.arguments[0]);
     } else if (method === "setDecoderPath") {
@@ -499,7 +520,8 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
       // discovery; constructors and callbacks still execute without rewriting.
       return loader && loader !== "LoadingManager" && (node.arguments.length === 0 ||
         CORE_LOADERS.has(loader) && node.arguments.length === 1 && localManager(node.arguments[0]))
-        ? { loader, origin: node, localManager: node.arguments.length === 1, paths: [""], resourcePaths: [""], codecs: new Map(),
+        ? { loader, origin: node, localManager: node.arguments.length === 1, paths: [""], resourcePaths: [""],
+          partPaths: [""], partFileMap: {}, codecs: new Map(),
           codecUrls: loader === "Rhino3dmLoader" ? [...RHINO_LIBRARIES] : [] } : null;
     }
     if (node?.type === "CallExpression" && ALL_SETTINGS.has(memberName(node.callee))) {
@@ -595,7 +617,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     return binding?.kind === "const" && !active.has(binding)
       ? instanceOrigin(binding.init, new Set(active).add(binding)) : null;
   };
-  const requests = [], objectLoads = new Map(), materialLoads = new Map(), rhinoLoads = new Map(), unresolvedLoads = new Set();
+  const requests = [], objectLoads = new Map(), materialLoads = new Map(), rhinoLoads = new Map(), ldrawLoads = new Map(), unresolvedLoads = new Set();
   for (const call of calls) {
     const method = memberName(call.callee);
     if (!["load", "loadAsync", "parse", "parseAsync", "preload", "preloadMaterials", "init", "decodeGeometry", "decodeDracoFile", "decodeObjects"].includes(method)) continue;
@@ -634,6 +656,16 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
         materialGroup = materialLoads.get(value.origin);
         for (const prefix of value.resourcePaths) materialGroup.paths.add(prefix);
       }
+      let partGroup;
+      if (value.loader === "LDrawLoader" && method !== "preloadMaterials") {
+        if (!ldrawLoads.has(value.origin)) ldrawLoads.set(value.origin, { paths: new Set(), maps: [], requests: [], unknown: false });
+        partGroup = ldrawLoads.get(value.origin);
+        if (!value.partPaths || !value.partFileMap) partGroup.unknown = true;
+        else {
+          for (const prefix of value.partPaths) partGroup.paths.add(prefix);
+          partGroup.maps.push(value.partFileMap);
+        }
+      }
       if (urls && urls.length * value.paths.length * value.resourcePaths.length <= LIMIT) {
         for (const url of urls) for (const prefix of value.paths) for (const resourcePath of value.resourcePaths) {
           const request = { loader: value.loader, url: prefix + url, resourcePath, path: prefix, originalUrl: url };
@@ -641,6 +673,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
           requests.push(request);
           objectGroup?.requests.push(request);
           materialGroup?.requests.push(request);
+          partGroup?.requests.push(request);
         }
       }
     } else if (!isUse(value.loader, method) && !(value.loader === "DRACOLoader" && method === "preload")) continue;
@@ -659,6 +692,22 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     }
   }
   for (const call of calls) {
+    if (["setPartsLibraryPath", "setFileMap"].includes(memberName(call.callee))) {
+      const group = ldrawLoads.get(instanceOrigin(call.callee.object));
+      if (group) {
+        // Every part fetch reads live configuration. Include finite changes
+        // made after load(), not just the configuration of the first request.
+        if (memberName(call.callee) === "setPartsLibraryPath") {
+          const paths = finite(call.arguments[0]);
+          if (!paths) group.unknown = true;
+          else for (const prefix of paths) group.paths.add(prefix);
+        } else {
+          const map = ldrawFileMap(call.arguments[0]);
+          if (!map) group.unknown = true;
+          else group.maps.push(map);
+        }
+      }
+    }
     if (memberName(call.callee) === "setLibraryPath") {
       const group = rhinoLoads.get(instanceOrigin(call.callee.object));
       if (group) {
@@ -687,6 +736,13 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
   for (const group of rhinoLoads.values()) {
     if (group.unknown || group.urls.size > LIMIT) continue;
     for (const url of group.urls) requests.push({ loader: "Rhino3dmLoader", url, resourcePath: "", path: "", originalUrl: url });
+  }
+  for (const group of ldrawLoads.values()) {
+    const maps = [...new Map(group.maps.map(map => [JSON.stringify(map), map])).values()];
+    for (const request of group.requests) {
+      request.partPaths = group.unknown || group.paths.size * maps.length > LIMIT ? null : [...group.paths];
+      request.partFileMaps = request.partPaths ? maps : null;
+    }
   }
   return requests;
 }
@@ -760,6 +816,10 @@ export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUr
   for (const request of requests) {
     const asset = add(request.url);
     if (!asset) continue;
+    if (request.loader === "LDrawLoader") {
+      if (request.partPaths) collectLDrawPartAssets(asset, request, add, fail);
+      continue;
+    }
     if ((request.loader === "USDLoader" || request.loader === "USDZLoader") && usdAssetUris) {
       // USDLoader captures this base when load starts; resourcePath and later
       // setPath calls do not alter it. USDComposer adds a trailing separator.

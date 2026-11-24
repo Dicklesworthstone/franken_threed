@@ -942,6 +942,34 @@ or unexpected browser errors. The source's unsupported morph-animation warning
 is preserved; this is retained loader functionality, without a performance or
 complete loader-family claim.
 
+## LDraw external part libraries
+
+Finite `LDrawLoader.load()` and `loadAsync()` requests now package recursively
+referenced local library parts as well as packed MPD models. Discovery preserves
+the pinned loader's `parts/`, `p/`, `models/`, as-is, relative and lowercase retry
+paths, including `s/` and `48/` standard folders, encoded URLs and internal MPD
+cache names. Original model and part bytes remain unchanged; geometry,
+materials, construction steps, parsing and runtime cache behavior stay in the
+retained source loader.
+
+Finite `setPartsLibraryPath()` changes and confined inline `setFileMap()` string
+choices are included even when made after loading starts. Unknown paths,
+aliased or accessor-based maps and custom manager boundaries keep their existing
+host route. The metadata walk has byte, file and request-work bounds, so cyclic
+references cannot cause unbounded build-time discovery.
+
+`three_ldraw_loader_assets.test.mjs` compares actual pinned-source HTTP loading
+with relocated output and packed execution after source/build directories
+become unavailable. It checks recursive geometry/material values, independent
+loads, callback order, each logical URL's manager lifecycle, pending path/map
+changes and original malformed/missing-part errors. Successful known resources
+come from embedded bytes in the packed test; missing search candidates still
+attempt their original host URLs and fail before the source tries its next
+candidate. This preserves source retry behavior and supports offline loading
+when those failures resolve; it does not promise zero attempted host requests.
+Browser rendering and hardware performance are not established by these Node
+loader tests.
+
 ## 3DS models and material textures
 
 Finite pinned `TDSLoader.load()` and `loadAsync()` requests now package the
