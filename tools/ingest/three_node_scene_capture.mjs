@@ -841,7 +841,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   if (!sourceMatricesUpdated) updateThreeCameraProjection(three, renderer, camera);
   const clippingCamera = clippingView ? Object.assign(Object.create(camera), {matrixWorldInverse: clippingView}) : camera;
   const clippingContexts = nativeClippingScene ? captureThreeNodeClipping(three, {root: renderRoot, camera: clippingCamera, hierarchy, visibility,
-    shadowPass: !!shadowPass, maxPlanes: maxNodes, backgroundMesh, fail}) : null;
+    shadowPass: !!shadowPass, maxPlanes: maxNodes, backgroundMesh, contextOwner: renderer,
+    renderContext: builderRenderContext, fail}) : null;
   for (const binding of bindings) if (binding.nodeProgram === null)
     binding.clippingContext = clippingContexts?.get(binding.object) ?? null;
   const opaque = [], translucent = [], backgroundDraws = [], draws = [], lights = [], preparationBindings = new Set();

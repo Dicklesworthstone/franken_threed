@@ -57,7 +57,54 @@ function clippingScene(T, renderer, coverage) {
   return {scene, camera, update, outer, inner, right};
 }
 
+function clippedExtensions(T, renderer, coverage) {
+  const result = clippingScene(T, renderer, coverage), N = T.TSL;
+  const left = result.inner.children.find(object => object.isMesh), right = result.right.children.find(object => object.isMesh);
+  class CrossSectionMaterial extends T.MeshStandardNodeMaterial {
+    constructor(source) { super(); this.copy(source); this.sectionGain = .875; this.sectionVariant = 0; }
+    customProgramCacheKey() { return super.customProgramCacheKey() + ':' + this.sectionVariant; }
+    setupOutput(builder, output) {
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('sectionGain', 'float')), output.a));
+    }
+  }
+  const material = new CrossSectionMaterial(left.material); left.material = right.material = material;
+  const glass = result.right.children.find(object => object !== right && object.isMesh);
+  glass.material.customProgramCacheKey = () => 'clipped-glass';
+  const sourceUpdate = result.update;
+  result.update = frame => {
+    sourceUpdate(frame);
+    if (frame === 8) material.sectionGain = .625;
+    if (frame === 12) result.right.add(left);
+    if (frame === 18) { material.sectionVariant++; material.needsUpdate = true; }
+    if (frame === 24) {
+      // A version-only change and a simultaneous group move must preserve the
+      // pinned one-draw clipping-key delay, then construct the new group.
+      result.inner.add(left); material.sectionGain = 1.125; material.needsUpdate = true;
+    }
+  };
+  return result;
+}
+
 export const nativeClippingScenarios = {
+  native_clipping_extensions(T, renderer) {
+    const result = clippedExtensions(T, renderer, false), render = renderer.render.bind(renderer); let frame = 0;
+    renderer.render = (...args) => {
+      if (args[0] === result.scene && args[1] === result.camera) result.update(++frame);
+      return render(...args);
+    };
+    return result;
+  },
+  native_clipping_extensions_msaa(T, renderer) {
+    if (renderer.samples !== 4) throw new Error('Clipped extensions require source constructor antialias');
+    const result = clippedExtensions(T, renderer, true), scenePass = T.TSL.pass(result.scene, result.camera);
+    const pipeline = new T.RenderPipeline(renderer, scenePass);
+    const scene = new T.Scene(), camera = new T.PerspectiveCamera(), render = renderer.render.bind(renderer); let frame = 0;
+    renderer.render = (...args) => {
+      if (args[0] !== scene) return render(...args);
+      result.update(++frame); return pipeline.render();
+    };
+    return {scene, camera, source: result, scenePass, pipeline};
+  },
   native_clipping_groups(T, renderer) {
     const result = clippingScene(T, renderer, false), render = renderer.render.bind(renderer); let frame = 0;
     renderer.render = (...args) => {

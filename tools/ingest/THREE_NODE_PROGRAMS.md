@@ -2515,7 +2515,8 @@ Basic, Normal, Matcap, Toon, Lambert, Phong, Standard and Physical materials,
 and on Sprite, Points, LineBasic and LineDashed materials. Ordinary classes keep
 their pinned `StandardNodeLibrary` conversions. These materials reuse the
 registered-material construction profile above, including its existing maps,
-scene lights, ordinary fog, geometry and attachment owners. Direct custom
+scene lights, ordinary fog, native clipping groups, geometry and attachment
+owners. Direct custom
 `ComputeNode` and lazy `Fn` geometry constructors retain their separate shared
 construction profile and its existing resource restrictions.
 
@@ -2567,8 +2568,8 @@ an override's original source material follows the same rule.
 The callback must keep its admitted shared construction profile and cannot
 replace its selected geometry. Authored color/output graphs and existing
 material maps can be selected by the callback before source construction.
-Custom material lighting/context and geometry combinations, clipping and
-multiview retain the shared owner's existing
+Custom material lighting/context and geometry combinations and multiview
+retain the shared owner's existing
 admission boundaries. ArrayCamera follows the shared view-count profile above. Accessor-backed key properties
 are not admitted. A callback that leaves this domain keeps its JavaScript
 effects and fails before publishing a new GPU descriptor.
@@ -3547,6 +3548,24 @@ including nested union/intersection groups, group enable/layer selection and
 math, and the pinned `ClippingNode` supplies the shader equations. Each queued
 draw retains its captured planes; moving a plane updates uniforms without
 rebuilding the graph. Background draws remain outside scene clipping.
+
+Inherited and registered node-material extensions, and ordinary materials with
+custom program keys, also compose with these groups. Shared construction keys
+retain source clipping-context identity and union/intersection counts, so two
+equally sized groups keep separate plane owners. Contexts remain distinct across
+renderer and attachment/depth scopes. Source material-version and dynamic-key
+checks precede the effectful clipping-key check: simultaneous changes can retain
+the previous builder for one draw. Its original plane-array lifetime, uniform
+allocation, key exceptions and self-disposing callbacks remain source-owned.
+
+The 26 native clipping-extension regressions compare pinned builder/callback
+traces, complete WGSL and uniform bytes for six mesh material families, nested
+groups, mode/count changes and one/four-sample coverage. A public renderer case
+with a recording device checks four queued draws and their exact
+captured-to-submitted bytes. Added
+`native_clipping_extensions` and `native_clipping_extensions_msaa` browser
+scenarios could not execute because Chromium startup is blocked by the host's
+socket permissions; these changes make no new pixel-parity or performance claim.
 
 Source `alphaToCoverage` selects multisample coverage for four-sample targets.
 `native_clipping_groups` and `native_clipping_msaa` exercise these paths. Legacy

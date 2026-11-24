@@ -38,7 +38,7 @@ import {inspectThreeNativeShadowFilter, inspectThreeNativeShadowGraph, captureTh
   registerThreeNativeShadow, updateThreeNativeShadow, withThreeNativeComputePrerequisites} from './three_node_shadows.mjs';
 import {inspectThreePipelineContext, inspectThreeLightingContext, inspectThreeNativePass,
   updateThreeNativePass, inspectThreeMRT, inspectThreeNativeCamera} from './three_node_passes.mjs';
-import {inspectThreeNodeClipping, updateThreeNodeClipping} from './three_node_clipping.mjs';
+import {inspectThreeNodeClipping, updateThreeNodeClipping, threeNodeClippingCacheKey, threeNodeClippingSource} from './three_node_clipping.mjs';
 import {createThreeNodeEffects} from './three_node_effects.mjs';
 import {inspectThreeNativeBatch} from './three_node_batch.mjs';
 import {createThreeNodeWireframes} from './three_node_wireframe.mjs';
@@ -1668,7 +1668,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         !extension && (context.scene?.environment || context.scene?.environmentNode || context.scene?.fog || context.scene?.fogNode) ||
         !extension && context.camera?.isArrayCamera || context.lightsNode || !extension && (context.lights?.length || lights.length ||
           context.lightingEnabled === false || renderer.lighting?.enabled === false) || rendererContextSignature !== null ||
-        context.clippingContext?.unionPlanes?.length || context.clippingContext?.intersectionPlanes?.length ||
+        !extension && (context.clippingContext?.unionPlanes?.length || context.clippingContext?.intersectionPlanes?.length) ||
         !extension && ((context.colorAttachmentCount ?? 1) !== 1 || renderer.getMRT?.() != null) ||
         renderer.getOutputRenderTarget?.()?.multiview) return null;
     if (sharedVertexExtension) for (const [name, attribute] of Object.entries(object.geometry.attributes)) {
@@ -1678,9 +1678,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         inspectThreeNodeSharedAttribute(three, attribute, fail, skinExtension && name === 'skinIndex');
     }
     const {attachment, chain} = builderScope(context);
+    const clippingKey = threeNodeClippingCacheKey(context, fail);
     // Admission runs during projection, before the source light list is ready.
     // Only actual program construction may initialize NodeManager's call key.
-    if (validationOnly) return {chain, geometrySetup, namedGeometry, materialProfile: !!extension};
+    if (validationOnly) return {chain, geometrySetup, namedGeometry, materialProfile: !!extension, clippingKey};
     let contextId = builderContexts.get(attachment);
     if (contextId === undefined) builderContexts.set(attachment, contextId = builderContexts.size);
     const {hash, hashArray} = three.NodeUtils;
@@ -1715,7 +1716,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       ? hash(callKey.key, context.camera.cameras.length) : callKey.key;
     const dynamic = hash(object.receiveShadow ? hash(cameraKey, 1) : cameraKey,
       renderer.contextNode.id, renderer.contextNode.version);
-    return {contextId, dynamic, chain, lightsNode, geometrySetup, namedGeometry, materialProfile: !!extension};
+    return {contextId, dynamic, chain, lightsNode, geometrySetup, namedGeometry, materialProfile: !!extension, clippingKey};
   }
   function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side, version = material.version, rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode)) {
     // Match the source's graph cache key. Uniform values never participate.
@@ -1807,11 +1808,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // the source RenderObject. Adopt its already accepted source key/version.
     if (!record && previous?.sharedBuilder) {
       const state = nodeStates.get(previous.descriptor);
-      record = remember(previous.sharedBuilder.key, state.materialVersion, state.sharedDynamic, previous);
+      record = remember(previous.sharedBuilder.key, state.materialVersion, state.sharedDynamic, previous, state.sharedClippingKey);
     }
-    const readKey = () => {
+    const readKey = (clippingKey = construction.clippingKey) => {
       const geometry = object.geometry;
-      const key = threeNodeBuilderMaterialKey(three, renderer, object, material, construction.contextId);
+      const key = threeNodeBuilderMaterialKey(three, renderer, object, material, construction.contextId, clippingKey);
       // Callback effects are real and are not rolled back on rejection. Never
       // publish a GPU descriptor for a newly unsupported graph or owner.
       construction = profile();
@@ -1819,8 +1820,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         fail('HOOK', 'A native cache-key callback cannot replace its selected geometry');
       return key + construction.dynamic;
     };
-    if (record && (record.version !== material.version || record.dynamic !== construction.dynamic)) {
-      const key = readKey(); // A throwing comparison leaves the old owner live.
+    const clippingNeedsUpdate = () => {
+      if (record.clippingKey === construction.clippingKey) return false;
+      record.clippingKey = construction.clippingKey; return true;
+    };
+    // Source RenderObjects checks version first, then dynamic state, then the
+    // effectful clippingNeedsUpdate getter. A version-only invalidation can
+    // keep the old clipping builder until the following draw. Do not move
+    // that getter ahead of either short-circuit or an authored key callback.
+    if (record && (record.version !== material.version || record.dynamic !== construction.dynamic || clippingNeedsUpdate())) {
+      const key = readKey(record.clippingKey); // A throwing comparison leaves the old owner live.
       if (record.key !== key) {
         record.dispose(); record = null;
       } else record.version = material.version;
@@ -1838,15 +1847,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       state.environmentGraph = environmentGraphKey(prepared, context);
       state.basicEnvironmentSignature = basicEnvironmentSignature(prepared, environment);
       state.mrtSignature = inspectThreeMRT(three, renderer, prepared)?.key ?? null;
+      state.clippingSignature = inspectThreeNodeClipping(three, context, maxNodes, fail);
+      state.sharedClippingKey = construction.clippingKey;
       return record.entry.descriptor;
     }
     if (!record) {
       if (customKeyRecords.size >= maxPrograms) fail('LIMIT', 'Native custom program key capacity exceeded');
       // RenderObject captures these before invoking its key. If the callback
       // changes a version, the following draw must still observe invalidation.
-      const version = material.version, dynamic = construction.dynamic;
+      const version = material.version, dynamic = construction.dynamic, clippingKey = construction.clippingKey;
       const key = readKey(); // Changed keys call again, after old-owner disposal.
-      record = remember(key, version, dynamic, null);
+      record = remember(key, version, dynamic, null, clippingKey);
     }
     const descriptor = compileProgram(material, object, context, record);
     const entry = cache.get(object)?.get(material)?.get(chain) ?? null;
@@ -1854,9 +1865,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     else if (entry) retire(entry);
     return descriptor;
 
-    function remember(key, version, dynamic, entry) {
+    function remember(key, version, dynamic, entry, clippingKey = construction.clippingKey) {
       const sourceMaterial = renderer._currentSourceMaterial ?? null;
-      const next = {key, version, dynamic, entry, geometrySetup: construction.geometrySetup,
+      const next = {key, version, dynamic, clippingKey, entry, geometrySetup: construction.geometrySetup,
         materialProfile: construction.materialProfile, dispose() {
         if (!customKeyRecords.delete(next)) return;
         if (passes?.get(chain) === next) passes.delete(chain);
@@ -1906,9 +1917,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const previous = passes?.get(passId) ?? (construction ? passes?.get(context.passId ?? null) : undefined);
     const previousState = previous && nodeStates.get(previous.descriptor);
     if (construction) construction.key = sourceKey ? sourceKey.key : previous?.sharedBuilder &&
-      previousState.materialVersion === material.version && previousState.sharedDynamic === construction.dynamic
+      previousState.materialVersion === material.version && previousState.sharedDynamic === construction.dynamic &&
+        previousState.sharedClippingKey === construction.clippingKey
       ? previous.sharedBuilder.key
-      : threeNodeBuilderMaterialKey(three, renderer, object, material, construction.contextId) + construction.dynamic;
+      : threeNodeBuilderMaterialKey(three, renderer, object, material, construction.contextId, construction.clippingKey) + construction.dynamic;
     // RenderObjects rechecks material keys only on needsUpdate or a dynamic
     // context change. A version-only change with the same source key retains
     // the very same builder nodes, including their captured PMREM texture.
@@ -1919,7 +1931,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         (!previous.descriptor.wireframe || wireframes.matchesLayout(previous.descriptor)) &&
         !previousState.namedGeometryDisposed && namedAttributesMatch(previousState) &&
         (!construction.namedGeometry || previousState.namedAttributes !== null) &&
-        (sourceKey || previousState.sharedDynamic === construction.dynamic) &&
+        (sourceKey || previousState.sharedDynamic === construction.dynamic && previousState.sharedClippingKey === construction.clippingKey) &&
         (previousState.materialVersion === material.version || previous.sharedBuilder.key === construction.key)) {
       previousState.materialVersion = material.version;
       previousState.environment = environment;
@@ -1931,6 +1943,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // Accept this draw's current targets/graph metadata without replaying setup;
       // capture still rejects mutations made by later node-update callbacks.
       previousState.mrtSignature = mrtKey;
+      previousState.clippingSignature = clippingKey;
+      previousState.sharedClippingKey = construction.clippingKey;
       return previous.descriptor;
     }
     let key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey, clippingKey);
@@ -2000,7 +2014,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // reach the first draw's ordered preparation boundary through its cached
     // graph, rather than being rewritten while another graph is constructed.
     const sharedKey = sourceKey ? sourceKey.key : construction && previous?.sharedBuilder && previousState.materialVersion === material.version &&
-      previousState.sharedDynamic === construction.dynamic ? previous.sharedBuilder.key : construction?.key;
+      previousState.sharedDynamic === construction.dynamic && previousState.sharedClippingKey === construction.clippingKey
+      ? previous.sharedBuilder.key : construction?.key;
     let sharedBuilder = construction ? sharedBuilders.get(sharedKey) : null;
     if (!sharedBuilder) assertEnvironmentVersion(environment);
     for (const entry of entries) for (const node of entry.pmremNodes) assertEnvironmentVersion(node.value);
@@ -2016,6 +2031,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       installThreeNativeShadowTargets(renderer, builder);
       builder.material = material; builder.context.material = material;
       builder.scene = context.scene ?? null; builder.camera = context.camera ?? null;
+      const sourceClipping = construction ? threeNodeClippingSource(context) : null;
       builder.clippingContext = Object.fromEntries(['unionPlanes', 'intersectionPlanes'].map(key =>
         [key, (context.clippingContext?.[key] ?? []).map(plane => plane.clone())]));
       // Keep the scene entrance distinct from material.lightsNode, just as the
@@ -2044,7 +2060,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       graphicsNode = node => node.isComputeNode || !computeChildren.has(node) || graphicsNodes.has(node) || generatedNodes.has(node);
       if (construction) sharedBuilder = {key: sharedKey, builder, captureShadowGraphs, environmentNode, graphicsNode,
         preparedPrototype: materialPrototype(preparedMaterial), geometrySetup: construction.geometrySetup,
-        materialProfile: construction.materialProfile, references: 0};
+        materialProfile: construction.materialProfile, sourceClipping, references: 0};
     }
     const lightsNode = authored ?? builder.lightsNode;
     assertInstances(object, instanceSignature);
@@ -2274,7 +2290,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       generated.length ? generatedAttributes.geometry(descriptor) : object.geometry);
     for (const attribute of instances?.cpu ?? []) instanceArrays.set(attribute, attribute.array);
     nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes, shadowGraphs,
-      sharedBuilder, sharedDynamic: construction?.dynamic, preparedPrototype: materialPrototype(preparedMaterial),
+      sharedBuilder, sharedDynamic: construction?.dynamic, sharedClippingKey: construction?.clippingKey,
+      preparedPrototype: materialPrototype(preparedMaterial),
       environment, materialEnvironment: materialEnvironment(preparedMaterial, environment), environmentGraph: environmentGraphKey(preparedMaterial, context),
       basicEnvironmentSignature: basicEnvironmentSignature(preparedMaterial, environment),
       transmissionSignature: transmissionSignature(preparedMaterial),
@@ -2661,6 +2678,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if ((state.material.alphaHash === true) !== state.alphaHash)
       fail('CHANGED', 'Native alpha hashing changed; compile the material graph again');
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== state.clippingSignature ||
+        state.sharedBuilder && threeNodeClippingCacheKey(context, fail) !== state.sharedClippingKey ||
         state.material.alphaToCoverage !== state.alphaToCoverage ||
         wideLineCoverage(state.material) !== state.wideLineCoverage ||
         (state.material.alphaToCoverage && renderer.currentSamples > 1) !== state.clippingSamples)
@@ -2703,7 +2721,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     checkEnvironment(state, context);
     checkTransmission(state);
     checkClipping(state, context);
-    updateThreeNodeClipping(state.builder.clippingContext, context);
+    updateThreeNodeClipping(state.builder.clippingContext, context, state.sharedBuilder?.sourceClipping);
     checkMaterialMaps(state);
     // Catch stale signedness, aliases and newly sampled integer reads before
     // observable callbacks. Live material references are read without updates;
