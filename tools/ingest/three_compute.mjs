@@ -68,7 +68,7 @@ function createThreeCompute(renderer, three) {
     if (![Float32Array, Int32Array, Uint32Array, Int16Array, Uint16Array, Int8Array, Uint8Array].includes(attribute.array.constructor))
       fail('STORAGE', 'Storage attributes require f32 or integer components');
   }
-  function normalize(attribute, update) {
+  function normalize(attribute, update, index = false) {
     live(); validateAttribute(attribute);
     // r186 StructTypeNode supplies its padded stride in 32-bit words. Preserve
     // those bytes, including mixed integer fields and matrix-column padding;
@@ -76,7 +76,14 @@ function createThreeCompute(renderer, three) {
     let array = attribute.array, layout = uploadLayouts.get(attribute);
     if (!layout) {
       if (array instanceof Int8Array || array instanceof Int16Array) array = new Int32Array(array);
-      else if (array instanceof Uint8Array || array instanceof Uint16Array) array = new Uint32Array(array);
+      else if (array instanceof Uint8Array || array instanceof Uint16Array) {
+        array = new Uint32Array(array);
+        // The source remaps restart indices only while promoting an initial
+        // INDEX allocation. Later Uint32 updates and shader/compute-first
+        // storage allocations keep 65535 as an ordinary value.
+        if (index) for (let i = 0; i < array.length; i++)
+          if (array[i] === 0xffff) array[i] = 0xffffffff;
+      }
       layout = {itemSize: attribute.itemSize, paddedItemSize: attribute.itemSize === 3 ? 4 : null};
       uploadLayouts.set(attribute, layout);
     }
@@ -142,7 +149,7 @@ function createThreeCompute(renderer, three) {
     // r186's native uploader leaves the WebGL-only onUpload callback inert.
     return buffer;
   }
-  function attributeRecord(attribute, deferred, indirect = false) {
+  function attributeRecord(attribute, deferred, indirect = false, index = false) {
     // Ordinary indirect BufferAttributes retain their raw words. Storage-backed
     // inputs retain the source backend's shared normalization (including vec3
     // padding), so compute and drawing observe the same allocation/layout.
@@ -156,7 +163,7 @@ function createThreeCompute(renderer, three) {
     const version = attribute.version ?? 0, previous = captured.get(attribute);
     const initialized = !!(previous?.data || gpu.getBuffer(attribute));
     const update = !previous || previous.version !== version || attribute.usage === three.DynamicDrawUsage;
-    const array = plainIndirect ? attribute.array : normalize(attribute, update);
+    const array = plainIndirect ? attribute.array : normalize(attribute, update, index);
     let ranges = (attribute.updateRanges ?? []).map(({start, count}) => ({start, count}));
     if (!Number.isSafeInteger(version) || version < 0 || ranges.some(({start, count}) =>
       !Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(count) || count < 0 || start + count > array.length))
@@ -247,12 +254,13 @@ function createThreeCompute(renderer, three) {
       capturingReads = true;
       try { return run(); } finally { capturingReads = false; }
     },
-    capture(attribute, {writable = false, indirect = false} = {}) {
+    capture(attribute, {writable = false, indirect = false, index = false} = {}) {
       live();
       if (issuing) fail('REENTRY', 'Cannot capture native storage from an upload callback');
-      if (typeof writable !== 'boolean' || typeof indirect !== 'boolean' || writable && indirect)
-        fail('STORAGE', 'Native storage access must be a captured boolean and indirect use must be read-only');
-      const record = attributeRecord(attribute, true, indirect), lease = Object.freeze({});
+      if (typeof writable !== 'boolean' || typeof indirect !== 'boolean' || typeof index !== 'boolean' ||
+          writable && (indirect || index) || indirect && index)
+        fail('STORAGE', 'Native storage access must be a captured boolean and index/indirect use must be distinct and read-only');
+      const record = attributeRecord(attribute, true, indirect, index), lease = Object.freeze({});
       record.refs++; readLeases.set(lease, {record, writable, indirect, vertex: false, released: false});
       return lease;
     },

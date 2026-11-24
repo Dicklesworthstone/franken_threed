@@ -14,7 +14,7 @@ import {createThreeNodePrograms} from './three_node_program.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {captureComputeStorage, captureComputeAttributeView, computeAttributeSnapshot} from './gpu_compute_attributes.mjs';
 // The retained uploader reads this browser enum when promoting unsigned data.
-globalThis.GPUBufferUsage ??= Object.freeze({INDEX: 16});
+globalThis.GPUBufferUsage ??= Object.freeze({COPY_SRC: 4, COPY_DST: 8, INDEX: 16, VERTEX: 32, STORAGE: 128, INDIRECT: 256});
 const Renderer = createWebGPURendererClass(T), N = T.TSL;
 function fixture(t) {
   const device = geometryDevice();
@@ -95,7 +95,7 @@ test('ordinary indexed materials share compiled storage with queued compute-prod
 // Run the pinned upload implementation and its actual finishRender submission
 // boundary. The recording device establishes queue-visible buffer history;
 // it does not execute the reference shader or establish real-GPU pixel parity.
-function sourceStorage(array, {vertex = false, shader = true, itemSize = 1, instanced = true,
+function sourceStorage(array, {vertex = false, index = false, shader = true, itemSize = 1, instanced = true,
   indirect = false, indexed = true} = {}) {
   const device = geometryDevice(), records = new WeakMap();
   const backend = {device, _isRenderCameraDepthArray: () => false, get(key) {
@@ -104,15 +104,17 @@ function sourceStorage(array, {vertex = false, shader = true, itemSize = 1, inst
     return record;
   }};
   const utils = new SourceWebGPUAttributeUtils(backend);
+  backend.attributeUtils = utils;
+  backend.createIndexAttribute = SourceWebGPUBackend.prototype.createIndexAttribute.bind(backend);
   backend.createStorageAttribute = attribute => utils.createAttribute(attribute, 128 | 32 | 8 | 4);
   backend.createIndirectStorageAttribute = attribute => utils.createAttribute(attribute, 256 | 128 | 8 | 4);
   backend.updateAttribute = attribute => utils.updateAttribute(attribute);
-  const owner = new SourceAttributes(backend, {createStorageAttribute() {}, createIndirectStorageAttribute() {}});
+  const owner = new SourceAttributes(backend, {createIndexAttribute() {}, createStorageAttribute() {}, createIndirectStorageAttribute() {}});
   const Attribute = indirect ? T.IndirectStorageBufferAttribute : instanced ? T.StorageInstancedBufferAttribute : T.StorageBufferAttribute;
   const attribute = new Attribute(array.slice(), itemSize);
   const info = {render: {calls: 0}}, geometries = new SourceGeometries(owner, info);
   const update = () => owner.update(attribute, indirect ? AttributeType.INDIRECT : AttributeType.STORAGE);
-  const index = indirect && indexed ? device.createBuffer({size: 12, usage: 16}) : null;
+  const indirectIndex = indirect && indexed ? device.createBuffer({size: 12, usage: 16}) : null;
   return {device, attribute, update, get buffer() { return backend.get(attribute).buffer; }, render(updates,
     {indirectDraws = null, shaderDraws = null, afterGeometry = null} = {}) {
     info.render.calls++;
@@ -122,13 +124,15 @@ function sourceStorage(array, {vertex = false, shader = true, itemSize = 1, inst
       const usesIndirect = indirect && (indirectDraws?.[drawIndex] ?? true), usesShader = shaderDraws?.[drawIndex] ?? shader;
       change(attribute);
       if (vertex) geometries.updateAttribute(attribute, AttributeType.STORAGE);
+      if (index) geometries.updateAttribute(attribute, AttributeType.INDEX);
       if (usesIndirect) geometries.updateAttribute(attribute, AttributeType.INDIRECT);
       afterGeometry?.[drawIndex]?.(attribute);
       if (usesShader) update();
       if (vertex) pass.setVertexBuffer(0, backend.get(attribute).buffer);
       pass.setBindGroup(0, {entries: usesShader ? [{binding: 0, resource: {buffer: backend.get(attribute).buffer}}] : []});
-      if (usesIndirect && indexed) { pass.setIndexBuffer(index, 'uint16'); pass.drawIndexedIndirect(backend.get(attribute).buffer, 0); }
+      if (usesIndirect && indexed) { pass.setIndexBuffer(indirectIndex, 'uint16'); pass.drawIndexedIndirect(backend.get(attribute).buffer, 0); }
       else if (usesIndirect) pass.drawIndirect(backend.get(attribute).buffer, 0);
+      else if (index) { pass.setIndexBuffer(backend.get(attribute).buffer, attribute.array instanceof Uint16Array ? 'uint16' : 'uint32'); pass.drawIndexed(attribute.count); }
       else pass.draw(3);
     }
     const context = {occlusionQueryCount: 0, textures: null};
@@ -136,6 +140,81 @@ function sourceStorage(array, {vertex = false, shader = true, itemSize = 1, inst
     SourceWebGPUBackend.prototype.finishRender.call(backend, context);
   }};
 }
+
+for (const Type of [Uint8Array, Uint16Array]) for (const dynamic of [false, true])
+test(`${dynamic ? 'dynamic' : 'versioned'} ${Type.name} storage indices retain source promotion, compute ownership and queued partial updates`, async t => {
+  const f = fixture(t), marker = Type === Uint16Array ? 65535 : 255;
+  const data = new Type([0, marker, 2, 2, 3, 0]);
+  const attribute = new T.StorageBufferAttribute(data, 1).setUsage(dynamic ? T.DynamicDrawUsage : T.StaticDrawUsage);
+  f.mesh.geometry.setIndex(attribute);
+  // Ordinary materials must select native index capture. Authored constant
+  // nodes give dynamic indices a source FULL update on every rendered use.
+  if (dynamic) f.material.colorNode = N.vec3(1);
+  else f.mesh.material = f.material = new T.MeshBasicMaterial();
+  const storage = N.storage(attribute, 'uint', attribute.count);
+  const compute = N.Fn(() => { storage.element(5).assign(1); })().compute(1);
+  t.after(() => compute.dispose());
+  f.device.onCompute = pass => { new Uint32Array(computeStorage(pass)[0].data)[5] = 1; };
+  const source = sourceStorage(data, {index: true, shader: false, instanced: false});
+  source.attribute.setUsage(attribute.usage);
+  for (const current of [attribute, source.attribute]) current.addUpdateRange(0, 1);
+  source.render([() => {}]);
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+  const promoted = marker === 65535 ? 0xffffffff : marker;
+  assert.equal(attribute.array.constructor, Uint32Array); assert.notEqual(attribute.array, data);
+  assert.deepEqual([...attribute.array], [0, promoted, 2, 2, 3, 0]);
+  assert.deepEqual([...attribute.array], [...source.attribute.array]);
+  assert.equal(data[1], marker, 'promotion replaces the public array without editing its former storage');
+  assert.equal(attribute.version, 0);
+  assert.deepEqual(attribute.updateRanges, [{start: 0, count: 1}], 'initial allocation retains pending ranges');
+  const buffer = captureComputeStorage(f.device, attribute).resolve().buffer;
+  assert.equal(buffer.usage & (16 | 128), 16 | 128);
+  source.update(); new Uint32Array(source.buffer.data)[5] = 1;
+  await f.renderer.computeAsync(compute);
+  assert.equal(computeStorage(f.device.computePasses.at(-1))[0], buffer);
+  assert.deepEqual(attribute.updateRanges, source.attribute.updateRanges);
+  const changes = [[0, 65535], [3, 1]].map(([offset, value]) => current => {
+    current.array.fill(99); current.array[offset] = value;
+    current.clearUpdateRanges(); current.addUpdateRange(offset, 1);
+    if (!dynamic) current.needsUpdate = true;
+  });
+  for (const change of changes) {
+    source.render([change]); change(attribute); f.renderer.render(f.scene, f.camera);
+  }
+  attribute.array.fill(123); if (!dynamic) attribute.needsUpdate = true;
+  await drain(f.renderer);
+  const selected = draws(f.device).filter(draw => draw.index?.buffer === buffer);
+  assert.equal(selected.length, 2);
+  assert.deepEqual(selected.map(draw => words(draw, buffer, Uint32Array)),
+    draws(source.device).slice(1).map(draw => words(draw, source.buffer, Uint32Array)));
+  assert.deepEqual(selected.map(draw => words(draw, buffer, Uint32Array)),
+    [[65535, promoted, 2, 2, 3, 1], [65535, promoted, 2, 1, 3, 1]],
+    'later Uint32 values are never remapped and untouched GPU-authored words survive');
+  assert.ok(selected.every(draw => draw.index.buffer === buffer && draw.index.format === 'uint32'));
+  assert.deepEqual(f.device.writes.filter(write => write.buffer === buffer).slice(1)
+    .map(write => [write.offset, write.input.byteLength]),
+    source.device.writes.map(write => [write.offset, write.input.byteLength]));
+  assert.equal(attribute.version, dynamic ? 0 : 3);
+  assert.equal(f.device.buffers.filter(value => value.label === 'f3d-compute-buffer' && value.usage & 128).length, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('Uint16 compute-first storage retains 65535 for shader consumers without index promotion', async t => {
+  const f = fixture(t), data = new Uint16Array([0, 65535, 2]);
+  const attribute = new T.StorageBufferAttribute(data, 1), storage = N.storage(attribute, 'uint', 3);
+  const compute = N.Fn(() => { storage.element(N.instanceIndex).addAssign(0); })().compute(3);
+  t.after(() => compute.dispose());
+  f.material.colorNode = N.vec3(storage.element(1).toFloat().mul(.00001));
+  const source = sourceStorage(data, {instanced: false}); source.update();
+  await f.renderer.init(); await f.renderer.computeAsync(compute);
+  assert.equal(attribute.array.constructor, Uint32Array); assert.deepEqual([...attribute.array], [0, 65535, 2]);
+  source.render([() => {}]); await f.renderer.renderAsync(f.scene, f.camera);
+  const buffer = computeStorage(f.device.computePasses[0])[0];
+  const draw = draws(f.device).find(draw => shaderStorage(draw).includes(buffer));
+  assert.ok(draw);
+  assert.deepEqual(words(draw, buffer, Uint32Array), words(draws(source.device)[0], source.buffer, Uint32Array));
+  assert.deepEqual(words(draw, buffer, Uint32Array), [0, 65535, 2]);
+});
 
 for (const Type of [Int8Array, Uint8Array, Int16Array, Uint16Array]) for (const vertex of [false, true])
 test(`${Type.name} storage enters native ${vertex ? 'vertex and shader' : 'shader'} reads through source integer promotion`, async t => {

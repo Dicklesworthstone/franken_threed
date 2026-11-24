@@ -591,13 +591,13 @@ test('storage index refresh follows final admitted versions and preserves accept
   assert.equal(owner.diagnostics.allocatedBytes, 0);
 });
 
-test('native storage index capture rejects narrow and nonscalar profiles before invoking its upload owner', t => {
+test('native storage index capture rejects signed and nonscalar profiles before invoking its upload owner', t => {
   const owner = histories(t), source = geometry(); let captures = 0;
   const capture = () => { captures++; throw new Error('unexpected upload capture'); };
-  for (const [array, itemSize] of [[new Uint16Array([0, 1, 65535]), 1], [new Int32Array(3), 1],
+  for (const [array, itemSize] of [[new Int16Array([0, 1, -1]), 1], [new Int32Array(3), 1],
     [new Float32Array(3), 1], [new Uint32Array(6), 2]]) {
     source.setIndex(new T.StorageBufferAttribute(array, itemSize));
-    assert.throws(() => owner.capture(source, 1, null, capture), /fixed scalar Uint32/);
+    assert.throws(() => owner.capture(source, 1, null, capture), /fixed scalar unsigned/);
   }
   assert.equal(captures, 0); assert.equal(owner.diagnostics.allocatedBytes, 0);
 });
@@ -608,8 +608,8 @@ test('source bundle capture forwards the index upload owner after generated attr
   const indices = new T.StorageBufferAttribute(new Uint32Array([0, 1, 2]), 1);
   source.setIndex(indices);
   const order = [], attributes = {install() { order.push('attributes'); }};
-  const packet = bundles.captureGeometry(source, attributes, 1, positionProgram, (attribute, view) => {
-    order.push('index'); assert.equal(attribute, indices);
+  const packet = bundles.captureGeometry(source, attributes, 1, positionProgram, (attribute, view, index) => {
+    order.push('index'); assert.equal(attribute, indices); assert.equal(index, true);
     return captureComputeAttributeView(device, attribute, view);
   });
   assert.deepEqual(order, ['attributes', 'index']);

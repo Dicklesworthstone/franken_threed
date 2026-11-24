@@ -1052,7 +1052,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   }};
   const textureUses = [], storageUses = [], vertexStorageUses = [], bundleGeometries = [], chargedGeometry = new Set(), deferredHookBindings = [];
   const vertexUploads = new Map();
-  const captureVertexAttribute = (attribute, view) => {
+  const captureVertexAttribute = (attribute, view, index = false) => {
     // A cold source selection runs after updateBefore, which can promote an
     // ordinary named input to storage after the initial binding inspection.
     if (typeof getStorage !== 'function') fail('SOURCE', 'Native storage vertex streams require the renderer storage owner');
@@ -1061,7 +1061,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // source render. Later shader bindings may independently update the same
     // allocation; their ordered history is reconciled after all draw updates.
     const previous = vertexUploads.get(attribute);
-    const lease = previous ? storageOwner.retain(previous) : storageOwner.capture(attribute);
+    const lease = previous ? storageOwner.retain(previous) : storageOwner.capture(attribute, {index});
     if (!previous) vertexUploads.set(attribute, lease);
     // Retain first so any subsequent proof/capture failure releases the upload.
     storageUses.push(lease); vertexStorageUses.push(lease);

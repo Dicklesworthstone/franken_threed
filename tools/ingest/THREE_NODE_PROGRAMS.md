@@ -1613,15 +1613,19 @@ format, stride, instance mode and ownership checks. Combined generated-geometry
 and indirect histories and allocation-layout changes remain rejected. Mixed
 writable and read-only aliases retain their render-pass hazard rejection.
 
-Native captured geometry also accepts nonempty scalar `Uint32Array` storage
-indices. Compile or render the index before compute, as required by the pinned
+Native captured geometry also accepts nonempty scalar unsigned storage indices.
+Initial `Uint8Array` and `Uint16Array` inputs use the shared storage owner's
+source promotion to `Uint32Array`. Initial index promotion maps the Uint16
+restart marker `65535` to `4294967295`; Uint8 value `255` and later Uint32 writes
+of `65535` remain unchanged. Shader/compute-first promotion keeps its separate
+source behavior. Compile or render the index before compute, as required by the pinned
 source's index-first allocation lifecycle. Ordinary materials, node materials,
 shadows and retained bundles use the shared compute-owned index allocation
 without CPU topology copies or an unchanged-version re-upload. Immutable index
 proofs retain accepted shape, ownership and queued versions. The first geometry
 upload may follow earlier shader updates or accepted retained reads; later
 shader uploads preserve their ordered partial ranges and untouched GPU words.
-Narrow, normalized, interleaved and multicomponent storage indices remain outside
+Normalized, interleaved and multicomponent storage indices remain outside
 this profile, and wireframe edges continue using source CPU-derived topology.
 Recording-device regressions check submitted index bytes and resource lifetime;
 they do not establish real-GPU image parity or a performance result.

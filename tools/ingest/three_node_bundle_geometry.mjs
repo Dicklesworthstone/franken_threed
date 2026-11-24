@@ -131,15 +131,15 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
     const captured = snapshotComputeAttributeView(attribute), shape = captured ?? attribute;
     const storage = shape?.isStorageBufferAttribute || shape?.isStorageInstancedBufferAttribute;
     if (!storage) return inspect(attribute);
-    // An index-first source allocation has INDEX|STORAGE usage. Admit Uint32
-    // directly: narrow source indices also need primitive-restart promotion,
-    // which the shared compute uploader does not perform.
-    if (!(shape.array instanceof Uint32Array) || shape.itemSize !== 1 ||
+    // Raw narrow unsigned indices enter the source's first-allocation
+    // promotion through the storage owner. Accepted GPU views stay Uint32.
+    if (!(shape.array instanceof Uint32Array || !captured &&
+        (shape.array instanceof Uint16Array || shape.array instanceof Uint8Array)) || shape.itemSize !== 1 ||
         shape.isInterleavedBufferAttribute || shape.normalized ||
         !Number.isSafeInteger(shape.count) || shape.count < 1 ||
         shape.array.length !== shape.count || !(shape.array.buffer instanceof ArrayBuffer) ||
         shape.array.buffer.resizable || !Number.isSafeInteger(shape.version) || shape.version < 0)
-      reject('ATTRIBUTE', 'Native storage indices require fixed scalar Uint32 source attributes');
+      reject('ATTRIBUTE', 'Native storage indices require fixed scalar unsigned source attributes');
     if (captured) return inspect(attribute);
     if (typeof captureIndexAttribute !== 'function')
       reject('ATTRIBUTE', 'Native storage indices require the renderer storage owner');
@@ -148,7 +148,7 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
     // Use the same first-geometry-use upload gate as generated vertex inputs.
     // A later shader-storage update may advance this allocation before submit;
     // refreshStorage derives the final immutable index proof for that render.
-    captureIndexAttribute(attribute, view).install();
+    captureIndexAttribute(attribute, view, true).install();
     return inspect(view);
   }
   function capture(geometry, renderId, attributeNames = null, captureIndexAttribute = null) {
