@@ -29,6 +29,41 @@ test('sampled texture validation captures issued uploads without future scopes o
   assert.equal(ready, true);
 });
 
+for (const blocked of ['sibling', 'earlier operation']) for (const failedScope of ['validation', 'out-of-memory'])
+  test(`sampled texture upload error escapes a pending ${blocked}: ${failedScope}`, async t => {
+    const d = textureDevice(), p = pool(d), texture = make();
+    p.prepare([texture]); await p.whenIdle();
+    const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return {promise, resolve}; };
+    const earlier = deferred(), validation = deferred(), memory = deferred(), completion = deferred();
+    const pop = d.popErrorScope; let reports = [];
+    d.popErrorScope = () => { const result = pop(); return reports.shift() ?? result; };
+    d.queue.onSubmittedWorkDone = () => completion.promise;
+    t.after(() => { earlier.resolve(null); validation.resolve(null); memory.resolve(null); completion.resolve(); p.dispose(); });
+    if (blocked === 'earlier operation') {
+      reports = [earlier.promise]; texture.needsUpdate = true; p.update([texture]);
+    }
+    reports = [memory.promise, validation.promise]; texture.needsUpdate = true; p.update([texture]);
+    assert.equal(reports.length, 0); assert.deepEqual(d.scopes, [], 'all scopes pop before waiting');
+    let failure, idleFailure;
+    const checked = p.validation.catch(error => { failure = error; });
+    const waiting = p.whenIdle().catch(error => { idleFailure = error; });
+    const failed = failedScope === 'validation' ? validation : memory;
+    const sibling = failedScope === 'validation' ? memory : validation;
+    if (blocked === 'earlier operation') sibling.resolve(null);
+    failed.resolve({message: 'sampled upload rejected'});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(failure?.code, 'THREE_TEXTURE_DEVICE'); assert.match(failure.message, /sampled upload rejected/);
+    assert.equal(idleFailure, failure, 'idle fails without waiting for native completion');
+    await Promise.all([checked, waiting]);
+    assert.equal(p.failed, true); assert.equal(p.diagnostics.textureBytes, 0);
+    assert.equal(p.diagnostics.textures, 0); assert.ok(d.textures.every(value => value.destroyed));
+    assert.throws(() => p.binding(texture), error => error === failure);
+    earlier.resolve(null); sibling.resolve({message: 'late sibling failure'}); completion.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+    await assert.rejects(p.whenIdle(), error => error === failure);
+    assert.equal(p.diagnostics.textureBytes, 0);
+  });
+
 test('requested byte uploads retain image identity and GPU-stale CPU changes',async()=>{
   const d=textureDevice(),p=pool(d),t=make(),image=t.image,data=image.data;
   p.prepare([t]);const b=p.binding(t),before=b.view.texture.levels[0].slice();

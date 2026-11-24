@@ -511,7 +511,11 @@ export function createGpuThreeTextures(device,{
       // throws. Observe pop failures after returned allocations acquire owners.
       while(scopes>0){scopes--;try{reports.push(Promise.resolve(device.popErrorScope()));}catch(error){reports.push(Promise.reject(error));}}
     }
-    const checked=Promise.all(reports).then(errors=>{const e=errors.find(Boolean);if(e)throw new ThreeTextureError('DEVICE',e.message||'Texture operation failed');}).catch(e=>{throw stop(e);});
+    // Native scopes resolve with error payloads. Turn each payload into a
+    // rejection before joining so a stalled sibling cannot conceal failure.
+    const checked=Promise.all(reports.map(report=>report.then(error=>{
+      if(error)throw new ThreeTextureError('DEVICE',error.message||'Texture operation failed');
+    }))).catch(e=>{throw stop(e);});
     pending=Promise.all([pending,checked]).then(()=>{});pending.catch(()=>{});
     // writeTexture lends native storage to an explicit operation, whose own
     // synchronous exception keeps its existing nonterminal caller semantics.

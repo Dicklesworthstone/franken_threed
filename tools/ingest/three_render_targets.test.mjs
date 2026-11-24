@@ -141,6 +141,55 @@ test('asynchronous GPU rejection fails the owner rather than publishing success'
   owner.dispose(); assert.ok(calls.textures.every(t => t.destroyed === 1));
 });
 
+for (const blocked of ['sibling', 'earlier operation']) for (const failedScope of ['validation', 'out-of-memory'])
+  test(`target sampling failure escapes a pending ${blocked}: ${failedScope}`, async t => {
+    const {owner, target, device, calls} = fixture(), bindings = owner.bindingsFor();
+    bindings.get(target.texture); await owner.whenIdle();
+    const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return {promise, resolve}; };
+    const earlier = deferred(), validation = deferred(), memory = deferred();
+    const pop = device.popErrorScope; let reports = [];
+    device.popErrorScope = () => { const result = pop(); return reports.shift() ?? result; };
+    t.after(() => { earlier.resolve(null); validation.resolve(null); memory.resolve(null); owner.dispose(); });
+    if (blocked === 'earlier operation') {
+      reports = [earlier.promise]; target.texture.wrapS = T.RepeatWrapping;
+      bindings.get(target.texture);
+    }
+    reports = [validation.promise, memory.promise]; target.texture.wrapT = T.RepeatWrapping;
+    bindings.get(target.texture);
+    assert.equal(reports.length, 0); assert.deepEqual(calls.scopes, [], 'all scopes pop before waiting');
+    let failure;
+    const waiting = owner.whenIdle().catch(error => { failure = error; });
+    const failed = failedScope === 'validation' ? validation : memory;
+    const sibling = failedScope === 'validation' ? memory : validation;
+    if (blocked === 'earlier operation') sibling.resolve(null);
+    failed.resolve({message: 'target sampling rejected'});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(failure?.code, 'THREE_TARGET_GPU'); assert.match(failure.message, /target sampling rejected/);
+    await waiting;
+    assert.equal(owner.size, 0); assert.equal(owner.allocatedBytes, 0);
+    assert.ok(calls.textures.every(texture => texture.destroyed === 1));
+    assert.throws(() => bindings.get(target.texture), error => error === failure);
+    earlier.resolve(null); sibling.resolve({message: 'late sibling failure'});
+    await new Promise(resolve => setImmediate(resolve));
+    await assert.rejects(owner.whenIdle(), error => error === failure);
+    assert.ok(calls.textures.every(texture => texture.destroyed === 1), 'late reports cannot retire storage twice');
+  });
+
+test('successful target sampling still waits for both validation scopes', async t => {
+  const {owner, target, device, calls} = fixture(), bindings = owner.bindingsFor();
+  bindings.get(target.texture); await owner.whenIdle();
+  const releases = [], reports = Array.from({length: 2}, () => new Promise(resolve => releases.push(resolve)));
+  const pop = device.popErrorScope;
+  device.popErrorScope = () => { const result = pop(); return reports.shift() ?? result; };
+  t.after(() => { for (const release of releases) release(null); owner.dispose(); });
+  target.texture.wrapS = T.RepeatWrapping; bindings.get(target.texture);
+  let ready = false; const waiting = owner.whenIdle().then(() => { ready = true; });
+  releases[0](null); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ready, false); assert.ok(calls.textures.every(texture => texture.destroyed === 0));
+  releases[1](null); await waiting; assert.equal(ready, true);
+  assert.equal(owner.size, 1); assert.ok(owner.allocatedBytes > 0);
+});
+
 test('readback session uses native attachment, not the flipped sampling image', () => {
   const {owner, target} = fixture(), e = owner.ensure(owner.capture(target));
   const sample = owner.bindingsFor().get(target.texture);

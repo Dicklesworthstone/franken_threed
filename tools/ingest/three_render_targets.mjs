@@ -994,9 +994,13 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     let result, error;
     try { result = operation(device); } catch (cause) { error = cause; }
     const invalid = device.popErrorScope(), oom = device.popErrorScope();
-    entry.validation = Promise.all([entry.validation, invalid, oom]).then(([, a, b]) => {
+    // A reported failure is terminal even if its sibling scope or an older
+    // operation is still pending. Successful sampling still joins every check.
+    const checks = [invalid, oom].map(scope => Promise.resolve(scope).then(cause => {
+      if (cause) throw new ThreeRenderTargetError('GPU', cause.message ?? 'Target sampling failed');
+    }));
+    entry.validation = Promise.all([entry.validation, ...checks]).then(() => {
       if (error) throw error;
-      if (a || b) throw new ThreeRenderTargetError('GPU', (a || b).message ?? 'Target sampling failed');
     });
     entry.validation.catch(cause => { terminal ??= cause; entry.error = cause; retire(entry); });
     if (error) { terminal ??= error; entry.error = error; retire(entry); throw error; }
