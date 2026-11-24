@@ -204,12 +204,18 @@ export function computeAttributeSnapshot(device, attribute, {index = false, inte
   const view = vertexViews.get(attribute);
   if (view) {
     if (view.device !== device) fail('OWNER', 'Captured vertex storage belongs to another device');
-    if (index) fail('FORMAT', 'Captured node vertex streams cannot be used as indices');
-    if (integer ? ![Int32Array, Uint32Array].includes(view.scalar) : view.scalar !== Float32Array)
+    if (index && integer) fail('FORMAT', 'Index and integer-vertex modes are distinct');
+    if (index) {
+      if (view.scalar !== Uint32Array || view.stride !== 1)
+        fail('FORMAT', 'Captured index streams require scalar Uint32 storage');
+    } else if (integer ? ![Int32Array, Uint32Array].includes(view.scalar) : view.scalar !== Float32Array) {
       fail('FORMAT', 'Captured storage signedness must match its vertex shader input');
+    }
     const resource = view.lease.resolve();
+    if (index && (resource.buffer.usage & 16) !== 16)
+      fail('FORMAT', 'Captured index storage requires INDEX buffer usage');
     return Object.freeze({buffer: resource.buffer, arrayStride: view.stride * 4, count: view.count,
-      byteLength: view.byteLength, scalar: view.scalar, indexFormat: null,
+      byteLength: view.byteLength, scalar: view.scalar, indexFormat: index ? 'uint32' : null,
       assertCurrent: view.lease.assertCurrent, whenIdle: view.lease.whenIdle});
   }
   const table = devices.get(device), entry = table?.get(attribute);
