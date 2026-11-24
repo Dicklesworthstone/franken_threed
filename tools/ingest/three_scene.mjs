@@ -2441,6 +2441,16 @@ export async function createGpuThreeScene(device,scene,{
     }
   }
   const bridge=Object.freeze({scene:root,prepare,render,assertNativePrepared,
+    getShader(object,material){
+      live();
+      const geometry=executionGeometry(object.geometry),keys=new Set([object,geometry]);
+      if(object.isMesh&&wireframeMaterial(material))keys.add(wireframeGeometry(geometry));
+      // Program meshes carry the original object key; fixed meshes share their
+      // source geometry/material key. The ordinary (front) side is last when
+      // a transparent DoubleSide material compiled both source passes.
+      const entry=entries.findLast(entry=>keys.has(entry.key)&&entry.material===material&&!entry.mesh.disposed);
+      return entry?renderer.getShader(entry.mesh):null;
+    },
     get disposed(){return disposed;},get failed(){return terminal!==null||resourceFailed();},
     get diagnostics(){return Object.freeze({prepareVersion,sourceDraws,logicalDraws,
       drawCalls,geometryCount:geometries.size,geometryBytes:geometryBytes(),

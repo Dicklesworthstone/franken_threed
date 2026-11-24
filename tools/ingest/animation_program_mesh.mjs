@@ -136,6 +136,7 @@ export function createProgramMeshes({device, format, colorFormats = format === n
       uniforms.live();
       return {
       program: true, gpu, reflection, uniformBinding, textureGroup: allocated.value.textureGroup,
+      shaderSource: {vertex, fragment},
       pipelines: {normal: pipelines[0], flipped: pipelines[1]}, geometrySignature: geometry.signature,
       points, provoking, topology,
       blended: !!raster.blend, alphaMode: raster.blend ? 'BLEND' : 'OPAQUE', blendConstant: raster.blendConstant ?? null, stencilReference,

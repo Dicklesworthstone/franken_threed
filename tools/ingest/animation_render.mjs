@@ -1241,7 +1241,8 @@ export async function createGpuAnimationRenderer(
   const records = new Set(),
     owned = new WeakMap(),
     buffers = new Map(),
-    pipelines = new Map();
+    pipelines = new Map(),
+    shaderSources = new Map();
   let allocatedBytes = 0,
     pendingMeshes = 0,
     disposed = false,
@@ -1428,7 +1429,7 @@ export async function createGpuAnimationRenderer(
     instanceBindGroup = instanceUniformLayout = null;
     environmentGroups.clear();
     rasterStates.clear(); rasterIds.clear();
-    pipelines.clear(); variants.clear();
+    pipelines.clear(); variants.clear(); shaderSources.clear();
     sharedBuffers?.clear();
     sharedGroups?.clear();
   }
@@ -1659,9 +1660,7 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
         environmentLit ? environmentLayouts.get(shadowed) : shadowed ? shadowLayout : lightLayout,
       );
     const pipelineLayout = device.createPipelineLayout({ label, bindGroupLayouts });
-    const module = device.createShaderModule({
-      label,
-      code:
+    const code =
         srgbOutput || raster?.premultipliedAlpha || textureTransforms || clipping || fog || nativeInstances || instancing || lit || attributes || format === null
           ? surfaceShader(
               mapMask,
@@ -1690,8 +1689,8 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
               alphaTextureComponent,
               matcap,
             )
-          : ANIMATION_RENDER_WGSL,
-    });
+          : ANIMATION_RENDER_WGSL;
+    const module = device.createShaderModule({label, code});
     let vertexBuffers = [
       {
         arrayStride: 40,
@@ -1768,6 +1767,7 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
             .then((pipeline) => { live(); pipelines.set(key, pipeline); }),
         );
       }
+    shaderSources.set(variantKey, {vertex: code, fragment: code});
     return Promise.all(created);
   }
   function ensureLighting() {
@@ -3186,6 +3186,15 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
     },
     addMesh,
     addProgramMeshImmediate,
+    getShader(mesh) {
+      live();
+      const record = owned.get(mesh);
+      if (!record || record.disposed) fail("ANIMATION_RENDER_DISPOSED", "Shader inspection requires a live mesh owned by this renderer");
+      const source = record.shaderSource ?? shaderSources.get(record.variant);
+      // Return the actual module strings, including both entry points when the
+      // fixed material owner compiles one WGSL module for its two stages.
+      return {fragmentShader: source.fragment, vertexShader: source.vertex};
+    },
     render,
     get drawCallCount() {
       return drawCallCount;

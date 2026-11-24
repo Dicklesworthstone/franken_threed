@@ -496,6 +496,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._srgbView = true;
       this._outputProfileKey = null;
       this._wanted = new Map();
+      this._shaderCompilations = new WeakMap();
       this._pending = [];
       this._drain = null;
       this._deferredError = null;
@@ -524,6 +525,36 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._nodes = {nodeFrame: typeof THREE.NodeFrame === 'function' ? new THREE.NodeFrame() : {frameId: 0, time: 0, deltaTime: 0, update() { this.frameId++; }}};
       this._inspector = typeof THREE.InspectorBase === 'function' ? new THREE.InspectorBase() : inspectorStub();
       this._inspector.setRenderer(this);
+      this.debug = {
+        checkShaderErrors: true, diagnostics: {keywords: false},
+        onNodeBuilderCreated: null, onShaderError: null,
+        getShaderAsync: async (scene, camera, object) => {
+          // Keep the public compile call, its scene lifecycle and rejection
+          // behavior. Inspection reads the prepared owner and submits no draw.
+          await this.compileAsync(object, camera, scene);
+          const bridge = this._shaderCompilations.get(object);
+          const material = scene.overrideMaterial || object.material;
+          const shader = bridge?.getShader(object, material);
+          if (shader) return shader;
+          // The pinned debug API also asks its node manager for shader state
+          // when public compilation projected no draw (visibility, layers or
+          // frustum culling). Construct that state without changing the object,
+          // running draw updates or submitting a preview render.
+          const lights = [], collect = value => {
+            if (value.isLight && value.layers.test(camera.layers)) lights.push(value);
+          };
+          object.traverseVisible(collect);
+          if (scene !== object) scene.traverseVisible(collect);
+          const target = this._renderTarget || this._outputRenderTarget;
+          const programs = this._nodeProgramSupport ??= createThreeNodePrograms({three: THREE, renderer: this, maxPrograms: maxBindings});
+          const program = programs.compile(material, object, {scene, camera, lights,
+            colorAttachmentCount: target?.textures.length ?? 1, lightingEnabled: this.lighting?.enabled !== false,
+            // As in compileAsync, build the default transparent pass with the
+            // original DoubleSide still restored. This state is not submitted.
+            compilation: true, sidePass: material.transparent && material.side === THREE.DoubleSide && !material.forceSinglePass});
+          return {fragmentShader: program.fragment, vertexShader: program.vertex};
+        },
+      };
     }
     set inspector(value) {
       this._inspector?.setRenderer(null);
@@ -2211,6 +2242,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         for (const request of requests) {
           request.destination._wanted.set(request.scene, request.key);
           await this._prepare(request.destination, request);
+          if (request.scene === compiled) {
+            const entry = request.destination._dispatcher?.entry(request.scene);
+            if (entry) this._shaderCompilations.set(compiled, entry.bridge);
+          }
         }
       } finally {
         // Geometry-node compilation can enqueue initialization/update kernels.

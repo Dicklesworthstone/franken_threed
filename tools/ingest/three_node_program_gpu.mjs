@@ -373,6 +373,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     catch (error) { releasePipeline(pipelineEntry); throw error; }
     const {pipelines, bindGroupLayouts} = prepared;
     const record = {nodeProgram: true, gpu, groups, uniformBindings, bindGroupLayouts, pipelineEntry, geometrySignature, geometryInstanced, instanceCapacity,
+      shaderSource: {vertex, fragment},
       topology, stripIndexFormat: nativeStripIndexFormat,
       resourceCount: groups.reduce((sum, group) => sum + group.resources.length, 0),
       pipelines: {normal: pipelines[0], flipped: pipelines[1]},

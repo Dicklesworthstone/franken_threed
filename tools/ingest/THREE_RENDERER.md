@@ -541,6 +541,26 @@ Scene; the hook's scene argument remains the original root. Compilation does not
 the Scene after-hook or submit graphics draws. Source native material render
 hooks remain inert, matching the pinned renderer.
 
+Native `renderer.debug.getShaderAsync(scene, camera, object)` supports the pinned
+shader editor's asynchronous inspection API. It invokes the public
+`compileAsync(object, camera, scene)`, preserving initialization, scene callbacks,
+override materials, selected targets and compilation errors, then returns
+`{fragmentShader, vertexShader}`. Prepared objects expose the exact WGSL strings
+used by their native GPU modules, without reconstructing a second shader or
+submitting a preview draw. Fixed materials use one combined WGSL module for both
+stages; authored TSL materials expose the separate pinned builder outputs.
+
+Inspection also constructs source node state for hidden, layer-excluded and
+frustum-culled objects, as the pinned debug API does, without making them visible
+or invoking draw-frequency updates. Transparent DoubleSide materials retain
+their original side and default-pass construction. Warm inspection reuses the
+prepared programs; graph invalidation, material disposal and renderer disposal
+keep their existing lifecycle behavior. Shader and resource admission bounds
+still apply. `three_renderer_shader_inspection.test.mjs` checks actual module
+strings, pinned builder output, public compilation/error behavior and zero
+graphics submissions with a recording device. This adds a renderer/tool service;
+the full H1 Inspector routing boundaries above remain unchanged.
+
 Hooked scenes use the complete native draw capture and its existing resource
 bounds. Ordinary rigid geometry shares its retained upload history with later
 hooks. Attributes already owned by the separate fixed shadow, instancing,
