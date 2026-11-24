@@ -65,9 +65,10 @@ compute inputs. Other sampled/storage image inputs use their existing owners.
 ## Compute-buffer output to render targets
 
 `copyStorageBufferToRenderTargetAsync(attribute, target, options)` copies the
-renderer-owned GPU buffer into the target's primary color attachment. It now
-selects allocated authored destination mips and explicit cube faces, array
-layers, or volume slices through the existing native target owner:
+renderer-owned GPU buffer into a selected color attachment. This F3D extension
+accepts `colorIndex` (default zero), allocated authored destination mips and
+explicit cube faces, array layers, or volume slices through the existing native
+target owner:
 
 ```js
 await renderer.copyStorageBufferToRenderTargetAsync(attribute, cubeTarget, {
@@ -78,8 +79,22 @@ await renderer.copyStorageBufferToRenderTargetAsync(attribute, cubeTarget, {
 });
 ```
 
-The target must be single-sample. Higher destination mips and all cube
-destinations require `generateMipmaps: false`; the level must already be
+RGBA8, R/RG/RGBA16F, R/RG/RGBA32F and signed or unsigned R/RG/RGBA32 integer
+attachments preserve the GPU buffer's exact bits. For example, an existing
+`rg32uint` second attachment accepts compute-produced pairs of unsigned words:
+
+```js
+await renderer.copyStorageBufferToRenderTargetAsync(counters, target, {
+  colorIndex: 1,
+  width: target.width, height: target.height,
+  bytesPerRow: target.width * 8,
+});
+```
+
+The target must be single-sample. The selected attachment's format determines
+the byte layout, and its own mip allocation and generation flags determine
+which levels are writable. Higher destination mips and all cube destinations
+require `generateMipmaps: false` on that attachment; the level must already be
 allocated. Default width/height cover the selected mip's remaining extent.
 `face` is required for cube, array and volume destinations. Cube and array
 indices stay fixed across levels; volume slice counts shrink with the mip.
@@ -91,13 +106,24 @@ rows. Offsets and row strides address GPU bytes, including storage-buffer
 padding; the copy never reads newer CPU attribute data or performs a format
 conversion. A suitably aligned region uses one encoded buffer-to-texture copy;
 tight or reversed rows use row copies in one submission, without staging.
+Under the [WebGPU copy rules](https://www.w3.org/TR/webgpu/), R16F accepts
+two-byte-aligned source offsets. Multi-row commands use 256-byte-aligned strides;
+split single-row commands omit that stride. Odd R16F byte offsets or row strides
+are rejected before allocation or submission.
 
-Queued calls capture destination generation, mip, face and layout. They consume
+Queued calls capture destination generation, color index, mip, face and layout. They consume
 GPU buffer contents at their FIFO submission point and retain the target until
 completion or failure. Admission checks the existing target budget before
 allocation or write scopes, so a budget refusal is retryable. Native color
-borrowing invalidates the existing sampling image without allocating a mip depth
-attachment or modifying depth contents.
+borrowing invalidates only the selected color's existing sampling image without
+allocating a mip depth attachment or modifying other colors or depth contents.
+A nested copy cannot overwrite that attachment when an earlier draw in its
+pending parent pass already samples it; disjoint sibling attachments retain
+their independent write admission.
+Either completed GPU error scope rejects a failed copy promptly, even while its
+sibling or a producer/fence remains pending. All scope results remain observed,
+and successful copies still join both scopes, producer validation and GPU
+completion. Early rejection does not release the submitted target storage.
 
 ## Queue and lifetime semantics
 

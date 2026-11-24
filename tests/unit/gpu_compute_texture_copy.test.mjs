@@ -2,19 +2,26 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {copyComputeBufferToTarget, inspectComputeTextureCopy} from '../../tools/ingest/gpu_compute_texture_copy.mjs';
 
-const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return {promise, resolve}; };
+const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return {promise, resolve, reject}; };
 function setup({format = 'rgba8unorm', width = 3, height = 2, completion = null, validation = null,
-  cube = false, array = false, volume = false, layers = cube ? 6 : 1, mipLevelCount = 1, generateMipmaps = false} = {}) {
-  const bpp = {rgba8unorm: 4, 'rgba8unorm-srgb': 4, rgba16float: 8, r32float: 4, rg32float: 8, rgba32float: 16}[format];
-  const calls = [], texture = {width, height, levels: Array.from({length: mipLevelCount}, (_, mip) => {
+  cube = false, array = false, volume = false, layers = cube ? 6 : 1, mipLevelCount = 1, generateMipmaps = false,
+  colorFormats = null, colorMipLevelCounts = null, colorGenerateMipmaps = null} = {}) {
+  const calls = [], textures = (colorFormats ?? [format]).map((format, colorIndex) => {
+    const bpp = {rgba8unorm: 4, 'rgba8unorm-srgb': 4, r16float: 2, rg16float: 4, rgba16float: 8,
+      r32float: 4, rg32float: 8, rgba32float: 16, r32uint: 4, rg32uint: 8, rgba32uint: 16,
+      r32sint: 4, rg32sint: 8, rgba32sint: 16}[format];
+    const texture = {width, height, bpp, levels: Array.from({length: colorMipLevelCounts?.[colorIndex] ?? mipLevelCount}, (_, mip) => {
     const w = Math.max(1, Math.floor(width / 2 ** mip)), h = Math.max(1, Math.floor(height / 2 ** mip));
     const depth = volume ? Math.max(1, Math.floor(layers / 2 ** mip)) : layers;
     return {width: w, height: h, depth, data: new Uint8Array(w * h * depth * bpp).fill(0xaa)};
   })};
-  texture.data = texture.levels[0].data;
+    texture.data = texture.levels[0].data; return texture;
+  }), texture = textures[0];
   let ensureCount = 0;
   const destination = {shape: {format, width, height, sampleCount: 1, cube, array, volume, layers,
-      mipLevelCount, generateMipmaps, textures: [{}]}, alive: true, busy: false,
+      mipLevelCount, generateMipmaps, textures: textures.map(() => ({})),
+      ...(colorFormats && {colorFormats}), ...(colorMipLevelCounts && {colorMipLevelCounts}),
+      ...(colorGenerateMipmaps && {colorGenerateMipmaps})}, alive: true, busy: false, dirtyColors: new Set(),
     dirty: false, depthDirty: false, mipsDirty: false, error: null, validation: Promise.resolve(), lifetime: new AbortController(),
     storage: {whenIdle: () => completion?.promise ?? Promise.resolve()}};
   const targets = {
@@ -25,10 +32,11 @@ function setup({format = 'rgba8unorm', width = 3, height = 2, completion = null,
       if (this.budgetError) throw this.budgetError;
     },
     withNativeColorDestination({entry, texture: source, device: owner, depth, colorIndex}, callback) {
-      assert.equal(entry, destination); assert.equal(source, entry.shape.textures[0]);
-      assert.equal(owner, device); assert.equal(depth, false); assert.equal(colorIndex, 0);
+      assert.equal(entry, destination); assert.equal(source, entry.shape.textures[colorIndex]);
+      assert.equal(owner, device); assert.equal(depth, false); assert.ok(textures[colorIndex]);
       this.assertCurrent(entry); entry.busy = true; entry.dirty = entry.mipsDirty = true;
-      try { callback(texture); this.assertCurrent(entry); } finally { entry.busy = false; }
+      entry.dirtyColors.add(colorIndex);
+      try { callback(textures[colorIndex]); this.assertCurrent(entry); } finally { entry.busy = false; }
     },
   };
   let reported = false;
@@ -41,9 +49,10 @@ function setup({format = 'rgba8unorm', width = 3, height = 2, completion = null,
         copyBufferToTexture(source, target, size) {
           calls.push(['copy', source.offset, source.bytesPerRow, [...target.origin], [...size], target.mipLevel]);
           commands.push(() => {
+            const {bpp} = target.texture;
             for (let row = 0; row < size[1]; row++) {
               const start = source.offset + row * (source.bytesPerRow ?? size[0] * bpp);
-              const level = texture.levels[target.mipLevel];
+              const level = target.texture.levels[target.mipLevel];
               const offset = ((target.origin[2] * level.height + target.origin[1] + row) * level.width + target.origin[0]) * bpp;
               level.data.set(source.buffer.data.subarray(start, start + size[0] * bpp), offset);
             }
@@ -55,7 +64,7 @@ function setup({format = 'rgba8unorm', width = 3, height = 2, completion = null,
       onSubmittedWorkDone: () => completion?.promise ?? Promise.resolve()},
   };
   const source = values => ({data: new Uint8Array(values.buffer, values.byteOffset, values.byteLength), size: values.byteLength, usage: 4 | 128});
-  return {device, targets, destination, texture, calls, source, get ensureCount() { return ensureCount; }};
+  return {device, targets, destination, texture, textures, calls, source, get ensureCount() { return ensureCount; }};
 }
 
 test('tight unaligned rows copy directly in a single submission, without mapping or staging', async () => {
@@ -85,13 +94,125 @@ test('region copies honor byte offsets, padded source rows and explicit vertical
 });
 
 test('float32 and half-float copies preserve raw bits, including signed zero and NaN payloads', async () => {
-  for (const format of ['r32float', 'rg32float', 'rgba32float', 'rgba16float']) {
+  for (const format of ['r32float', 'rg32float', 'rgba32float', 'r16float', 'rg16float', 'rgba16float']) {
     const s = setup({format, width: 2, height: 2});
     const values = new Uint32Array(s.texture.data.byteLength / 4);
     for (let i = 0; i < values.length; i++) values[i] = [0x80000000, 0x7fc01234, 0xff800000, 0x3f800000][i % 4];
     await copyComputeBufferToTarget(s.device, s.source(values), s.targets, s.destination);
     assert.deepEqual(new Uint32Array(s.texture.data.buffer), values, format);
   }
+});
+
+test('R16F copies permit two-byte offsets and encode only legal native row strides', async () => {
+  for (const bytesPerRow of [8, 256]) {
+    const s = setup({format: 'r16float'}), values = new Uint16Array((2 + bytesPerRow + 6) / 2).fill(0xabcd);
+    const row0 = [0x8000, 0x7e01, 0x3c00], row1 = [0xfc00, 0, 0x7bff];
+    values.set(row0, 1); values.set(row1, (2 + bytesPerRow) / 2);
+    await copyComputeBufferToTarget(s.device, s.source(values), s.targets, s.destination, {offset: 2, bytesPerRow});
+    assert.deepEqual(new Uint16Array(s.texture.data.buffer), new Uint16Array([...row0, ...row1]));
+    const copies = s.calls.filter(call => call[0] === 'copy');
+    assert.deepEqual(copies.map(call => [call[1], call[2]]), bytesPerRow === 256 ? [[2, 256]] : [[2, undefined], [10, undefined]]);
+    // WebGPU aligns color-copy offsets to the texel block footprint (2 for R16F).
+    // Explicit multi-row strides align to 256; split single rows omit the stride.
+    const before = s.calls.length;
+    for (const options of [{offset: 1}, {bytesPerRow: 7}])
+      assert.throws(() => copyComputeBufferToTarget(s.device, s.source(values), s.targets, s.destination, options), /LAYOUT/);
+    assert.equal(s.calls.length, before);
+  }
+});
+
+for (const format of ['r32uint', 'rg32uint', 'rgba32uint', 'r32sint', 'rg32sint', 'rgba32sint'])
+  test(`${format}: compute bytes reach only the selected MRT attachment without integer conversion`, async () => {
+    const s = setup({colorFormats: ['rgba8unorm', format]}), selected = s.textures[1];
+    const words = Uint32Array.from({length: selected.data.byteLength / 4}, (_, i) =>
+      [0xffffffff, 0x80000000, 0x01000001, 0x7fffffff, 0x80000001, 0][i % 6]);
+    const input = words.slice(), primary = s.texture.data.slice();
+    await copyComputeBufferToTarget(s.device, s.source(words), s.targets, s.destination, {colorIndex: 1});
+    assert.deepEqual(new Uint32Array(selected.data.buffer), input);
+    assert.deepEqual(words, input); assert.deepEqual(s.texture.data, primary);
+    assert.deepEqual([...s.destination.dirtyColors], [1]); assert.equal(s.destination.depthDirty, false);
+    assert.equal(s.calls.filter(c => c[0] === 'submit').length, 1);
+  });
+
+test('selected MRT attachment controls authored mip extents and generation independently of primary color', async () => {
+  const s = setup({width: 8, height: 8, mipLevelCount: 1, generateMipmaps: true,
+    colorFormats: ['rgba8unorm', 'rg32sint'], colorMipLevelCounts: [1, 4], colorGenerateMipmaps: [true, false]});
+  const values = new Int32Array([-2147483648, 16777217, 2147483647, -1, -16777217, 1, 0, -2147483647]);
+  await copyComputeBufferToTarget(s.device, s.source(values), s.targets, s.destination, {colorIndex: 1, destinationMipLevel: 2});
+  assert.deepEqual(new Int32Array(s.textures[1].levels[2].data.buffer), values);
+  assert.ok(s.texture.data.every(byte => byte === 0xaa));
+  for (const mip of [0, 1, 3]) assert.ok(s.textures[1].levels[mip].data.every(byte => byte === 0xaa));
+  assert.deepEqual([...s.destination.dirtyColors], [1]);
+});
+
+test('attachment selectors, byte bounds, mips and generation fail before native allocation or submission', () => {
+  const s = setup({width: 8, height: 8, mipLevelCount: 4,
+    colorFormats: ['rgba8unorm', 'rgba32uint'], colorMipLevelCounts: [4, 1], colorGenerateMipmaps: [false, false]});
+  const buffer = s.source(new Uint8Array(8 * 8 * 4));
+  for (const colorIndex of [-1, 2, 0.5, NaN, null, '1'])
+    assert.throws(() => copyComputeBufferToTarget(s.device, buffer, s.targets, s.destination, {colorIndex}), /ATTACHMENT/);
+  assert.throws(() => copyComputeBufferToTarget(s.device, buffer, s.targets, s.destination, {colorIndex: 1}), /BOUNDS/);
+  assert.throws(() => copyComputeBufferToTarget(s.device, buffer, s.targets, s.destination,
+    {colorIndex: 1, destinationMipLevel: 1}), /LEVEL/);
+  s.destination.shape.colorMipLevelCounts[1] = 4; s.destination.shape.colorGenerateMipmaps[1] = true;
+  assert.throws(() => copyComputeBufferToTarget(s.device, buffer, s.targets, s.destination,
+    {colorIndex: 1, destinationMipLevel: 2}), /MIP/);
+  assert.equal(s.ensureCount, 0); assert.equal(s.calls.length, 0); assert.equal(s.destination.dirtyColors.size, 0);
+});
+
+test('production source and native target owners expose the copied integer attachment without a replica', async t => {
+  const T = await import('../../upstream/three.js/build/three.webgpu.js');
+  const {createThreeRenderTargets} = await import('../../tools/ingest/three_render_targets.mjs');
+  const {mrtTransferDevice} = await import('../../tools/ingest/fixtures/mrt_transfer_fixture.mjs');
+  const f = mrtTransferDevice(), copies = [], encode = f.device.createCommandEncoder;
+  // Extend the existing independent byte recorder with buffer-to-texture copies.
+  // Source and native target allocation, attachment borrowing and sampling stay real.
+  f.device.createCommandEncoder = () => {
+    const encoder = encode(), pending = [];
+    return {...encoder, copyBufferToTexture(source, destination, size) {
+      copies.push({source, destination, size});
+      pending.push(() => {
+        const {texture, mipLevel, origin} = destination, width = Math.max(1, texture.width >> mipLevel);
+        assert.equal(texture.destroyed, 0); assert.ok(texture.usage & 2);
+        const input = new Uint8Array(source.buffer.data), plane = texture.planes[mipLevel][origin[2]];
+        for (let row = 0; row < size[1]; row++) {
+          const start = source.offset + row * (source.bytesPerRow ?? size[0] * texture.bpp);
+          plane.set(input.subarray(start, start + size[0] * texture.bpp),
+            ((origin[1] + row) * width + origin[0]) * texture.bpp);
+        }
+      });
+    }, finish() { const command = encoder.finish(); command.commands.push(...pending); return command; }};
+  };
+  const target = new T.RenderTarget(3, 2, {count: 2, depthBuffer: false});
+  Object.assign(target.textures[1], {format: T.RGBAIntegerFormat, type: T.UnsignedIntType});
+  const owner = createThreeRenderTargets(T, {getDevice: () => f.device, flipY: false});
+  t.after(() => { owner.dispose(); target.dispose(); });
+  const entry = owner.capture(target), sample = owner.captureNativeTexture(target.textures[1]);
+  const words = Uint32Array.from({length: 24}, (_, i) => [0xffffffff, 0x01000001, 0x80000001, 0][i % 4]);
+  await copyComputeBufferToTarget(f.device, {size: words.byteLength, usage: 4 | 128, data: words.buffer}, owner, entry, {colorIndex: 1});
+  owner.withNativeTexture(sample, texture => {
+    assert.equal(texture, copies[0].destination.texture); assert.equal(texture.format, 'rgba32uint');
+    assert.deepEqual(new Uint32Array(texture.planes[0][0].buffer), words);
+  });
+  assert.equal(sample.sampleType, 'uint'); assert.equal(f.calls.textures.length, 2);
+  assert.ok(f.calls.textures[0].planes[0][0].every(byte => byte === 0));
+  assert.equal(entry.sample, null); assert.equal(f.calls.buffers.length, 0); assert.equal(f.uploads.length, 0);
+  await owner.whenIdle();
+
+  const fence = deferred(), invalid = deferred(), sibling = deferred(), storage = entry.storage;
+  t.after(() => { fence.resolve(); invalid.resolve(null); sibling.resolve(null); });
+  f.device.queue.onSubmittedWorkDone = () => fence.promise;
+  let pops = 0, failure;
+  f.device.popErrorScope = () => ++pops <= 2 ? Promise.resolve(null) : pops === 3 ? invalid.promise : sibling.promise;
+  const failed = copyComputeBufferToTarget(f.device, {size: words.byteLength, usage: 4 | 128, data: words.buffer}, owner, entry, {colorIndex: 1});
+  failed.catch(error => { failure = error; });
+  invalid.resolve({message: 'outer copy validation failed'});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(failure?.code, 'GPU_COMPUTE_TEXTURE_GPU'); await assert.rejects(failed, /outer copy validation failed/);
+  assert.throws(() => owner.withNativeTexture(sample, () => assert.fail('failed color cannot publish')), error => error === failure);
+  assert.equal(entry.storage, storage); assert.ok(f.calls.textures.every(texture => texture.destroyed === 0));
+  sibling.reject(new Error('late outer scope failure')); fence.resolve(); await storage.whenIdle();
+  owner.dispose(); assert.ok(f.calls.textures.every(texture => texture.destroyed === 1));
 });
 
 test('invalid rectangles, formats, MSAA, layouts and unknown options cause no GPU work', () => {
@@ -135,6 +256,41 @@ test('GPU validation failures poison target sampling and reject copy completion'
   const s = setup({validation: {message: 'invalid copy descriptor'}});
   await assert.rejects(copyComputeBufferToTarget(s.device, s.source(new Uint8Array(24)), s.targets, s.destination), /invalid copy descriptor/);
   assert.throws(() => s.targets.assertCurrent(s.destination), /invalid copy descriptor/);
+});
+
+for (const failedScope of [0, 1])
+  test(`copy scope ${failedScope} rejects promptly while its sibling, producer and submission fence remain pending`, async t => {
+    const fence = deferred(), producer = deferred(), scopes = [deferred(), deferred()], s = setup({completion: fence});
+    let pops = 0, failure = null;
+    s.device.popErrorScope = () => scopes[pops++].promise;
+    t.after(() => { scopes.forEach(scope => scope.resolve(null)); producer.resolve(); fence.resolve(); });
+    const storage = s.destination.storage;
+    const copy = copyComputeBufferToTarget(s.device, s.source(new Uint8Array(24)), s.targets, s.destination, {},
+      {sourceCompletion: () => producer.promise});
+    copy.catch(error => { failure = error; });
+    scopes[failedScope].resolve({message: 'copy scope failed'});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(failure?.code, 'GPU_COMPUTE_TEXTURE_GPU');
+    await assert.rejects(copy, /copy scope failed/);
+    assert.equal(pops, 2); assert.equal(s.destination.error, failure);
+    assert.equal(s.destination.lifetime.signal.aborted, true);
+    assert.equal(s.destination.storage, storage, 'early public rejection does not release submitted target storage');
+    assert.equal(s.destination.alive, true);
+    scopes[1 - failedScope].reject(new Error('late sibling failure'));
+    producer.resolve(); fence.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+  });
+
+test('successful copy completion still joins both scopes, producer validation and submitted work', async () => {
+  const fence = deferred(), producer = deferred(), scopes = [deferred(), deferred()], s = setup({completion: fence});
+  let pops = 0, completed = false;
+  s.device.popErrorScope = () => scopes[pops++].promise;
+  const copy = copyComputeBufferToTarget(s.device, s.source(new Uint8Array(24)), s.targets, s.destination, {},
+    {sourceCompletion: () => producer.promise}).then(() => { completed = true; });
+  for (const pending of [scopes[0], scopes[1], producer]) {
+    pending.resolve(null); await new Promise(resolve => setImmediate(resolve)); assert.equal(completed, false);
+  }
+  fence.resolve(); await copy; assert.equal(completed, true); assert.equal(s.destination.error, null);
 });
 
 test('failed producer validation cannot publish a successfully copied target', async () => {

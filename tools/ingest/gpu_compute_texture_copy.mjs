@@ -1,10 +1,12 @@
 /** Bit-preserving, GPU-only storage-buffer -> source RenderTarget color copy.
  * No mapping, CPU upload, temporary texture or precision conversion is used.
  * Aligned rows use one copy; tight unaligned rows (or flipY) use row copies in
- * one command buffer. Selected authored mips and cube/array/volume slices share
- * the normal target owner's allocation, mip tracking and sampling invalidation.
+ * one command buffer. Selected MRT attachments, authored mips and cube/array/
+ * volume slices share the normal owner's allocation, mips and sampling invalidation.
  * Native coordinates are top-left. This is an explicit F3D extension, not an
  * implementation claim for upstream texture-backed TSL compute bindings. */
+import {gpuTargetColorFormat} from './gpu_target_transfer.mjs';
+
 export class GpuComputeTextureCopyError extends Error {
   constructor(code, message) {
     super(`GPU_COMPUTE_TEXTURE_${code}: ${message}`);
@@ -12,9 +14,12 @@ export class GpuComputeTextureCopyError extends Error {
   }
 }
 const fail = (code, message) => { throw new GpuComputeTextureCopyError(code, message); };
-const TEXEL_BYTES = new Map([['rgba8unorm', 4], ['rgba8unorm-srgb', 4], ['rgba16float', 8],
-  ['r32float', 4], ['rg32float', 8], ['rgba32float', 16]]);
-const KEYS = new Set(['x', 'y', 'width', 'height', 'offset', 'bytesPerRow', 'flipY', 'face', 'destinationMipLevel']);
+const TEXEL_BYTES = new Map([['rgba8unorm', 4], ['rgba8unorm-srgb', 4],
+  ['r16float', 2], ['rg16float', 4], ['rgba16float', 8],
+  ['r32float', 4], ['rg32float', 8], ['rgba32float', 16],
+  ['r32uint', 4], ['rg32uint', 8], ['rgba32uint', 16],
+  ['r32sint', 4], ['rg32sint', 8], ['rgba32sint', 16]]);
+const KEYS = new Set(['x', 'y', 'width', 'height', 'offset', 'bytesPerRow', 'flipY', 'face', 'colorIndex', 'destinationMipLevel']);
 const integer = n => Number.isSafeInteger(n) && n >= 0;
 
 /** Validate the complete copy before target allocation or command encoding.
@@ -22,12 +27,15 @@ const integer = n => Number.isSafeInteger(n) && n >= 0;
 export function inspectComputeTextureCopy(byteLength, target, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options) || Object.keys(options).some(k => !KEYS.has(k)))
     fail('OPTIONS', 'Expected buffer-to-target copy options');
-  const texelBytes = TEXEL_BYTES.get(target?.format);
-  if (!texelBytes || target.sampleCount !== 1) fail('TARGET', 'Expected a single-sample RGBA8/RGBA16F/R/RG/RGBA32F target');
-  const {destinationMipLevel = 0} = options, mipLevelCount = target.mipLevelCount ?? 1;
+  const {colorIndex = 0, destinationMipLevel = 0} = options;
+  const texelBytes = TEXEL_BYTES.get(gpuTargetColorFormat(target, colorIndex, fail));
+  if (!texelBytes || target.sampleCount !== 1)
+    fail('TARGET', 'Expected a single-sample RGBA8 or R/RG/RGBA 16F/32F/32I/32UI color attachment');
+  const mipLevelCount = target.colorMipLevelCounts?.[colorIndex] ?? target.mipLevelCount ?? 1;
   if (!integer(destinationMipLevel) || !integer(mipLevelCount) || mipLevelCount < 1 || destinationMipLevel >= mipLevelCount)
     fail('LEVEL', 'Destination mip level is not allocated');
-  if ((destinationMipLevel > 0 || target.cube) && target.generateMipmaps !== false)
+  if ((destinationMipLevel > 0 || target.cube) &&
+      (target.colorGenerateMipmaps?.[colorIndex] ?? target.generateMipmaps) !== false)
     fail('MIP', 'Higher destination mips and cube faces require authored, non-generated storage');
   const divisor = 2 ** destinationMipLevel;
   const mipWidth = target.width === 0 ? 0 : Math.max(1, Math.floor(target.width / divisor));
@@ -46,7 +54,7 @@ export function inspectComputeTextureCopy(byteLength, target, options = {}) {
   const empty = width === 0 || height === 0;
   const end = empty ? offset : offset + (height - 1) * bytesPerRow + width * texelBytes;
   if (!Number.isSafeInteger(end) || end > byteLength) fail('BOUNDS', 'Copy reads beyond the GPU storage buffer');
-  return Object.freeze({x, y, width, height, offset, bytesPerRow, flipY, empty, face, destinationMipLevel,
+  return Object.freeze({x, y, width, height, offset, bytesPerRow, flipY, empty, face, colorIndex, destinationMipLevel,
     singleCopy: height <= 1 || (!flipY && bytesPerRow % 256 === 0)});
 }
 
@@ -73,7 +81,7 @@ export function copyComputeBufferToTarget(device, buffer, targets, destination, 
   const plan = inspectComputeTextureCopy(buffer.size, destination.shape, options);
   if (plan.empty) return Promise.resolve(false);
   if (destination.busy) fail('REENTRANT', 'Cannot copy during a target submission');
-  const write = {entry: destination, texture: destination.shape.textures[0], device, depth: false, colorIndex: 0};
+  const write = {entry: destination, texture: destination.shape.textures[plan.colorIndex], device, depth: false, colorIndex: plan.colorIndex};
   // Budget admission and allocation failures remain retryable before write scopes.
   targets.validateNativeTextures([write]);
   targets.ensure(destination);
@@ -100,11 +108,13 @@ export function copyComputeBufferToTarget(device, buffer, targets, destination, 
     });
   } catch (cause) { error = cause; }
   // Error scopes may not span awaits on a renderer's shared GPUDevice.
-  const validation = Promise.all([device.popErrorScope(), device.popErrorScope()]).then(values => {
+  const scopes = [device.popErrorScope(), device.popErrorScope()];
+  // A fulfilled GPUError already fails this copy. Do not wait for its sibling
+  // to settle before rejecting, but keep every popped scope observed.
+  const validation = Promise.all(scopes.map(scope => Promise.resolve(scope).then(failure => {
     if (error) throw error;
-    const failure = values.find(Boolean);
     if (failure) throw new GpuComputeTextureCopyError('GPU', failure.message ?? 'GPU texture copy failed');
-  });
+  }))).then(() => {});
   const produced = error ? Promise.resolve() : sourceCompletion?.();
   destination.validation = Promise.all([destination.validation, validation, produced]).then(() => {});
   destination.validation.catch(cause => {

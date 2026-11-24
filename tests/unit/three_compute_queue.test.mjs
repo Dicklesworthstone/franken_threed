@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {withThreeCompute} from '../../tools/ingest/three_compute.mjs';
 import {computeAttributeSnapshot} from '../../tools/ingest/gpu_compute_attributes.mjs';
+import {withThreeNativeCapture} from '../../tools/ingest/three_node_shadows.mjs';
 
 const deferred = () => {
   let resolve, reject;
@@ -53,10 +54,11 @@ function setup({initialization = null, compilation = null, mapping = null} = {})
         copyBufferToTexture(source, target, size) {
           commands.push(() => {
             events.push(['texture-copy']);
+            const bpp = target.texture.bpp ?? 4;
             for (let row = 0; row < size[1]; row++) {
-              const start = source.offset + row * (source.bytesPerRow ?? size[0] * 4);
-              const offset = ((target.origin[1] + row) * target.texture.width + target.origin[0]) * 4;
-              target.texture.data.set(source.buffer.data.subarray(start, start + size[0] * 4), offset);
+              const start = source.offset + row * (source.bytesPerRow ?? size[0] * bpp);
+              const offset = ((target.origin[1] + row) * target.texture.width + target.origin[0]) * bpp;
+              target.texture.data.set(source.buffer.data.subarray(start, start + size[0] * bpp), offset);
             }
           });
         }, finish: () => commands,
@@ -502,10 +504,14 @@ test('preparation started by a before-update hook still snapshots the current ca
 });
 
 
-function targetFor(renderer, width = 2, height = 2) {
-  const target = {texture: {}}, texture = {width, data: new Uint8Array(width * height * 4)};
+function targetFor(renderer, width = 2, height = 2, formats = ['r32float']) {
+  const target = {textures: formats.map(() => ({}))}; target.texture = target.textures[0];
+  const textures = formats.map(format => {
+    const bpp = format.startsWith('rgba') ? 16 : format.startsWith('rg') ? 8 : 4;
+    return {width, bpp, data: new Uint8Array(width * height * bpp)};
+  });
   const entry = {target, alive: true, busy: false, depthDirty: false, dirty: false, references: 0,
-    shape: {format: 'r32float', width, height, sampleCount: 1, textures: [target.texture]}, validation: Promise.resolve(),
+    shape: {format: formats[0], colorFormats: formats, width, height, sampleCount: 1, textures: target.textures.slice()}, validation: Promise.resolve(),
     lifetime: new AbortController(), storage: {whenIdle: async () => {}}};
   renderer._targets = {
     capture(value) { assert.equal(value, target); return entry; },
@@ -517,12 +523,15 @@ function targetFor(renderer, width = 2, height = 2) {
       return () => { assert.equal(active, true); active = false; value.references--; };
     },
     withNativeColorDestination({entry: value, texture: source, depth, colorIndex}, callback) {
-      assert.equal(source, target.texture); assert.equal(depth, false); assert.equal(colorIndex, 0);
+      assert.equal(source, target.textures[colorIndex]); assert.equal(depth, false); assert.ok(textures[colorIndex]);
       this.assertCurrent(value); value.busy = true; value.dirty = true;
-      try { callback(texture); } finally { value.busy = false; }
+      try { callback(textures[colorIndex]); } finally { value.busy = false; }
     },
   };
-  return {target, entry, values: () => [...new Float32Array(texture.data.buffer)]};
+  return {target, entry, values: (index = 0) => {
+    const Type = formats[index].endsWith('uint') ? Uint32Array : formats[index].endsWith('sint') ? Int32Array : Float32Array;
+    return [...new Type(textures[index].data.buffer)];
+  }};
 }
 
 test('public compute-to-target copies preserve compute/copy/draw order without waiting for completion', async () => {
@@ -557,6 +566,46 @@ test('copying compute storage never uploads newer CPU values or needsUpdate rang
   assert.deepEqual(values(), [1, 11, 21, 31]);
   assert.equal(events.filter(e => e[0] === 'upload').length, uploads);
   assert.deepEqual(data.updateRanges, [{start: 0, count: 4}]); renderer.dispose();
+});
+
+test('queued MRT copies capture colorIndex and preserve computed GPU words through pending completion', async () => {
+  const {renderer, device, block, events} = setup(), {target, entry, values} = targetFor(renderer, 2, 2, ['r32float', 'rg32uint']);
+  const data = attribute(new Float32Array([0, 10, 20, 30, 40, 50, 60, 70])), kernel = node([storage(data)], {count: 8});
+  const uploads = events.filter(e => e[0] === 'upload').length, gate = block(), fence = deferred();
+  device.queue.onSubmittedWorkDone = () => fence.promise;
+  const compute = renderer.computeAsync(kernel), options = {colorIndex: 1};
+  data.array.fill(999); data.version++; data.updateRanges = [{start: 0, count: 8}];
+  const copy = renderer.copyStorageBufferToRenderTargetAsync(data, target, options);
+  options.colorIndex = 0; options.width = 1; options.flipY = true;
+  let drawn;
+  const draw = new Promise((resolve, reject) => renderer._enqueue({resolve, reject, issue() { drawn = values(1); }}));
+  gate.open(); await Promise.all([compute, draw]);
+  assert.deepEqual(drawn, [...new Uint32Array(new Float32Array([1, 11, 21, 31, 41, 51, 61, 71]).buffer)]);
+  assert.deepEqual(values(), [0, 0, 0, 0]); assert.equal(entry.references, 1);
+  assert.equal(events.filter(e => e[0] === 'upload').length, uploads + 1, 'only the queued producer uploads its captured CPU version');
+  assert.deepEqual(data.updateRanges, [{start: 0, count: 8}]);
+  fence.resolve(); assert.equal(await copy, true); assert.equal(entry.references, 0); renderer.dispose();
+});
+
+test('nested buffer-to-MRT writes reject overlap with the selected texture and permit an untouched sibling', async () => {
+  const {renderer, events} = setup(), {target, entry, values} = targetFor(renderer, 2, 2, ['r32float', 'r32uint']);
+  const data = attribute(new Float32Array([0, 10, 20, 30])); renderer.compute(node([storage(data)]));
+  let overlap;
+  withThreeNativeCapture(renderer, record => {
+    record(target.textures[1]);
+    overlap = renderer.copyStorageBufferToRenderTargetAsync(data, target, {colorIndex: 1});
+  });
+  await assert.rejects(overlap, {code: 'THREE_NODE_PROGRAM_SHADOW'});
+  assert.equal(events.some(event => event[0] === 'texture-copy'), false); assert.equal(entry.references, 0);
+  let disjoint;
+  withThreeNativeCapture(renderer, record => {
+    record(target.texture);
+    disjoint = renderer.copyStorageBufferToRenderTargetAsync(data, target, {colorIndex: 1});
+  });
+  assert.equal(await disjoint, true);
+  assert.deepEqual(values(), [0, 0, 0, 0]);
+  assert.deepEqual(values(1), [...new Uint32Array(new Float32Array([1, 11, 21, 31]).buffer)]);
+  assert.equal(entry.references, 0); renderer.dispose();
 });
 
 test('public copies reject missing GPU storage and stale target generations', async () => {

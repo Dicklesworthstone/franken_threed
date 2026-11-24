@@ -930,17 +930,18 @@ export function withThreeCompute(Base, THREE) {
       if (onProgress !== null && typeof onProgress !== 'function') fail('OPTIONS', 'onProgress must be a function');
       await submit(this, () => owner(this).compile(list, onProgress), true);
     }
-    /** F3D extension: copy GPU storage bytes into a selected target color mip/layer.
+    /** F3D extension: copy GPU storage bytes into a selected target color/mip/layer.
      * The texture can then be sampled by ordinary scene materials. No CPU
      * readback/re-upload or format conversion; row layout is expressed in bytes.
      * x/y are top-left coordinates; flipY reverses rows within the copied region. */
     async copyStorageBufferToRenderTargetAsync(attribute, target, options = {}) {
       check(this);
-      assertThreeNativeTextureWrite(this, target?.texture);
       if (!attribute || !(attribute.isStorageBufferAttribute || attribute.isStorageInstancedBufferAttribute || attribute.isIndirectStorageBufferAttribute))
         fail('STORAGE', 'Expected a source storage buffer attribute');
       if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected copy options');
-      const destination = this._targets.capture(target), copiedOptions = {...options};
+      const copiedOptions = {...options}, {colorIndex = 0} = copiedOptions;
+      assertThreeNativeTextureWrite(this, (target?.textures ?? [target?.texture])[colorIndex]);
+      const destination = this._targets.capture(target);
       const release = this._targets.retainGeneration(destination);
       try { return await submit(this, () => owner(this).copyToTarget(attribute, destination, copiedOptions)); }
       finally { release(); }
