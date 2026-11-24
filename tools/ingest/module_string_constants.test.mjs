@@ -68,7 +68,7 @@ test('namespace proof respects shadowing, live mutable exports and opaque member
   assert.deepEqual(sites.at(-1).candidates, ['./a.mjs']);
 });
 
-test('mutable, opaque, star, JSON and cyclic selector exports stay unresolved', () => {
+test('mutable, opaque, JSON and unresolved cyclic selector exports stay conservative', () => {
   const cases = [
     [`import {entry} from './config.mjs'; import(entry);`, `export let entry='./a.mjs';`],
     [`import {entry} from './config.mjs'; import(entry);`, `let value='./a.mjs'; export {value as entry};`],
@@ -123,6 +123,142 @@ test('cross-module string analysis keeps recursion, module count and source byte
   assert.equal(result.reads.length, 128);
 });
 
+
+test('star barrels resolve finite strings through aliases and same-binding diamonds', () => {
+  const files = {
+    'config.mjs': `export const entry=(observe(),choose()?'./a.mjs':'./b.mjs');
+      export default './default.mjs';`,
+    'left.mjs': `export * from './config.mjs';`,
+    'right.mjs': `import {entry as selected} from './config.mjs'; export {selected as entry};`,
+    'barrel.mjs': `export * from './left.mjs'; export * from './right.mjs';
+      export * from './config.mjs'; export {default as fallback} from './config.mjs';`,
+  };
+  const {sites, reads} = analyze(`import {entry, fallback} from './barrel.mjs';
+    import * as paths from './barrel.mjs'; const alias=paths; const {entry: picked}=alias;
+    import(entry); import(paths.entry); import(picked); import(fallback); import(paths.default);`, files);
+  assert.deepEqual(sites.map(site => site.candidates), [
+    ['./a.mjs', './b.mjs'], ['./a.mjs', './b.mjs'], ['./a.mjs', './b.mjs'], ['./default.mjs'], undefined,
+  ]);
+  assert.equal(reads.length, 4, 'diamond paths reuse exact module snapshots');
+});
+
+test('star ambiguity is determined by binding identity rather than equal URL values', () => {
+  const files = {
+    'left.mjs': `export const entry='./same.mjs';`,
+    'right.mjs': `export const entry='./same.mjs';`,
+    'ambiguous.mjs': `export * from './left.mjs'; export * from './right.mjs';`,
+    'copied.mjs': `import {entry as original} from './left.mjs'; export const entry=original;`,
+    'copy-barrel.mjs': `export * from './left.mjs'; export * from './copied.mjs';`,
+    'propagated.mjs': `export * from './ambiguous.mjs'; export * from './left.mjs';`,
+  };
+  for (const name of ['ambiguous', 'copy-barrel', 'propagated']) {
+    const {sites} = analyze(`import {entry} from './${name}.mjs';
+      import * as paths from './${name}.mjs'; import(entry); import(paths.entry);`, files);
+    assert.deepEqual(sites.map(site => site.classification), ['nonliteral', 'nonliteral'], name);
+  }
+});
+
+test('explicit exports override star bindings even when their values cannot be proven', () => {
+  const declarations = [
+    `export let entry='./mutable.mjs';`,
+    `export var entry='./mutable.mjs';`,
+    `export function entry() { return './function.mjs'; }`,
+    `export class entry {}`,
+    `export const {nested:{entry}}=opaque();`,
+    `export let [entry]=['./mutable.mjs'];`,
+    `export const [...entry]=['./array.mjs'];`,
+    `export * as entry from './config.mjs';`,
+    `import * as paths from './config.mjs'; export {paths as entry};`,
+  ];
+  for (const declaration of declarations) {
+    const {sites} = analyze(`import {entry} from './barrel.mjs'; import(entry);`, {
+      'config.mjs': `export const entry='./wrong.mjs';`,
+      'barrel.mjs': `${declaration} export * from './config.mjs';`,
+    });
+    assert.equal(sites[0].classification, 'nonliteral', declaration);
+  }
+  const {sites} = analyze(`import {entry} from './barrel.mjs'; import(entry);`, {
+    'left.mjs': `export const entry='./wrong-a.mjs';`,
+    'right.mjs': `export const entry='./wrong-b.mjs';`,
+    'config.mjs': `export const selected='./chosen.mjs';`,
+    'barrel.mjs': `export * from './left.mjs'; export * from './right.mjs';
+      export {selected as entry} from './config.mjs';`,
+  });
+  assert.deepEqual(sites[0].candidates, ['./chosen.mjs']);
+});
+
+test('star cycles find reachable definitions without caching path-dependent misses', () => {
+  const files = {
+    'a.mjs': `export * from './b.mjs'; export * from './config.mjs';`,
+    'b.mjs': `export * from './a.mjs';`,
+    'config.mjs': `export const entry='./a-entry.mjs'; export default './default.mjs';`,
+  };
+  for (const names of [['a', 'b'], ['b', 'a']]) {
+    const {sites} = analyze(`import {entry as first} from './${names[0]}.mjs';
+      import {entry as second} from './${names[1]}.mjs';
+      import * as paths from './a.mjs'; import(first); import(second); import(paths.default); import(paths.missing);`, files);
+    assert.deepEqual(sites.map(site => site.candidates), [['./a-entry.mjs'], ['./a-entry.mjs'], undefined, undefined]);
+  }
+});
+
+test('opaque star sources do not establish absence or erase possible ambiguity', () => {
+  for (const opaque of [
+    `export * from 'https://example.invalid/config.mjs';`,
+    `export * from './missing.mjs';`,
+    `export * from './invalid.mjs';`,
+    `export * from './json.mjs' with {type:'json'};`,
+  ]) {
+    for (const statements of [`export * from './config.mjs'; ${opaque}`, `${opaque} export * from './config.mjs';`]) {
+      const {sites} = analyze(`import {entry} from './barrel.mjs'; import(entry);`, {
+        'config.mjs': `export const entry='./a.mjs';`,
+        'barrel.mjs': statements, 'invalid.mjs': 'export const =;', 'json.mjs': '{"entry":"./b.mjs"}',
+      });
+      assert.equal(sites[0].classification, 'nonliteral', statements);
+    }
+  }
+});
+
+test('star export graphs retain depth and source-count budgets', () => {
+  const chain = Object.fromEntries(Array.from({length: 70}, (_, index) => [`s${index}.mjs`,
+    index === 69 ? `export const entry='./a.mjs';` : `export * from './s${index + 1}.mjs';`]));
+  assert.equal(analyze(`import {entry} from './s0.mjs'; import(entry);`, chain).sites[0].classification, 'nonliteral');
+  const wide = Object.fromEntries(Array.from({length: 129}, (_, index) => [`m${index}.mjs`,
+    index === 128 ? `export const entry='./a.mjs';` : 'export const unrelated=0;']));
+  wide['barrel.mjs'] = Object.keys(wide).map(name => `export * from './${name}';`).join('\n');
+  const result = analyze(`import {entry} from './barrel.mjs'; import(entry);`, wide);
+  assert.equal(result.sites[0].classification, 'nonliteral');
+  assert.equal(result.reads.length, 128);
+});
+
+
+test('star bindings distinguish default expressions, aliases and URL identities', () => {
+  for (const [declaration, expected] of [
+    [`const value='./a.mjs'; export {value as entry}; export default value;`, undefined],
+    [`const value='./a.mjs'; export {value as entry,value as default};`, ['./a.mjs']],
+  ]) {
+    const {sites} = analyze(`import {entry} from './barrel.mjs'; import(entry);`, {
+      'leaf.mjs': declaration, 'left.mjs': `export {entry} from './leaf.mjs';`,
+      'right.mjs': `export {default as entry} from './leaf.mjs';`,
+      'barrel.mjs': `export * from './left.mjs'; export * from './right.mjs';`,
+    });
+    assert.deepEqual(sites[0].candidates, expected);
+  }
+  const {sites} = analyze(`import {entry} from './barrel.mjs'; import(entry);`, {
+    'leaf.mjs': `export const entry='./a.mjs';`,
+    'barrel.mjs': `export * from './leaf.mjs?left'; export * from './leaf.mjs?right';`,
+  });
+  assert.equal(sites[0].classification, 'nonliteral', 'identical bytes at different URLs are distinct module bindings');
+});
+
+
+test('large shallow export patterns remain bounded without argument spreading', () => {
+  const {sites} = analyze(`import {entry} from './barrel.mjs'; import(entry);`, {
+    'barrel.mjs': `export const [${','.repeat(150000)}entry]=[]; export * from './config.mjs';`,
+    'config.mjs': `export const entry='./wrong.mjs';`,
+  });
+  assert.equal(sites[0].classification, 'nonliteral');
+});
+
 function fixture(files) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'f3d-imported-strings-'));
   const source = path.join(root, 'source');
@@ -133,7 +269,7 @@ function fixture(files) {
   return {root, source};
 }
 
-test('normal emitted applications retain imported choices, lazy identity, effects and JSON bytes after relocation', async () => {
+test('normal emitted applications retain star-barrel choices, lazy identity, effects and JSON bytes after relocation', async () => {
   const {root, source} = fixture({
     'index.html': '<script type="module" src="app.mjs"></script>',
     'app.mjs': `import {first, second, config, variant, log} from './relay.mjs';
@@ -144,7 +280,10 @@ test('normal emitted applications retain imported choices, lazy identity, effect
         const json=await import(config,(log.push('options'),{with:{type:'json'}}));
         a.bump(); return {initial,first,second,same:a===again,different:a!==different,
           values:[a.value,b.value,different.value,json.default.value],log:log.slice()};}`,
-    'relay.mjs': `export {first, default as second, config, variant, log} from './config.mjs';`,
+    'relay.mjs': `export * from './middle.mjs'; export * from './config.mjs';
+      export {default as second} from './config.mjs';`,
+    'middle.mjs': `import {first} from './config.mjs'; export {first};
+      export {config, variant, log} from './config.mjs';`,
     'config.mjs': `export const log=[]; export const first=(log.push('config'),'./a.mjs');
       export default './b.mjs'; export const config='./data.json'; export const variant='./a.mjs?other#view';`,
     'a.mjs': `export let value=7; export const bump=()=>++value;`,
