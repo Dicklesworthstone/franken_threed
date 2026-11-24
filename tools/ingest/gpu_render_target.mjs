@@ -282,7 +282,6 @@ export function createGpuRenderTarget(device, options = {}) {
   if (!COLOR_BYTES.has(format) || !DEPTH_BYTES.has(depthFormat))
     fail('FORMAT', 'Unsupported color or depth format');
   if (![1, 4].includes(sampleCount)) fail('SAMPLES', 'Expected one or four samples');
-  const float32 = ['r32float', 'rg32float', 'rgba32float'].includes(format);
   if (colorFormats.some(value => value.includes('32float')) && sampleCount !== 1)
     fail('SAMPLES', 'Float32 color targets currently require one sample');
   if (colorFormats.some(integerColor) && sampleCount !== 1)
@@ -308,8 +307,6 @@ export function createGpuRenderTarget(device, options = {}) {
     fail('UNSUPPORTED', 'Volume targets require one sample');
   if (array && depthArray && sampleDepth && sampleCount !== 1)
     fail('UNSUPPORTED', 'Sampled array depth requires one sample');
-  if (multiple && cube)
-    fail('UNSUPPORTED', 'Cube targets require one color attachment');
   if (cube && sampleCount !== 1)
     fail('UNSUPPORTED', 'Cube targets require one sample');
   if (requestedMipLevels !== undefined && (!Number.isSafeInteger(requestedMipLevels) || requestedMipLevels < 1))
@@ -340,7 +337,7 @@ export function createGpuRenderTarget(device, options = {}) {
   if (volume) dimension(layers);
   depthExtent(width, height);
   if (cube && width !== height) fail('SIZE', 'Cube faces must be square');
-  const historyIndices = new Set(), grownMipColors = new Set();
+  const historyIndices = new Set(), grownMipColors = new Set(), replacedMipLevels = new Map();
   const rendererOptions = Object.freeze({format, depthFormat, sampleCount, ...(multiple ? {colorFormats} : {})});
   let current = null, disposed = false, terminal = null, busy = false, version = 0;
   let validation = Promise.resolve(), retirement = Promise.resolve();
@@ -351,14 +348,15 @@ export function createGpuRenderTarget(device, options = {}) {
     if (!w || !h) return 1;
     const maximum = 1 + Math.floor(Math.log2(Math.max(w, h, volume ? d : 1)));
     if (grownMipColors.has(colorIndex)) return maximum;
-    const requested = colorMipLevelCounts[colorIndex];
+    const requested = replacedMipLevels.get(colorIndex) ?? colorMipLevelCounts[colorIndex];
     if (requested > maximum) fail('SIZE', 'mipLevelCount exceeds the target extent');
     return requested ?? (colorGenerateMipmaps[colorIndex] ? maximum : 1);
   };
   function requireMipFeatures(colorIndices = [...colorFormats.keys()]) {
     if (colorIndices.some(index => integerColor(colorFormats[index])))
       fail('MIP', 'Integer targets require authored mip levels');
-    if (cube && float32 && device.features?.has?.('float32-filterable') !== true)
+    if (cube && colorIndices.some(index => colorFormats[index].includes('32float')) &&
+        device.features?.has?.('float32-filterable') !== true)
       fail('FEATURE', 'Float32 cube mip generation requires float32-filterable on the supplied device');
   }
   const generatedColors = [...colorFormats.keys()].filter(index => colorGenerateMipmaps[index] && levels(width, height, layers, index) > 1);
@@ -652,54 +650,70 @@ export function createGpuRenderTarget(device, options = {}) {
   function growMipmaps(colorIndices) {
     exclusive();
     const plan = mipmapGrowthPlan(colorIndices);
+    plan.mipLevels = colorFormats.map((_, index) => plan.colors.includes(index) ? plan.maximum : current?.colorMipLevelCounts[index]);
+    return replaceColors(plan, true);
+  }
+  function reinitializeCubeColors(colorIndices, mipLevels) {
+    exclusive();
+    const colors = selectedMipColors(colorIndices), maximum = 1 + Math.floor(Math.log2(Math.max(width, height)));
+    if (!cube || historyIndices.size) fail('MIP', 'Color reinitialization requires cube storage without history alternatives');
+    if (!Array.isArray(mipLevels) || mipLevels.length !== colorFormats.length || mipLevels.some((count, index) =>
+      !Number.isSafeInteger(count) || count < 1 || count > maximum || !colors.includes(index) && count !== current?.colorMipLevelCounts[index]))
+      fail('MIP', 'Replacement mip counts must preserve all unselected attachments');
+    const bytes = colors.reduce((sum, index) => sum + colorImageCost(width, height, layers, index, mipLevels[index]), 0);
+    const previousBytes = colors.reduce((sum, index) => sum + colorImageCost(width, height, layers, index, current.colorMipLevelCounts[index]), 0);
+    return replaceColors({colors, bytes, previousBytes, mipLevels}, false);
+  }
+  function replaceColors(plan, preserve) {
     if (!plan.colors.length) return false;
-    if (plan.bytes > maxBytes - allocated()) fail('BUDGET', 'Peak mip growth allocation exceeds maxBytes');
-    if (typeof device.createCommandEncoder !== 'function' || typeof device.queue.submit !== 'function')
+    if (plan.bytes > maxBytes - allocated()) fail('BUDGET', 'Peak color replacement allocation exceeds maxBytes');
+    if (preserve && (typeof device.createCommandEncoder !== 'function' || typeof device.queue.submit !== 'function'))
       fail('DEVICE', 'Mip growth requires a command encoder and queue submission');
     const replacements = new Map();
     let frames;
     busy = true;
     try {
       checked(() => {
-        const encoder = device.createCommandEncoder({label: label + ' mip growth'});
+        const encoder = preserve ? device.createCommandEncoder({label: label + ' mip growth'}) : null;
         for (const index of plan.colors) {
           const attachmentFormat = colorFormats[index];
-          const texture = device.createTexture({label: `${label} color ${index} grown mips`,
+          const texture = device.createTexture({label: `${label} color ${index} replacement`,
             size: {width, height, depthOrArrayLayers: layers}, format: attachmentFormat,
             ...(attachmentFormat.endsWith('-srgb') ? {viewFormats: [attachmentFormat.replace(/-srgb$/, '')]} : {}),
-            dimension: volume ? '3d' : '2d', sampleCount: 1, mipLevelCount: plan.maximum, usage: 1 | 2 | 4 | 16});
+            dimension: volume ? '3d' : '2d', sampleCount: 1, mipLevelCount: plan.mipLevels[index], usage: 1 | 2 | 4 | 16});
           replacements.set(index, texture);
-          for (let level = 0; level < current.colorMipLevelCounts[index]; level++)
+          if (preserve) for (let level = 0; level < current.colorMipLevelCounts[index]; level++)
             encoder.copyTextureToTexture({texture: current.colors[index], mipLevel: level}, {texture, mipLevel: level},
               {width: Math.max(1, Math.floor(width / 2 ** level)), height: Math.max(1, Math.floor(height / 2 ** level)),
                 depthOrArrayLayers: volume ? Math.max(1, Math.floor(layers / 2 ** level)) : layers});
         }
         // Retain every depth view, sibling view and multisample image. Only
         // resolved references to replaced color images need new views.
-        frames = new Map([...current.frames].map(([level, cached]) => {
+        frames = new Map([...current.frames].filter(([level]) => plan.mipLevels.every(count => level < count)).map(([level, cached]) => {
           const rebind = (frame, layer) => {
             const original = frame.resolveTargets ?? (frame.resolveTarget ? [frame.resolveTarget] : frame.colorViews ?? [frame.colorView]);
             const resolved = original.map((view, index) => replacements.has(index)
               ? replacements.get(index).createView({baseMipLevel: level, mipLevelCount: 1,
-                ...(volume ? {dimension: '3d'} : array ? {dimension: '2d', baseArrayLayer: layer, arrayLayerCount: 1} : {})}) : view);
+                ...(volume ? {dimension: '3d'} : cube || array ? {dimension: '2d', baseArrayLayer: layer, arrayLayerCount: 1} : {})}) : view);
             return Object.freeze({...frame, ...(sampleCount === 4
               ? {resolveTarget: resolved[0], ...(multiple ? {resolveTargets: Object.freeze(resolved)} : {})}
               : {colorView: resolved[0], ...(multiple ? {colorViews: Object.freeze(resolved)} : {})})});
           };
-          return [level, array || volume ? Object.freeze(cached.map(rebind)) : rebind(cached, 0)];
+          return [level, cube || array || volume ? Object.freeze(cached.map(rebind)) : rebind(cached, 0)];
         }));
         // Copies follow all prior draw/resolve commands and precede any caller's
         // subsequent generation. Growth itself never synthesizes mip pixels.
-        device.queue.submit([encoder.finish()]);
+        if (encoder) device.queue.submit([encoder.finish()]);
       });
       const previous = {colors: plan.colors.map(index => current.colors[index]), bytes: plan.previousBytes, used: true};
       for (const [index, texture] of replacements) {
         current.mipsDirty.delete(current.colors[index]); current.mipSteps.delete(current.colors[index]);
-        current.colors[index] = texture; current.colorMipLevelCounts[index] = plan.maximum;
-        current.mipsDirty.add(texture); grownMipColors.add(index);
+        current.colors[index] = texture; current.colorMipLevelCounts[index] = plan.mipLevels[index];
+        current.mipsDirty.add(texture);
+        if (preserve) grownMipColors.add(index); else replacedMipLevels.set(index, plan.mipLevels[index]);
       }
       current.color = current.colors[0]; current.mipLevelCount = current.colorMipLevelCounts[0];
-      current.frames = frames; current.layerFrames = array || volume ? frames.get(0) : [frames.get(0)];
+      current.frames = frames; current.layerFrames = cube || array || volume ? frames.get(0) : [frames.get(0)];
       current.frame = current.layerFrames[0];
       current.views = current.frame.resolveTargets ?? (current.frame.resolveTarget ? [current.frame.resolveTarget]
         : current.frame.colorViews ?? [current.frame.colorView]);
@@ -730,7 +744,7 @@ export function createGpuRenderTarget(device, options = {}) {
         : array ? 'Array layer is out of range' : '2D targets require face zero');
     if (mipLevel > 0 && (sampleCount !== 1 || sampleDepth))
       fail('MIP', 'Nonzero mip rendering requires single-sample color and private depth');
-    if (!current || current.frames.has(mipLevel) || depthFormat === null) return 0;
+    if (!current || current.frames.has(mipLevel) || current.mipDepths.has(mipLevel) || depthFormat === null) return 0;
     return Math.max(1, Math.floor(width / 2 ** mipLevel)) * Math.max(1, Math.floor(height / 2 ** mipLevel)) * DEPTH_BYTES.get(depthFormat) * depthLayers;
   }
   function frameAt(mipLevel, bytes, face) {
@@ -739,6 +753,7 @@ export function createGpuRenderTarget(device, options = {}) {
       return cube || array || volume ? frame[face] : frame;
     }
     if (bytes > maxBytes - allocated()) fail('BUDGET', 'Mip depth allocation exceeds maxBytes');
+    const existingDepth = current.mipDepths.get(mipLevel);
     let depth = null;
     try {
       const frame = checked(() => {
@@ -748,7 +763,7 @@ export function createGpuRenderTarget(device, options = {}) {
         const volumeViews = volume ? current.colors.map(color => color.createView({dimension: '3d', baseMipLevel: mipLevel, mipLevelCount: 1})) : null;
         const colorViews = faces.map(view => volumeViews ?? current.colors.map(color => color.createView({baseMipLevel: mipLevel, mipLevelCount: 1, ...view})));
         if (depthFormat !== null) {
-          depth = device.createTexture({label: `${label} mip ${mipLevel} depth`,
+          depth = existingDepth ?? device.createTexture({label: `${label} mip ${mipLevel} depth`,
             size: {width: Math.max(1, Math.floor(width / 2 ** mipLevel)), height: Math.max(1, Math.floor(height / 2 ** mipLevel)), depthOrArrayLayers: depthLayers},
             format: depthFormat, dimension: '2d', sampleCount: 1, mipLevelCount: 1, usage: 1 | 16});
         }
@@ -760,7 +775,7 @@ export function createGpuRenderTarget(device, options = {}) {
       if (depth) current.mipDepths.set(mipLevel, depth);
       current.frames.set(mipLevel, frame); current.bytes += bytes;
       return cube || array || volume ? frame[face] : frame;
-    } catch (error) { depth?.destroy(); throw error; }
+    } catch (error) { if (depth !== existingDepth) depth?.destroy(); throw error; }
   }
   function selectedSlots(colorSlots) {
     const slots = colorSlots ?? colorFormats.map(() => 0);
@@ -941,11 +956,13 @@ export function createGpuRenderTarget(device, options = {}) {
     frameAllocationBytes,
     mipmapGrowthBytes,
     growMipmaps,
+    reinitializeCubeColors,
     reserveColorHistory,
     generateMipmaps(colorIndices, colorSlots = null) {
       exclusive();
-      const selected = selectedMipColors(colorIndices), slots = selectedSlots(colorSlots);
-      if (!current || !selected.some(index => current.mipsDirty.has(colorTexture(current, index, slots)) && current.colorMipLevelCounts[index] > 1)) return false;
+      const requested = selectedMipColors(colorIndices), slots = selectedSlots(colorSlots);
+      const selected = current ? requested.filter(index => current.mipsDirty.has(colorTexture(current, index, slots)) && current.colorMipLevelCounts[index] > 1) : [];
+      if (!selected.length) return false;
       // Missing optional filtering is a retryable admission error, not a failed
       // allocation or submission, and is checked before taking the owner lock.
       requireMipFeatures(selected);

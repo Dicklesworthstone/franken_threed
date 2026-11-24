@@ -1659,8 +1659,18 @@ exist in every attachment, while sampling, uploads, copies and readback can
 select a longer chain on one color. Volume mip extents shrink in XYZ; depth
 attachments retain their independent 2D/array allocation. The added production
 owner/compute recording tests cover these paths, budgets and resize lifetimes;
-they do not extend the browser pixel evidence above. Automatic volume generation,
-cube MRT and WebGL-authored MRT mip pyramids remain excluded.
+they do not extend the browser pixel evidence above. Automatic native volume
+mip generation remains excluded; WebGL-authored MRT follows its separate profile.
+
+Native cube MRT accepts complete cube textures on every color attachment, with
+independent formats, mip counts and captured generation choices across all six
+faces. `CubeCamera`, native node sampling and typed face/mip readback use the
+same target owner. A versioned mip reinitialization replaces only the changed
+color, retaining sibling colors and depth content until their own lifecycle
+changes. Replacement allocations and retiring images share the existing budget.
+Initialized layout/format/identity changes outside that replacement profile fail
+before discarding any existing attachment. The focused source/recording-device
+tests establish these operations, not browser pixel parity or acceleration.
 See [THREE_RENDER_TARGETS.md](./THREE_RENDER_TARGETS.md) for the current profiles.
 
 ## Native mipmapped pass histories

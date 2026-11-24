@@ -373,6 +373,39 @@ Their recognized source resize preserves earlier queued six-face generations and
 charges each until its final consumer completes. Public `setSize()` and
 `dispose()` still invalidate pending uses of their replaced residency.
 
+### Native cube multiple color attachments
+
+Native cube MRT retains independent formats, mip counts, samplers and generation
+flags for every color. Each attachment must be a complete source `CubeTexture`:
+the pinned `CubeRenderTarget` constructor replaces only attachment zero, so its
+`count` option alone does not construct additional cube images. For example:
+
+```js
+const target = new THREE.CubeRenderTarget(128, { generateMipmaps: false });
+const auxiliary = target.texture.clone();
+auxiliary.isRenderTargetTexture = true;
+auxiliary.type = THREE.HalfFloatType;
+target.textures.push(auxiliary);
+```
+
+Every rendered mip must exist in every attachment. Native node sampling and
+typed readback select each color's own pyramid; `CubeCamera` retains all outputs
+across its six face renders. Requested generation touches only selected dirty
+colors with more than one level. A one-level float32 or integer attachment does
+not impose a mip-filtering requirement on a different color.
+
+Versioned mip reinitialization discards only the updated color, preserving sibling
+pixels and private base/mip depth. Replacement and retired images remain charged
+until GPU completion. Pending uses retain the existing reconfiguration boundary.
+Incompatible changes to an initialized MRT's layout, formats or attachment
+identities fail before retiring its storage; dispose the source target before
+reconfiguring those fields. The WebGL cube route remains single-color.
+
+`three_render_target_cube_mrt.test.mjs` compares pinned backend view descriptors,
+source objects, command order and exact transfer bytes. It also exercises target
+lifetimes and allocation budgets. These checks do not establish browser pixel
+parity or hardware performance.
+
 ### Native cube temporal histories
 
 A registered native `PassNode` can retain current and previous cube color images.
@@ -594,8 +627,8 @@ and resize retirement continue to charge every live image to the shared budget.
 The focused array-MRT owner tests check descriptors, command order, sampling
 leases, exact allocation charges, independent history images and retirement.
 They use the existing recording-device fixtures and do not execute mip shaders
-or establish pinned-source pixel equivalence. Cube MRT retains its existing
-admission limit; authored volume MRT levels follow the profile below.
+or establish pinned-source pixel equivalence. Native cube MRT follows the
+single-sample profile above; authored volume MRT levels follow the profile below.
 
 ## Native volume targets and layered transfers
 
