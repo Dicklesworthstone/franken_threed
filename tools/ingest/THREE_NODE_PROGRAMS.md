@@ -2480,8 +2480,12 @@ the builder. The final user releases the shared cache entry. Moving into an
 authored graph retires the prior shared reference, so returning to the ordinary
 profile cannot revive an environment whose source builder has already retired.
 
-The initial sharing profile is opaque, rigid Mesh Standard/Physical materials
-(ordinary or node classes) with float attributes and material-local environments.
+The initial sharing profile includes opaque, rigid Mesh Basic/Toon/Lambert/Phong
+and Standard/Physical materials (ordinary or node classes) with float attributes;
+Standard/Physical also retain material-local environments. Installing a custom
+program key after an ordinary first draw preserves that accepted source graph
+without invoking the new callback early. The next source version/context
+invalidation compares keys, then rebuilds only when the source would do so.
 Authored graph slots, other material maps, analytic lights, scene environments
 or fog, clipping, shadows, deformation, transmission, wireframes and multiview
 retain their existing preparation paths; their cross-material builder-sharing

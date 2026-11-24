@@ -415,8 +415,72 @@ test('custom key effects cannot enter an unsupported geometry setup profile', t 
   assert.equal(f.programs.diagnostics.programs, 0);
 });
 
+
+for (const family of ['Basic', 'Toon', 'Lambert', 'Phong']) for (const node of [false, true])
+test('ordinary ' + family + (node ? 'Node' : '') + ' materials retain source ownership when custom keys are installed after rendering', t => {
+  const f = fixture(t), Material = T['Mesh' + family + (node ? 'Node' : '') + 'Material'];
+  const source = keyedItem(f, new Material()), candidate = keyedItem(f, new Material());
+  const key = function () { this.userData.calls++; return this.userData.variant; };
+  const replacement = function () { this.userData.calls++; return 'replacement:' + this.userData.variant; };
+  for (const item of [source, candidate]) item.material.userData = {calls: 0, variant: 'first'};
+  let reference, descriptor;
+  for (const [label, change, calls, rebuilt] of [
+    ['initial default', () => {}, 0, true],
+    ['install unmarked', material => { material.customProgramCacheKey = key; }, 0, false],
+    ['invalidate installed key', material => { material.needsUpdate = true; }, 2, true],
+    ['unchanged key', material => { material.needsUpdate = true; }, 1, false],
+    ['unmarked value', material => { material.userData.variant = 'second'; }, 0, false],
+    ['invalidate value', material => { material.needsUpdate = true; }, 2, true],
+    ['replace unmarked', material => { material.customProgramCacheKey = replacement; }, 0, false],
+    ['invalidate replacement', material => { material.needsUpdate = true; }, 2, true],
+    ['remove unmarked', material => { delete material.customProgramCacheKey; }, 0, false],
+    ['invalidate removal', material => { material.needsUpdate = true; }, 0, true],
+    ['warm default', () => {}, 0, false],
+  ]) {
+    for (const item of [source, candidate]) { item.material.userData.calls = 0; change(item.material); }
+    f.renderer.info.calls++;
+    const nextReference = f.reference(source), nextDescriptor = f.compile(candidate);
+    assert.equal(source.material.userData.calls, calls, label + ': original source callback count');
+    assert.equal(candidate.material.userData.calls, calls, label + ': candidate callback count');
+    assert.equal(nextReference.object !== reference?.object, rebuilt, label + ': source render-object lifetime');
+    assert.equal(nextDescriptor !== descriptor, rebuilt, label + ': candidate descriptor lifetime');
+    assert.equal(nextDescriptor.vertex, nextReference.state.vertexShader, label + ': source vertex program');
+    assert.equal(nextDescriptor.fragment, nextReference.state.fragmentShader, label + ': source fragment program');
+    assert.equal(f.programs.diagnostics.programs, 1, label + ': previous owner retired');
+    reference = nextReference; descriptor = nextDescriptor;
+  }
+});
+
+for (const family of ['Basic', 'Toon', 'Lambert', 'Phong'])
+test('ordinary ' + family + ' source builders retain independent uniforms and their original disposal boundaries', t => {
+  const f = fixture(t), Material = T['Mesh' + family + 'NodeMaterial'];
+  const a = keyedItem(f, new Material()), b = keyedItem(f, new Material());
+  a.material.color.setRGB(.25, .375, .5); b.material.color.setRGB(.75, .625, .875);
+  const sourceA = f.reference(a), sourceB = f.reference(b), dA = f.compile(a), dB = f.compile(b);
+  assert.equal(sourceA.state, sourceB.state, 'the actual source shares its constructed builder');
+  assert.notEqual(dA, dB, 'each render object owns its draw descriptor');
+  assert.equal(dA.vertex, sourceA.state.vertexShader); assert.equal(dB.fragment, sourceB.state.fragmentShader);
+  const first = f.capture(a, dA), saved = first.uniforms.map(bytes => bytes.slice());
+  assert.ok(values(first).includes(.25)); assert.ok(values(f.capture(b, dB)).includes(.75));
+  b.material.color.setRGB(.875, .25, .625); b.material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(f.reference(b).state, sourceB.state, 'uniform edits preserve source construction');
+  assert.equal(f.compile(b), dB); assert.ok(values(f.capture(b, dB)).includes(.875));
+  assert.deepEqual(first.uniforms, saved, 'later owners do not mutate accepted uniform snapshots');
+  b.object.geometry.dispose(); f.renderer.info.calls++;
+  assert.equal(f.reference(b).state, sourceB.state, 'geometry disposal does not dispose the source material builder');
+  assert.equal(f.compile(b), dB);
+  a.material.dispose(); f.renderer.info.calls++;
+  assert.equal(f.reference(b).state, sourceB.state); assert.equal(f.compile(b), dB);
+  b.object.dispatchEvent({type: 'dispose'}); f.renderer.info.calls++;
+  const nextSource = f.reference(b), next = f.compile(b);
+  assert.notEqual(nextSource.state, sourceB.state); assert.notEqual(next, dB);
+  assert.equal(next.vertex, nextSource.state.vertexShader); assert.equal(next.fragment, nextSource.state.fragmentShader);
+  assert.equal(f.programs.diagnostics.programs, 1, 'only the reconstructed owner remains');
+});
+
 test('late keys on an unshared material require a fresh source construction instead of replaying setup', t => {
-  const f = fixture(t), item = keyedItem(f, new T.MeshBasicNodeMaterial()); f.compile(item);
+  const f = fixture(t), item = keyedItem(f, new T.MeshBasicNodeMaterial());
+  item.material.colorNode = T.TSL.vec3(.25, .5, .75); f.compile(item);
   let calls = 0; item.material.customProgramCacheKey = () => { calls++; return 'late'; };
   assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_MATERIAL_CACHE'}); assert.equal(calls, 0);
   item.material.dispose(); f.renderer.info.calls++; f.compile(item); assert.equal(calls, 1);

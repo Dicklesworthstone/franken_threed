@@ -249,8 +249,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (families.has(prototype)) return prototype;
     return null;
   };
-  // Ordinary rigid PBR materials additionally share source builder state.
-  // Other profiles retain their existing per-object construction owners.
+  // Ordinary opaque Basic/Toon/Lambert/Phong/Standard/Physical materials share
+  // source builder state. Other profiles retain their per-object owners.
   const sharedBuilders = new Map(), builderContexts = new Map();
   const customKeyCache = new WeakMap(), customKeyRecords = new Set();
   const builderCallKeys = new WeakMap(), defaultBuilderCallKeys = new WeakMap(), builderLightNodes = new WeakMap();
@@ -1625,7 +1625,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       : extension
       ? [three.NodeMaterial.prototype, three.MeshBasicNodeMaterial.prototype, three.MeshNormalNodeMaterial.prototype,
         three.MeshMatcapNodeMaterial.prototype, ...litPrototypes, ...primitiveExtensionPrototypes].includes(prototype)
-      : [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(prototype)) ||
+      : [three.MeshBasicNodeMaterial.prototype, three.MeshToonNodeMaterial.prototype,
+        three.MeshLambertNodeMaterial.prototype, three.MeshPhongNodeMaterial.prototype,
+        three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(prototype)) ||
         Object.getPrototypeOf(object) !== three.Mesh.prototype && !instanceExtension && !skinExtension && !batchExtension && !primitiveExtension ||
         object.geometry.isInstancedBufferGeometry && !instancedGeometryExtension ||
         // Morph.js owns the target atlas, influence uniforms and captured
