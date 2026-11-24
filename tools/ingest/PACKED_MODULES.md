@@ -942,6 +942,37 @@ or unexpected browser errors. The source's unsupported morph-animation warning
 is preserved; this is retained loader functionality, without a performance or
 complete loader-family claim.
 
+## 3DS models and material textures
+
+Finite pinned `TDSLoader.load()` and `loadAsync()` requests now package the
+original 3DS model and its diffuse, bump, opacity and specular image resources.
+Named imports, aliases and addon-aggregate imports use the same resource closure.
+The default texture path is captured when loading starts; a finite
+`setResourcePath()` change remains live while the response is pending. Image
+URLs keep the source's literal prefix concatenation, including leading slashes,
+absolute-looking names and query/fragment identity.
+
+A bounded metadata reader visits only the source-supported root, mesh-data,
+material and texture-map chunks. It preserves byte-valued, NUL-terminated names,
+every distinct duplicate map-name request, and the native reader's tolerance for
+names extending past a declared chunk end. Unknown chunks are opaque. Byte,
+chunk and string-work limits, including non-advancing chunks, fail explicitly
+with `TDS_BUDGET`. The original model bytes, geometry/material parser, runtime
+`parse()`, image loaders and malformed-input errors remain source-owned. Custom
+managers, dynamic paths and modified or escaping loader instances retain their
+existing host routes.
+
+`three_tds_loader_assets.test.mjs` compares the retained source with a relocated
+HTTP deployment and a packed application after source/build directories become
+unavailable. The fixtures include a four-map triangle and the pinned portalgun
+example, whose separately authored normal map follows the example's ordinary
+`TextureLoader` path. Exact positions, indices, UVs, material-map settings,
+callbacks, progress, independent reloads, runtime parsing and native parse
+errors match; all 18 image requests preserve their original bytes, and packed
+execution rejects non-embedded requests. The Node host supplies image completion
+without decoding PNG/JPEG pixels, so this establishes retained-loader packaging,
+not browser image-decoder, rendering or performance parity.
+
 ## FBX scenes, textures and animation
 
 Finite pinned `FBXLoader.load()` and `loadAsync()` requests now package their
