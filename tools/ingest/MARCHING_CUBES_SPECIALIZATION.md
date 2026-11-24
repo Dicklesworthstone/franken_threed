@@ -84,6 +84,31 @@ native/fallback calls from the existing polygonizer counters. No public Three.js
 exports or function wrappers are added, and source-tree imports and split chunks
 use the same compiler-owned ownership registry.
 
+## Closed ball loops
+
+The same opt-in can batch a closed application loop of `addBall` calls into one
+Wasm field transaction. Scalar preparation preserves the source expressions and
+native Math calls; the original loop remains available when its assumptions no
+longer hold. Both the pinned package core and source-module `Color` imports can
+use this path, including ordinary re-exports of the genuine color-management
+object. Default colors and witnessed Color palettes keep their numeric values,
+public arrays and synchronous publication behavior.
+
+The compiler records the pinned `ColorManagement` object at its literal
+allocation and checks the actual live imported binding before each batch. Color
+registration defers that import read until invocation, preserving legal module
+initialization cycles. Modified dependency source, changed conversion methods,
+accessors and proxy replacements retain the original loop. Unknown dependency
+identities are rejected before property inspection, so a Proxy receives no
+extra speculative traps. Restoring an admitted binding or method permits later
+native calls again.
+
+`marching_cubes_source_colors.test.mjs` builds and relocates actual source-module
+bundles, comparing their real Wasm output with unspecialized pinned modules. It
+covers default/palette loops, conversion observers and recovery, re-exports,
+module cycles, modified source, proxies and changing live bindings. These are
+execution and equivalence checks, not a measured speedup claim.
+
 ## Validation scope
 
 Run `node --test tools/ingest/marching_cubes_adapter.test.mjs` after installing

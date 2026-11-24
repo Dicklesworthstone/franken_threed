@@ -12,6 +12,7 @@ const MARCHING_CUBES_PIN='148ef33ecb6d2502ff796d4554abd1549c95d519';
 export const MARCHING_CUBES_SOURCE_BLOB='29a405be3eae30a7e2b1ff04827068921d31d5dc';
 export const EVENT_DISPATCHER_SOURCE_BLOB='ac793ea9081486b1b1e834c9df2480d18fb90e0c';
 export const COLOR_SOURCE_BLOB='f42d664478a6952dd1889eebc9a16736a2c614ab';
+export const COLOR_MANAGEMENT_SOURCE_BLOB='b4c1bd94f81a5852e83b01ae9557f1944e55068e';
 const MATERIAL_SOURCE_BLOB='fe5bca948033d5f3fa5f8125d9ea2752430acde7';
 const SHADER_MATERIAL_SOURCE_BLOB='f557ef1aa2250b4c721c0dda132406b897ecc3ae';
 // Checked-in pinned build, also recorded in evidence/01.1/build_sha256.txt.
@@ -121,13 +122,14 @@ export function specializeMarchingCubesBase(source,{
   const hash=sourceBlob(source),defaultPin=expectedBlob===EVENT_DISPATCHER_SOURCE_BLOB;
   const core=defaultPin && createHash('sha256').update(source).digest('hex')===CORE_BUILD_SHA256;
   const colorSource=defaultPin && hash===COLOR_SOURCE_BLOB;
+  const managementSource=defaultPin && hash===COLOR_MANAGEMENT_SOURCE_BLOB;
   const materialSource=defaultPin && hash===MATERIAL_SOURCE_BLOB;
   const shaderSource=defaultPin && hash===SHADER_MATERIAL_SOURCE_BLOB;
-  if (hash!==expectedBlob && !core && !colorSource && !materialSource && !shaderSource) return {changed:false,code:source};
+  if (hash!==expectedBlob && !core && !colorSource && !managementSource && !materialSource && !shaderSource) return {changed:false,code:source};
   const ast=parse(source),register=fresh(source,'register'),registerPrototype=fresh(source,'material_prototype');
-  const registerBallColor=fresh(source,'ball_color');
+  const registerBallColor=fresh(source,'ball_color'),registerManagement=fresh(source,'color_management');
   const edits=[],registeredClasses=[],registeredPrototypes=[];
-  if (!colorSource && !materialSource && !shaderSource) {
+  if (!colorSource && !managementSource && !materialSource && !shaderSource) {
     const base=ast.body.find(node=>node.type==='ClassDeclaration' && node.id?.name==='EventDispatcher');
     if (!base || base.superClass || base.body.body.some(node=>node.kind==='constructor')) throw new TypeError('Expected verified default base constructor');
     edits.push({at:base.body.start+1,text:`\nconstructor() { ${register}(this); }\n`});
@@ -141,7 +143,14 @@ export function specializeMarchingCubesBase(source,{
     // the true allocation BEFORE that call, never the returned identity.
     edits.push({at:ctor.body.start+1,text:`\n${register}(this);\n`});
     registeredClasses.push('Color');
-    if(core)edits.push({at:color.end,text:`\n${registerBallColor}(Color,ColorManagement);\n`});
+    edits.push({at:color.end,text:`\n${registerBallColor}(Color,()=>ColorManagement);\n`});
+  }
+  if(core || managementSource) {
+    const factory=ast.body.find(node=>node.type==='FunctionDeclaration' && node.id?.name==='createColorManagement');
+    const literal=factory?.body.body.find(node=>node.type==='VariableDeclaration' &&
+      node.declarations[0]?.id.name==='ColorManagement')?.declarations[0].init;
+    if(literal?.type!=='ObjectExpression')throw new TypeError('Missing verified ColorManagement allocation');
+    edits.push({at:literal.start,text:`${registerManagement}(`},{at:literal.end,text:')'});
   }
   const prototypeClasses=core?['EventDispatcher','Material','ShaderMaterial']:
     materialSource?['Material']:shaderSource?['ShaderMaterial']:
@@ -160,7 +169,8 @@ export function specializeMarchingCubesBase(source,{
   const imports=[];
   if(registeredClasses.length)imports.push(`registerMarchingCubesObject as ${register}`);
   if(registeredPrototypes.length)imports.push(`registerMarchingCubesMaterialPrototype as ${registerPrototype}`);
-  if(core)imports.push(`registerMarchingCubesBallColorClass as ${registerBallColor}`);
+  if(core || colorSource)imports.push(`registerMarchingCubesBallColorClass as ${registerBallColor}`);
+  if(core || managementSource)imports.push(`registerMarchingCubesBallManagement as ${registerManagement}`);
   const header=`import { ${imports.join(', ')} } from ${JSON.stringify(runtimeModule)};\n`;
   return {changed:true,registeredClasses,registeredPrototypes,code:header+code,header,
     edits:edits.map(edit=>({start:edit.at,end:edit.at,text:edit.text}))};

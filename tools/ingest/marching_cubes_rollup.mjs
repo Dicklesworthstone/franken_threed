@@ -86,7 +86,7 @@ export function marchingCubesRollupPlugin(options={}) {
       }
       const edits=[],headers=[];let tail='';
       if (code.includes('class EventDispatcher') || code.includes('class Color') ||
-          code.includes('class Material') || code.includes('class ShaderMaterial')) {
+          code.includes('class Material') || code.includes('class ShaderMaterial') || code.includes('function createColorManagement')) {
         const base=specializeMarchingCubesBase(code,{runtimeModule:ADAPTER});
         if (base.changed) {
           if (base.registeredClasses.includes('EventDispatcher')) registrations++;

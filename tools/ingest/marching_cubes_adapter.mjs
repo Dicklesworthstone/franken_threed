@@ -37,7 +37,7 @@ function platformIntact() {
   return true;
 }
 const objects={has:isNumericObject},dispatches=new WeakMap(),updates=new WeakMap(),fieldUpdates=new WeakMap();
-const ballOwners=new WeakMap(),ballColors=new WeakMap(),ballRecipes=new WeakMap(),ballArrays=new WeakSet(),ballUpdates=new WeakMap();
+const ballOwners=new WeakMap(),ballColors=new WeakMap(),ballManagements=new WeakMap(),ballRecipes=new WeakMap(),ballArrays=new WeakSet(),ballUpdates=new WeakMap();
 const F64=Float64Array,functionPrototype=Function.prototype,objectPrototype=Object.prototype;
 const functionSource=Function.prototype.toString,instanceCheck=data(functionPrototype,Symbol.hasInstance);
 const mathObject=data(globalThis,'Math'),ballMath=new Map();
@@ -166,12 +166,19 @@ export function marchingCubesDiagnostics(object) {
     initialized:dispatch?.attempted??false,kernel:dispatch?.kernel?.diagnostics??null,fieldKernels,ballLoops});
 }
 
-/** The complete core hash proves both Color and its ColorManagement closure.
- * Source-tree Color without that dependency proof keeps ordinary addBall calls. */
-export function registerMarchingCubesBallColorClass(Class,management) {
+/** Emitted around the pinned ColorManagement literal before its initialization
+ * can invoke imported code. Only this freshly allocated identity authorizes
+ * inspecting the resolved dependency, including through source re-exports. */
+export function registerMarchingCubesBallManagement(management) {
+  ballManagements.set(management,{convert:data(management,'convert'),toWorking:data(management,'colorSpaceToWorking')});
+  return management;
+}
+/** Resolve the actual live import only when the application calls addBall.
+ * Reading it at class evaluation would introduce a new TDZ failure in a cycle.
+ * The emitted resolver contains only that lexical read, never an application call. */
+export function registerMarchingCubesBallColorClass(Class,resolveManagement) {
   const proto=data(Class,'prototype');
-  ballColors.set(Class,{Class,proto,management,set:data(proto,'set'),setRGB:data(proto,'setRGB'),
-    convert:data(management,'convert'),toWorking:data(management,'colorSpaceToWorking')});
+  ballColors.set(Class,{Class,proto,resolveManagement,set:data(proto,'set'),setRGB:data(proto,'setRGB')});
 }
 export function attachMarchingCubesBallBatch(token,base64,resolveMath) {
   const record=dispatches.get(token);
@@ -195,11 +202,17 @@ function ballPlatform(recipe) {
 }
 function ballColorIntact(record) {
   if(!record)return false;
-  const {Class,proto,management}=record;
+  const {Class,proto}=record;
+  let management;
+  try{management=record.resolveManagement();}catch{return false;}
+  const source=ballManagements.get(management);
+  // No property/prototype inspection of a redirected object or Proxy, even
+  // when its underlying source module was otherwise recognized.
+  if(!source)return false;
   if(data(Class,'prototype')!==proto||prototype(Class)!==functionPrototype||prototype(proto)!==objectPrototype||
     descriptor(Class,Symbol.hasInstance)||data(functionPrototype,Symbol.hasInstance)!==instanceCheck||
     data(proto,'set')!==record.set||data(proto,'setRGB')!==record.setRGB||
-    data(management,'convert')!==record.convert||data(management,'colorSpaceToWorking')!==record.toWorking||
+    data(management,'convert')!==source.convert||data(management,'colorSpaceToWorking')!==source.toWorking||
     !own(management,'workingColorSpace')||!own(management,'enabled'))return false;
   // Fresh Color assignments must neither call inherited setters nor throw on
   // a nonwritable inherited slot. The two inspected prototypes are witnessed.
