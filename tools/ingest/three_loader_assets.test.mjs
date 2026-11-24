@@ -10,6 +10,7 @@ import { parse } from "acorn";
 import { buildApplication } from "./build_application.mjs";
 import { packHtml } from "./pack_html.mjs";
 import { collectThreeLoaderAssets, findThreeLoaderRequests } from "./three_loader_assets.mjs";
+import { createImportedStringResolver } from "./module_string_constants.mjs";
 import { fbxResources, fbxPixel } from "./fixtures/fbx_resources.mjs";
 import { colladaAssetUris } from "./pack_collada.mjs";
 import { prepareUsdAssetUris } from "./pack_usd.mjs";
@@ -87,6 +88,33 @@ test("private resource tables close loader files, model sidecars, cube faces and
   ]);
   assert.deepEqual(requests.filter(({loader}) => loader === 'GLTFLoader').map(({resourcePath}) => resourcePath),
     ['shared/', 'shared/']);
+});
+
+
+test("imported primitive resources close loader paths and codecs while mutable or opaque values stay host-owned", () => {
+  const files={
+    'file:///app/config.mjs': `export const root='models/';export const sidecars='shared/';export const codec='draco/';
+      export const model=choose()?'first.gltf':'second.gltf';export const file=(observe(),'data.bin');
+      export let changing='mutable.bin';export const object={file:'object.bin'};`,
+    'file:///app/relay.mjs': `export {file as selected,model,codec} from './config.mjs';`,
+  };
+  const imported=createImportedStringResolver({readModule:url=>files[url],
+    resolveModule:(specifier,from)=>new URL(specifier,from).href});
+  const options={resolveImportedString:imported('file:///app/main.mjs')};
+  const requests=discover(`import {FileLoader} from 'three';import * as paths from './config.mjs';
+    import {selected,model,codec} from './relay.mjs';
+    import {GLTFLoader} from ${JSON.stringify(gltfUrl)};import {DRACOLoader} from ${JSON.stringify(dracoUrl)};
+    new FileLoader().setPath(paths.root).load(selected);
+    const decoder=new DRACOLoader().setDecoderPath(codec);
+    new GLTFLoader().setDRACOLoader(decoder).setPath(paths.root).setResourcePath(paths.sidecars).loadAsync(model);`,options);
+  assert.deepEqual(requests.map(({url})=>url),['models/data.bin','models/first.gltf','models/second.gltf',
+    'draco/draco_wasm_wrapper.js','draco/draco_decoder.wasm','draco/draco_decoder.js']);
+  assert.deepEqual(requests.filter(({loader})=>loader==='GLTFLoader').map(({resourcePath})=>resourcePath),['shared/','shared/']);
+  assert.deepEqual(discover(`import {FileLoader} from 'three';import * as paths from './config.mjs';
+    new FileLoader().load(paths.changing);new FileLoader().load(paths.object.file);
+    new FileLoader(manager).load(paths.file);
+    const loader=new FileLoader();expose(loader);loader.load(paths.file);
+    function shadow(paths){new FileLoader().load(paths.file)}`,options),[]);
 });
 
 test("loader resource tables keep mutations, escapes, shadowing and unknown selections on the host route", () => {
@@ -1119,7 +1147,7 @@ test("rooted glTF sidecars preserve pinned LoaderUtils path concatenation", asyn
   assert.deepEqual(assets.get("shared/geometry.bin").source, geometry);
 });
 
-test("rooted nested-page loaders retain model sidecars and relative resources after site and standalone relocation", async t => {
+test("rooted nested-page loaders retain imported resource configuration after site and standalone relocation", async t => {
   const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
   const model = JSON.stringify({
     asset: {version: "2.0"}, scene: 0, scenes: [{nodes: [0]}], nodes: [{mesh: 0}],
@@ -1133,12 +1161,16 @@ test("rooted nested-page loaders retain model sidecars and relative resources af
     "models/triangle.gltf": model, "shared/geometry #.bin": Buffer.from(positions.buffer),
   };
   const root = fixture({"pages/demo.html": '<script type="module" src="/modules/app.mjs"></script>', ...resources,
+    "config/paths.mjs": `export const root='/resources/',local='resources/',models='/models/',sidecars='/shared/';
+      export const name='message%20%23.txt?edition=2#part',localName='local.txt?edition=4',model='triangle.gltf?version=3#scene';`,
+    "config/relay.mjs": `export {name as selected} from './paths.mjs';`,
     "modules/app.mjs": `import {FileLoader} from ${JSON.stringify(coreUrl)};
       import {GLTFLoader} from ${JSON.stringify(gltfUrl)};
+      import * as paths from '../config/paths.mjs';import {selected} from '../config/relay.mjs';
       export async function load() {
-        const text = await new FileLoader().setPath('/resources/').loadAsync('message%20%23.txt?edition=2#part');
-        const relative = await new FileLoader().setPath('resources/').loadAsync('local.txt?edition=4');
-        const gltf = await new GLTFLoader().setPath('/models/').setResourcePath('/shared/').loadAsync('triangle.gltf?version=3#scene');
+        const text = await new FileLoader().setPath(paths.root).loadAsync(selected);
+        const relative = await new FileLoader().setPath(paths.local).loadAsync(paths.localName);
+        const gltf = await new GLTFLoader().setPath(paths.models).setResourcePath(paths.sidecars).loadAsync(paths.model);
         return {text, relative, positions: [...gltf.scene.children[0].geometry.attributes.position.array]};
       }`,
   });

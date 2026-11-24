@@ -145,7 +145,7 @@ function relativeUrl(value) {
 }
 
 /** Returns finite load requests, following lexical const bindings without guessing names. */
-export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, onDefaultManagerExposure, onManagerConstructorExposure, moduleUrl, source } = {}) {
+export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, onDefaultManagerExposure, onManagerConstructorExposure, moduleUrl, source, resolveImportedString = null } = {}) {
   const root = packageRootUrl ? canonicalUrl(packageRootUrl).replace(/\/?$/, "/") : PINNED_ROOT;
   const currentModule = moduleUrl ? canonicalUrl(moduleUrl) : null;
   // This exact retained module only reads the default manager as the fallback
@@ -294,7 +294,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
   // Use the same bounded lexical/ownership proof as module, fetch and worker
   // closure. Discover possible resource strings without folding their reads,
   // selector effects or TDZ failures out of the retained loading expression.
-  const classifyString = createDynamicImportClassifier(ast);
+  const classifyString = createDynamicImportClassifier(ast, resolveImportedString);
   const finite = node => {
     const value = classifyString(node);
     return value.classification === "literal" ? [value.specifier] :

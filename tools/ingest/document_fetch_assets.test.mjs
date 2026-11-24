@@ -8,6 +8,7 @@ import test from 'node:test';
 import {pathToFileURL} from 'node:url';
 import {Worker} from 'node:worker_threads';
 import {analyzeDocumentFetch, collectDocumentFetchAssets} from './document_fetch_assets.mjs';
+import {createImportedStringResolver} from './module_string_constants.mjs';
 import {buildApplication} from './build_application.mjs';
 import {packHtml} from './pack_html.mjs';
 
@@ -348,5 +349,101 @@ test('packing refuses Request replacement in other document modules or classic s
       'shim.mjs': shim, 'data.json': '{}'});
     assert.throws(() => packHtml(f.entry, f.packed), {code: 'FETCH_URL'});
     assert.equal(fs.existsSync(f.packed), false);
+  }
+});
+
+test('imported document resources retain native responses, effects and document bases after relocation and packing', async () => {
+  const f = fixture({
+    'index.html': '<script type="module" src="src/main.mjs"></script>',
+    'src/main.mjs': `import {selected, log} from '../config/relay.mjs';
+      import * as paths from '../config/paths.mjs';
+      export async function run(){const initial=log.slice();
+        async function load(flag){const uri=flag?selected:paths.default;
+          const response=await fetch(new Request((log.push('url'),uri),
+            (log.push('options'),{method:'GET'})));
+          const copy=response.clone();return {uri,value:await response.json(),raw:await copy.text()};}
+        const left=await load(true),right=await load(false);
+        const raw=await(await fetch(paths.raw)).text();
+        const wasm=await WebAssembly.instantiateStreaming(fetch(paths.wasm));
+        return {initial,left,right,raw,wasm:wasm.instance.exports.run(),log:log.slice()};}`,
+    'config/relay.mjs': `export {first as selected, log} from './paths.mjs';`,
+    'config/paths.mjs': `export const log=[];export const first=(log.push('configuration'),'data/left.json?v=1#selected');
+      export default 'data/right.json';export const raw='raw/body.txt';export const wasm='kernel.wasm';`,
+    'data/left.json': '{"value":42}', 'data/right.json': '{"value":7}',
+    'raw/body.txt': 'document-relative imported bytes',
+    'kernel.wasm': Buffer.from('0061736d010000000105016000017f030201000707010372756e00000a06010400412a0b', 'hex'),
+  });
+  const directFile=path.join(f.root,'direct.html');
+  packHtml(f.entry,directFile);
+  const direct=application(fs.readFileSync(directFile,'utf8'),f.source);
+  const built=await buildApplication(f.entry,f.out);
+  for(const name of ['data/left.json','data/right.json','raw/body.txt','kernel.wasm'])
+    assert.deepEqual(fs.readFileSync(path.join(f.out,name)),fs.readFileSync(path.join(f.source,name)));
+  const referenceHost=await host(f.source);
+  let expected;
+  try { expected=await execute({...application(fs.readFileSync(f.entry,'utf8'),f.source),base:referenceHost.base}); }
+  finally { await referenceHost.close(); }
+  fs.renameSync(f.source,path.join(f.root,'source-unavailable'));
+  const relocated=path.join(f.root,'relocated');fs.renameSync(f.out,relocated);
+  const builtEntry=path.join(relocated,built.htmlFile),builtHost=await host(relocated);
+  try {
+    assert.deepEqual(await execute({...application(fs.readFileSync(builtEntry,'utf8'),relocated),base:builtHost.base}),expected);
+  } finally { await builtHost.close(); }
+  packHtml(builtEntry,f.packed);
+  const packed=application(fs.readFileSync(f.packed,'utf8'),relocated);
+  fs.renameSync(relocated,path.join(f.root,'build-unavailable'));
+  assert.deepEqual(await execute(direct),expected);
+  assert.deepEqual(await execute(packed),expected);
+  assert.deepEqual(expected.initial,['configuration']);
+  assert.deepEqual(expected.log,['configuration','url','options','url','options']);
+  assert.equal(expected.left.uri,'data/left.json?v=1#selected');
+  assert.equal(expected.left.value.value,42);assert.equal(expected.right.value.value,7);
+  assert.equal(expected.raw,'document-relative imported bytes');assert.equal(expected.wasm,42);
+});
+
+test('retained inline and scoped modules copy imported fetch resources from the same frontend snapshot', async () => {
+  const f=fixture({
+    'index.html': `<script type="importmap">{"imports":{"settings":"./config/default.mjs"},
+      "scopes":{"./src/":{"settings":"./config/scoped.mjs"}}}</script>
+      <script type="module">import {resource} from 'settings';
+        export const open=name=>import(name);globalThis.loadInline=()=>fetch(resource);</script>
+      <script type="module" src="src/main.mjs"></script>`,
+    'src/main.mjs': `import {resource} from 'settings';
+      export const open=name=>import(name);export const load=()=>fetch(resource);`,
+    'config/default.mjs': `export const resource: string='data/default.json';`,
+    'config/scoped.mjs': `export const resource: string='data/scoped.json';`,
+    'data/default.json': '{"scope":"document"}','data/scoped.json': '{"scope":"module"}',
+  });
+  const seen=[];
+  await buildApplication(f.entry,f.out,{transformModule(source,{url}){
+    seen.push(url);return source.includes('resource: string')?source.replace('resource: string','resource'):null;
+  }});
+  for(const name of ['data/default.json','data/scoped.json'])
+    assert.deepEqual(fs.readFileSync(path.join(f.out,name)),fs.readFileSync(path.join(f.source,name)));
+  assert.match(fs.readFileSync(path.join(f.out,'src/main.mjs'),'utf8'),/import\(name\)/);
+  assert.match(fs.readFileSync(path.join(f.out,'config/scoped.mjs'),'utf8'),/const resource=/);
+  assert.equal(seen.filter(url=>url.endsWith('/config/scoped.mjs')).length,1);
+});
+
+test('imported fetch discovery admits only proved primitive strings and preserves request guards', () => {
+  const files={
+    'file:///app/config.mjs': `export const first=(observe(),'data/first.json');export default 'data/second.json';
+      export let changing='mutable.json';export const object={entry:'object.json'};`,
+    'file:///app/relay.mjs': `export {first as selected} from './config.mjs';`,
+  };
+  const imported=createImportedStringResolver({readModule:url=>files[url],
+    resolveModule:(specifier,from)=>new URL(specifier,from).href});
+  const options={resolveImportedString:imported('file:///app/main.mjs')};
+  const source=`import {selected} from './relay.mjs';import * as paths from './config.mjs';
+    function load(flag){const uri=flag?selected:paths.default;return fetch(new Request(uri));}
+    fetch(paths.changing);fetch(paths.object.entry);fetch(paths[unknown]);
+    function shadow(selected){return fetch(selected)}`;
+  assert.deepEqual(analyzeDocumentFetch(source,options).sites.map(site=>site.candidates),
+    [['data/first.json','data/second.json']]);
+  assert.deepEqual(analyzeDocumentFetch(source).sites,[]);
+  for(const suffix of ["fetch(selected,{method:'POST'})","fetch(new Request(selected,{method:'POST'}))",
+    "globalThis.fetch=other;fetch(selected)","globalThis.Request=Other;fetch(new Request(selected))"]) {
+    const sites=analyzeDocumentFetch(`import {selected} from './relay.mjs';${suffix}`,options).sites;
+    assert.equal(sites.length,1);assert.equal(sites[0].admitted,false,suffix);
   }
 });

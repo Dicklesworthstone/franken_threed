@@ -463,7 +463,7 @@ export function f3dRollupPlugin(options = {}) {
 
       if (ast) {
         if (options.documentUrl && code.includes("fetch"))
-          documentFetchSites.push(...analyzeDocumentFetch(ast).sites);
+          documentFetchSites.push(...analyzeDocumentFetch(ast, {resolveImportedString: importedStrings(referrerUrl)}).sites);
         const classifyImport = createDynamicImportClassifier(ast, importedStrings(referrerUrl));
         const inspectorImports = new Map(analysis.dynamicImports.filter(request => request.runtime_fallback === true)
           .map(request => [request.source_span.start.offset, request]));
@@ -478,7 +478,7 @@ export function f3dRollupPlugin(options = {}) {
               node.specifiers.some(specifier => specifier.type === "ImportNamespaceSpecifier") ||
               ["ExportNamedDeclaration", "ExportAllDeclaration"].includes(node.type) && node.source))) {
           const requests = findThreeLoaderRequests(ast, {
-            moduleUrl: id, source: code,
+            moduleUrl: id, source: code, resolveImportedString: importedStrings(referrerUrl),
             resolveModule: (specifier) => resolveModuleSpecifier(specifier, referrerUrl, importMap, {
               target, mapBaseUrl, documentRoot, packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources,
             }),

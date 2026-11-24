@@ -24,9 +24,9 @@ export const isRelativeDocumentFetchUrl = value => Boolean(value.trim()) &&
 export const isLocalDocumentFetchUrl = (value, {documentRoot = null} = {}) =>
   isRelativeDocumentFetchUrl(value) || Boolean(documentRoot && isRootRelativeDocumentUrl(value));
 
-export function analyzeDocumentFetch(source, {sourceType = 'module'} = {}) {
+export function analyzeDocumentFetch(source, {sourceType = 'module', resolveImportedString = null} = {}) {
   const ast = typeof source === 'string' ? acorn.parse(source, {ecmaVersion: 'latest', sourceType}) : source;
-  const ancestors = new WeakMap(), cache = new WeakMap(), classify = createDynamicImportClassifier(ast);
+  const ancestors = new WeakMap(), cache = new WeakMap(), classify = createDynamicImportClassifier(ast, resolveImportedString);
   walk.fullAncestor(ast, (node, _state, parents) => ancestors.set(node, parents.slice()));
   const bound = (node, name) => isIdentifierShadowedAtAncestors(name, ancestors.get(node) ?? [ast, node], cache);
   const host = node => node?.type === 'Identifier' && hosts.has(node.name) && !bound(node, node.name);

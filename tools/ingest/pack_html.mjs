@@ -590,7 +590,9 @@ export function packHtml(
     } catch (error) {
       fail("SCRIPT_PARSE", `${from}: ${error.message}`);
     }
-    const documentFetch = worker ? {sites: []} : analyzeDocumentFetch(ast);
+    const documentFetch = worker ? {sites: []} : analyzeDocumentFetch(ast, {
+      resolveImportedString: sourceType === "module" ? importedStrings(from) : null,
+    });
     const documentFetchSites = new Map(documentFetch.sites.map(site => [site.node, site]));
     documentFetchMutated ||= Boolean(documentFetch.hostMutated);
     documentRequestMutated ||= Boolean(documentFetch.requestMutated);

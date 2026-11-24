@@ -460,16 +460,27 @@ per build pass, with a combined depth of at most 64 local aliases/export hops. I
 configuration modules. Namespace aliases and simple object destructuring may
 select proved primitive exports without evaluating configuration code. Runtime
 member/key reads and effects stay intact; a namespace's exported objects are not
-assumed immutable. Unknown keys, star reexports, mutable bindings,
-opaque values, JSON/CommonJS imports and unresolved external modules do not prove
-a finite selector. Ordinary worker graphs share this proof for lazy imports,
+assumed immutable. Unambiguous export-star chains use the same primitive export
+proof; star exports do not forward a default export. Ambiguous bindings, missing
+or unreadable star targets, and unresolved external branches remain conservative.
+Unknown keys, mutable bindings, opaque values, JSON/CommonJS imports and
+unresolved external modules do not prove a finite selector. Ordinary worker graphs share this proof for lazy imports,
 worker entries, fetch requests, module-relative URL assets and nested worker
 constructors. Document worker configuration uses the document import map; imports
 inside worker graphs retain their independent package resolution. Imported URL
 strings keep their original values and resolve at the consuming document, worker
 realm or module boundary. Inspected configuration files are watched, and each
-build refreshes the selector cache before discovering worker outputs. Other
-loader/document-fetch discovery keeps its existing selector requirements.
+build refreshes the selector cache before discovering worker outputs.
+
+The same primitive-string proof also discovers document `fetch()`/native
+`Request` resources and Three loader URLs, paths, model sidecars and codec
+directories. Bundled and retained document modules use the same import-map,
+package and frontend source snapshot. Configuration imports resolve from the
+consuming module; the resulting fetch/loader strings still resolve from the
+document base and the loader's source path rules. Directly packed document fetches map only the request operand;
+build-then-pack loader resources use the existing finite resource table. Selectors, configuration effects, callback ordering and native response
+handling stay source-owned. Mutable exports, exported objects, custom managers
+and unproved requests keep their existing conservative host boundaries.
 
 Parameters, mutable bindings, unproved imported values, opaque property/call results,
 array patterns, rest/default/nested/computed patterns and escaped tables are

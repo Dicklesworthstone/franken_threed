@@ -48,7 +48,8 @@ import { normalizeSpecifierKey, resolveModuleSpecifier, urlToFilePath } from "./
 import { buildModuleGraph } from "./module_graph.mjs";
 import { IngestionParseError } from "./types.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
-import { assertUnbundledModule } from "./commonjs_modules.mjs";
+import { assertUnbundledModule, commonjsFormat } from "./commonjs_modules.mjs";
+import { createImportedStringResolver } from "./module_string_constants.mjs";
 import { moduleWorkerRollupPlugin, workerGlobalBindings } from "./module_workers.mjs";
 import { analyzeDocumentFetch, collectDocumentFetchAssets } from "./document_fetch_assets.mjs";
 import { gltfAssetUris } from "./pack_gltf.mjs";
@@ -1158,9 +1159,18 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     const parsedHtml = parseHtmlEntries(rawHtmlContent, entryBaseUrl, {documentRoot});
     const importMap = parsedHtml.importMap;
     const { effectiveBaseDir } = resolveBaseDetails(parsedHtml.baseHref, entryDir, entryBaseUrl, documentRoot);
-    const copyFetchResources = (source, sourceType) => {
+    const importedStrings = createImportedStringResolver({
+      readModule: url => url.startsWith("file:") && path.extname(urlToFilePath(url)).toLowerCase() !== ".json" &&
+        commonjsFormat(url, moduleSources) === "module" ? moduleSources.read(url).code : null,
+      resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, importMap, {
+        target, mapBaseUrl: parsedHtml.baseUrl, documentRoot,
+        _moduleSources: moduleSources, packageRootUrl: options.packageRootUrl,
+      }),
+    });
+    const copyFetchResources = (source, sourceType, moduleUrl = parsedHtml.baseUrl) => {
       if (!source.includes("fetch")) return;
-      const {sites} = analyzeDocumentFetch(source, {sourceType});
+      const {sites} = analyzeDocumentFetch(source, {sourceType,
+        resolveImportedString: sourceType === "module" ? importedStrings(moduleUrl) : null});
       for (const [name, asset] of collectDocumentFetchAssets(sites, {
         documentUrl: entryBaseUrl, documentBaseUrl: parsedHtml.baseUrl, documentRoot,
       })) {
@@ -1474,7 +1484,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
           if (!item.runtimeModule || !(error instanceof IngestionParseError)) throw error;
           continue; // Preserve a lazy module's native syntax rejection.
         }
-        copyFetchResources(jsContent, item.isModuleSpecifier ? "module" : "script");
+        copyFetchResources(jsContent, item.isModuleSpecifier ? "module" : "script", fileUrl);
         const {moduleRequests, assetSpecifiers, runtimeImports} = dependencies;
         if (runtimeImports) retainRuntimeTargets();
         const jsDir = path.dirname(srcAssetAbs);
