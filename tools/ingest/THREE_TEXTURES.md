@@ -159,8 +159,16 @@ residency and encode only the requested rectangle, with no CPU readback or
 per-copy submitted-work fence. Public `waitForGPU()` retains validation and
 completion responsibility.
 
-Ready ordinary 2D material maps select the existing native sampled owner from
-their first draw, so a future copy preserves uploaded pixels even after
+Ordinary 2D material maps select the existing native sampled owner from their
+first draw, including maps whose loaders have not completed. A version-zero
+texture binds the pinned source's one-texel default without reading pixels or
+calling `onUpdate`; a requested `dataReady: false` version allocates full empty
+storage and follows the source callback boundary. Loader completion requires
+`needsUpdate`, and earlier queued draws retain their accepted default or empty
+allocation. Object-space normal maps and Phong's nonuniform normal scale use
+the same source-built material shader before and after loading.
+
+This shared history also lets a future copy preserve uploaded pixels even after
 unrequested CPU edits or Source replacement. Scene companions share that
 capture path; scenes without these maps keep their existing selection. Static
 bundles observe accepted GPU writes while preserving their sampler bindings.
@@ -169,6 +177,18 @@ their Texture version requests it. Filter edits preserve a program's constructed
 texture-load or sampling choice until material invalidation; incompatible graph
 and layout changes still trigger the existing checks. Decoded-image capture
 waits for immutable bitmap pixels before allocating or uploading storage.
+
+After loading, replacing an ordinary native 2D texture's `Source` also requires
+`needsUpdate` before it changes the accepted GPU storage. An unrequested
+replacement can still be empty or incomplete without erasing the earlier
+pixels or replaying `onUpdate`. Disposal ends that accepted residency, so reuse
+captures the current source again even when the public version did not change.
+
+`three_renderer_pending_maps.test.mjs` checks these first-draw routes against
+the pinned source WGSL and `Textures.updateTexture` allocation/callback policy,
+including queued loading transitions, unchanged-version image/Source edits,
+map removal and disposal. Its recording device establishes upload and binding
+behavior; it does not execute browser loaders or measure rendered pixels.
 
 Ordinary destinations with mip chains, compressed/layered/cube storage, media
 lifetimes, or the WebGL-authored renderer surface remain outside this copy

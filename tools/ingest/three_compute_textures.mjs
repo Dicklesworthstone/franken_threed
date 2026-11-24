@@ -89,6 +89,13 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     // default or an explicitly acknowledged no-data allocation.
     if (accepted?.alive && accepted.nativeAllocation && accepted.version === t.version)
       return sourcePool().inspect(accepted.texture, {initialize: true});
+    // Native Textures.updateTexture checks the Texture version before its
+    // Source. Replacing a loaded ordinary map's Source without needsUpdate
+    // must retain its accepted storage, just like a still-loading default.
+    // Other texture families retain their dedicated readiness/version rules.
+    if (accepted?.alive && accepted.native2D && !accepted.nativeMedia &&
+        accepted.version === t.version && accepted.source !== t.source)
+      return sourcePool().inspect(accepted.texture, {initialize: true});
     if (accepted?.alive && accepted.nativeAllocation !== 'default' &&
         t.source?.dataReady === false && t.version > 0 && !t.isVideoTexture && !t.isCompressedTexture) {
       // A no-data update keeps its existing physical extent. Sampler changes
@@ -532,7 +539,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     };
     texture.onUpdate = () => acknowledge(original.onUpdate);
     return record = {original, texture, key: shape.key, source, version, sourceVersion, nativeMedia: shape.nativeMedia === true,
-      nativeAllocation: shape.nativeAllocation, width: shape.width, height: shape.height,
+      nativeAllocation: shape.nativeAllocation, native2D: shape.native2D === true, width: shape.width, height: shape.height,
       layers: shape.layers, cube: shape.cube, layered: shape.layered,
       partialRanges: updates && rangeValues.length ? rangeValues.map(({start, count}) => ({start, count})) : null,
       partialLayers: updates && layerValues.length ? layerValues : null,
@@ -569,12 +576,13 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     const shape = describe(binding, {copyDestination}), original = binding.texture;
     let record = current.get(original);
     const privateDestination = copyDestination || copyDestinations.has(original);
-    const unchanged = record && record.key === shape.key && (privateDestination || record.source === original.source || record.nativeAllocation) &&
+    const unchanged = record && record.key === shape.key && (privateDestination || record.source === original.source ||
+      record.nativeAllocation || record.native2D && !record.nativeMedia) &&
       record.version === original.version;
     // An unused alias can increment Source.version without requesting an upload
     // through this texture. Only an already captured alias payload changes the
     // shared residency; a later uncaptured version must not hide that payload.
-    const sharedPixels = unchanged && !shape.nativeMedia && !shape.nativeAllocation && !privateDestination ? histories.get(original.source)?.get(shape.key) : null;
+    const sharedPixels = unchanged && !shape.nativeMedia && !shape.nativeAllocation && !privateDestination ? histories.get(record.source)?.get(shape.key) : null;
     if (!unchanged || sharedPixels && sharedPixels !== record.pixels) {
       if (records.size >= maxTextures) fail('BUDGET', 'Captured compute texture versions exceed maxTextures');
       // A sampler change must not reread an advancing video or wait for an

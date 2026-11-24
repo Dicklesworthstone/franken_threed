@@ -167,12 +167,13 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     const sampled2D = texture => copied?.(texture) || texture?.isTexture === true &&
       !texture.isRenderTargetTexture && !texture.isStorageTexture && !texture.isDepthTexture &&
       !texture.isFramebufferTexture && !texture.isExternalTexture && !texture.isVideoTexture &&
-      !texture.isCubeTexture && !texture.isDataArrayTexture && !texture.isData3DTexture && !texture.isCompressedTexture &&
-      texture.version > 0 && texture.source?.dataReady === true && texture.image?.complete !== false &&
-      (texture.image?.naturalWidth ?? texture.image?.width) > 0 &&
-      (texture.image?.naturalHeight ?? texture.image?.height) > 0;
+      !texture.isCubeTexture && !texture.isDataArrayTexture && !texture.isData3DTexture && !texture.isCompressedTexture;
     if (!hasThreeNativeTexture(material, sampled2D)) return false;
     // Keep ordinary 2D maps on the native sampled owner from their first draw.
+    // Loading is an allocation state, not a different material program: the
+    // source owner supplies version-zero defaults and dataReady:false storage.
+    // Waiting for pixels here would send loader startup through fixed shaders
+    // with different map features, callback rules and upload history.
     // A later copy must preserve already uploaded pixels even if CPU image or
     // Source identities changed without needsUpdate; a second fixed upload
     // owner could not recover that history. Removing a map retains this path.
