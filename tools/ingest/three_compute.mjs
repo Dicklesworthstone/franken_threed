@@ -198,13 +198,13 @@ function createThreeCompute(renderer, three) {
       const record = readRecord(lease), value = readLeases.get(lease);
       let history = histories.get(record.key);
       if (!history) {
-        history = {first: record, last: record, records: new Set(), shaders: new Set(), generated: false, indirect: false};
+        history = {first: record, last: record, records: new Set(), geometryUploads: new Set(), generated: false, indirect: false};
         histories.set(record.key, history);
       }
       if (!history.records.has(record)) { history.records.add(record); history.last = record; }
       history.generated ||= value.vertex === true;
       history.indirect ||= value.indirect === true;
-      if (!value.vertex && !value.indirect) history.shaders.add(record);
+      if (value.geometryUpload) history.geometryUploads.add(record);
       const first = history.first;
       if (first.byteLength !== record.byteLength || first.scalar !== record.scalar ||
           first.itemSize !== record.itemSize || first.count !== record.count)
@@ -214,14 +214,19 @@ function createThreeCompute(renderer, three) {
       access(record.key, value.writable);
       records.add(record);
     }
-    // Capture enforces Geometries' first indirect upload, which can precede or
-    // follow independently admitted shader-storage updates. Indirect commands
-    // read the accumulated allocation at execution; their first lease does
-    // not freeze its bytes. Keep combined generated-vertex/indirect histories
-    // outside this profile, including their shared first-geometry-use gate.
+    // The first geometry upload may follow shader-storage uploads or retained
+    // bundle reads. Only new geometry admissions consume that source gate;
+    // already accepted reads must follow the final allocation without another
+    // upload. Combined generated-vertex/indirect histories stay outside this
+    // profile, including their shared first-geometry-use gate.
     for (const history of histories.values()) if (history.records.size > 1 && history.generated &&
-        (history.indirect || [...history.records].slice(1).some(record => !history.shaders.has(record))))
-      fail('READ_CONFLICT', 'Multiple generated-vertex versions require shader-storage uploads without indirect aliases');
+        (history.indirect || history.geometryUploads.size > 1))
+      fail('READ_CONFLICT', 'One render requires a single new geometry upload without combined indirect aliases');
+    // Consume admission provenance only after the complete history succeeds.
+    // Repeated preparation and warm bundle wrappers can retain the same opaque
+    // lease; that accepted use is no longer a fresh geometry upload. Versions,
+    // allocation identities and immutable draw proofs remain unchanged.
+    for (const lease of leases) readLeases.get(lease).geometryUpload = false;
     // r186 updates shader storage during object traversal, then submits the
     // render encoder at finishRender. All draws sharing that allocation see
     // the accumulated uploads, including partial ranges, at submission time.
@@ -253,7 +258,7 @@ function createThreeCompute(renderer, three) {
     },
     retain(lease) {
       const record = readRecord(lease), value = readLeases.get(lease), next = Object.freeze({});
-      record.refs++; readLeases.set(next, {...value, released: false});
+      record.refs++; readLeases.set(next, {...value, geometryUpload: false, released: false});
       return next;
     },
     uploadIdentity(lease) {
@@ -310,7 +315,8 @@ function createThreeCompute(renderer, three) {
     },
     vertexAttribute(lease, view) {
       const record = readRecord(lease);
-      readLeases.get(lease).vertex = true;
+      const value = readLeases.get(lease);
+      value.vertex = true; value.geometryUpload = true;
       return captureComputeAttributeView(device, record.key, view, record.version);
     },
     refreshVertexAttribute(lease, view) {

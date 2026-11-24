@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import SourceWebGPUAttributeUtils from '../../upstream/three.js/src/renderers/webgpu/utils/WebGPUAttributeUtils.js';
 import {createThreeNodeBundleGeometry} from './three_node_bundle_geometry.mjs';
+import {createThreeNodeBundles} from './three_node_bundles.mjs';
 import {createGpuProgramGeometry, programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {createComputeAttributeOwner, captureComputeAttributeView, computeAttributeSnapshot,
-  snapshotComputeAttributeView} from './gpu_compute_attributes.mjs';
+  snapshotComputeAttributeView, refreshComputeAttributeView} from './gpu_compute_attributes.mjs';
 
 const positionProgram = [{name: 'position', location: 0, locations: 1, components: 3, scalar: 'float'}];
 function geometry() {
@@ -336,7 +337,7 @@ test('immutable geometry retains captured GPU versions without copying simulatio
   for (const frame of [first, second, warm]) frame.release();
 });
 
-test('GPU view proofs retain accepted shape and cannot be forged or used as indices', t => {
+test('GPU view proofs retain accepted shape and reject forged or nonscalar index uses', t => {
   const owner = histories(t), source = geometry(), device = geometryDevice();
   const storage = new T.StorageBufferAttribute(new Uint32Array([1,2,3,4,5,6,7,8]), 4);
   const publication = createComputeAttributeOwner(device); t.after(() => publication.dispose());
@@ -513,4 +514,110 @@ test(`native ${Type.name} unpadded reinterpretation retains its legal raw layout
   assert.deepEqual([...next.geometry.attributes.value.array], Array(12).fill(90));
   assert.deepEqual([...first.geometry.attributes.value.array], Array(12).fill(10));
   first.release(); next.release();
+});
+
+test('captured scalar storage indices keep accepted topology without copying CPU bytes', t => {
+  const owner = histories(t), source = geometry(), device = geometryDevice();
+  const indices = new T.StorageBufferAttribute(new Uint32Array([0, 1, 2]), 1);
+  const publication = createComputeAttributeOwner(device); t.after(() => publication.dispose());
+  const buffer = device.createBuffer({size: indices.array.byteLength, usage: 128 | 32 | 16});
+  publication.publish(indices, buffer, indices.array, 0, () => {}, () => Promise.resolve());
+  const mutable = Object.create(indices);
+  captureComputeAttributeView(device, indices, mutable).install(); source.setIndex(mutable);
+  // Accepted metadata belongs to the captured proof, not this mutable adapter.
+  mutable.array = new Uint32Array(12); mutable.itemSize = 4; mutable.count = 3; mutable.version = 99;
+  const packet = owner.capture(source, 1), accepted = packet.geometry.index;
+  assert.ok(Object.isFrozen(accepted)); assert.notEqual(accepted, mutable);
+  assert.equal(accepted.array, indices.array); assert.equal(accepted.itemSize, 1); assert.equal(accepted.count, 3);
+  assert.equal(accepted.version, 0); assert.equal(packet.bytes, 36); assert.equal(owner.diagnostics.allocatedBytes, 36);
+  const gpu = createGpuProgramGeometry(device, packet.geometry, positionProgram, {attributeTypes: 'webgpu'});
+  t.after(() => gpu.dispose());
+  const snapshot = programGeometrySnapshot(gpu, device);
+  assert.equal(snapshot.indexBuffer, buffer); assert.equal(snapshot.indexFormat, 'uint32');
+  assert.equal(snapshot.indexCount, 3); assert.equal(snapshot.readIndex, null);
+  assert.equal(device.writes.filter(write => write.buffer === buffer).length, 0);
+  packet.release(); gpu.dispose(); assert.equal(buffer.destroyed, false);
+});
+
+test('raw scalar storage indices acquire stable views through the renderer capture owner', t => {
+  const owner = histories(t), source = geometry(), device = geometryDevice();
+  const indices = new T.StorageBufferAttribute(new Uint32Array([0, 1, 2]), 1);
+  source.setIndex(indices);
+  assert.throws(() => owner.capture(source, 1), /renderer storage owner/);
+  assert.equal(owner.diagnostics.allocatedBytes, 0, 'an uncaptured index cannot publish CPU histories');
+  const seen = [];
+  const capture = (attribute, view) => {
+    seen.push({attribute, view}); return captureComputeAttributeView(device, attribute, view);
+  };
+  const first = owner.capture(source, 1, null, capture), warm = owner.capture(source, 2, null, capture);
+  assert.equal(first.geometry, warm.geometry); assert.equal(seen.length, 2);
+  assert.equal(seen[0].attribute, indices); assert.equal(seen[0].view, seen[1].view);
+  indices.array.fill(2); indices.needsUpdate = true;
+  const next = owner.capture(source, 3, null, capture);
+  assert.equal(seen[2].view, seen[0].view); assert.notEqual(next.geometry, first.geometry);
+  assert.equal(first.geometry.index.version, 0); assert.equal(next.geometry.index.version, 1);
+  assert.equal(next.geometry.attributes.position.array, first.geometry.attributes.position.array);
+  assert.equal(owner.diagnostics.allocatedBytes, 36, 'GPU index bytes never enter the CPU history budget');
+  for (const packet of [first, warm, next]) packet.release();
+});
+
+test('storage index refresh follows final admitted versions and preserves accepted CPU generations and ranges', t => {
+  const owner = histories(t), source = geometry(), device = geometryDevice();
+  const indices = new T.StorageBufferAttribute(new Uint32Array([0, 1, 2]), 1);
+  source.setIndex(indices); source.setDrawRange(1, 2);
+  const publication = createComputeAttributeOwner(device); t.after(() => publication.dispose());
+  const buffer = device.createBuffer({size: indices.array.byteLength, usage: 128 | 32 | 16});
+  publication.publish(indices, buffer, indices.array, 0, () => {}, () => Promise.resolve());
+  const packet = owner.capture(source, 1, null, (attribute, view) => captureComputeAttributeView(device, attribute, view));
+  const oldIndex = packet.geometry.index, oldGpu = computeAttributeSnapshot(device, oldIndex, {index: true});
+  const oldPositions = packet.geometry.attributes.position;
+  source.attributes.position.array.fill(99); source.setDrawRange(0, 1);
+  indices.needsUpdate = true;
+  const refresh = attribute => refreshComputeAttributeView(device, indices, attribute, 1);
+  const updated = packet.refreshStorage(refresh), warm = packet.refreshStorage(refresh);
+  assert.ok(updated); assert.equal(warm.geometry, updated.geometry);
+  assert.equal(updated.geometry.attributes.position, oldPositions);
+  assert.deepEqual(updated.geometry.drawRange, {start: 1, count: 2});
+  assert.equal(updated.geometry.index.version, 1); assert.equal(oldIndex.version, 0);
+  assert.equal(updated.bytes, 36); assert.equal(owner.diagnostics.allocatedBytes, 36);
+  assert.throws(() => computeAttributeSnapshot(device, updated.geometry.index, {index: true}), /UNPREPARED/);
+  oldGpu.assertCurrent();
+  publication.publish(indices, buffer, indices.array, 1, () => {}, () => Promise.resolve());
+  assert.equal(computeAttributeSnapshot(device, updated.geometry.index, {index: true}).buffer, buffer);
+  assert.throws(() => oldGpu.assertCurrent(), /UNPREPARED/);
+  assert.equal(updated.refreshStorage(refresh), null);
+  owner.dispose(); assert.equal(owner.diagnostics.allocatedBytes, 36);
+  for (const lease of [packet, updated, warm]) lease.release();
+  assert.equal(owner.diagnostics.allocatedBytes, 0);
+});
+
+test('native storage index capture rejects narrow and nonscalar profiles before invoking its upload owner', t => {
+  const owner = histories(t), source = geometry(); let captures = 0;
+  const capture = () => { captures++; throw new Error('unexpected upload capture'); };
+  for (const [array, itemSize] of [[new Uint16Array([0, 1, 65535]), 1], [new Int32Array(3), 1],
+    [new Float32Array(3), 1], [new Uint32Array(6), 2]]) {
+    source.setIndex(new T.StorageBufferAttribute(array, itemSize));
+    assert.throws(() => owner.capture(source, 1, null, capture), /fixed scalar Uint32/);
+  }
+  assert.equal(captures, 0); assert.equal(owner.diagnostics.allocatedBytes, 0);
+});
+
+test('source bundle capture forwards the index upload owner after generated attributes are installed', t => {
+  const bundles = createThreeNodeBundles(T), source = geometry(), device = geometryDevice();
+  t.after(() => bundles.dispose());
+  const indices = new T.StorageBufferAttribute(new Uint32Array([0, 1, 2]), 1);
+  source.setIndex(indices);
+  const order = [], attributes = {install() { order.push('attributes'); }};
+  const packet = bundles.captureGeometry(source, attributes, 1, positionProgram, (attribute, view) => {
+    order.push('index'); assert.equal(attribute, indices);
+    return captureComputeAttributeView(device, attribute, view);
+  });
+  assert.deepEqual(order, ['attributes', 'index']);
+  assert.ok(packet.geometry.index.isStorageBufferAttribute);
+  assert.equal(packet.geometry.index.version, 0);
+  assert.deepEqual(Object.keys(packet.geometry.attributes), ['position']);
+  assert.equal(packet.bytes, 36);
+  const retained = packet.retain(); packet.release(); bundles.dispose();
+  assert.equal(retained.geometry.index.count, 3, 'a queued packet retains its index metadata after bundle retirement');
+  retained.release();
 });

@@ -70,11 +70,11 @@ export function createThreeNodeBundles(three, {maxEntries = 16384, maxBytes = 64
       return passes.get(passId);
     },
     hasGeometryHistory: owner => geometry.hasHistory(owner),
-    captureGeometry(view, attributes, renderId, inputs = null) {
+    captureGeometry(view, attributes, renderId, inputs = null, captureIndexAttribute = null) {
       // Generated streams install into private views only. Freeze all streams
       // at the same upload boundary, before ordinary NodeFrame updates.
       attributes?.install();
-      return geometry.capture(view, renderId, inputs?.map(input => input.name) ?? null);
+      return geometry.capture(view, renderId, inputs?.map(input => input.name) ?? null, captureIndexAttribute);
     },
     commit(selection, draws, version = selection.group.version) {
       const retained = [], undo = [];

@@ -11,7 +11,7 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
     error.code = `THREE_NODE_BUNDLE_GEOMETRY_${code}`; throw error;
   };
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) reject('LIMIT', 'Invalid bundle geometry history budget');
-  const owners = new Map(), geometries = new Map(), disposedSources = new WeakSet();
+  const owners = new Map(), geometries = new Map(), disposedSources = new WeakSet(), indexViews = new WeakMap();
   let allocatedBytes = 0, disposed = false;
   const live = () => { if (disposed) reject('DISPOSED', 'Bundle geometry histories are disposed'); };
   const keep = generation => { generation.refs++; };
@@ -69,17 +69,23 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
           const next = refresh(attribute) ?? attribute;
           attributes[name] = next; changed ||= next !== attribute;
         }
+        const index = view.geometry.index && (refresh(view.geometry.index) ?? view.geometry.index);
+        changed ||= index !== view.geometry.index;
         if (!changed) return null;
         const previous = view.storageView;
-        if (previous && Object.entries(attributes).every(([name, attribute]) => previous.geometry.attributes[name] === attribute))
+        if (previous && previous.geometry.index === index &&
+            Object.entries(attributes).every(([name, attribute]) => previous.geometry.attributes[name] === attribute))
           return lease(previous);
-        // Only GPU metadata changes. Keep the exact retained CPU generations,
-        // ranges and index instead of recapturing live source geometry bytes.
+        // Only GPU metadata changes. Keep the exact retained CPU generations
+        // and ranges instead of recapturing live vertex or index bytes.
         for (const generation of view.generations) keep(generation);
-        const selected = view.selected.map(source => source.gpu
-          ? {...source, attribute: attributes[source.name], generation: attributes[source.name]} : source);
+        const selected = view.selected.map(source => {
+          if (!source.gpu) return source;
+          const attribute = source.name === null ? index : attributes[source.name];
+          return {...source, attribute, generation: attribute};
+        });
         const next = {refs: 1, state: view.state, key: view.key, selected, generations: view.generations, bytes: view.bytes,
-          geometry: Object.freeze({...view.geometry, attributes: Object.freeze(attributes)})};
+          geometry: Object.freeze({...view.geometry, attributes: Object.freeze(attributes), index})};
         if (previous) dropView(previous);
         view.storageView = next;
         return lease(next);
@@ -121,7 +127,31 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
         attribute.isFloat16BufferAttribute === true, attribute.isInstancedBufferAttribute === true,
         owner.isInstancedInterleavedBuffer === true, owner.meshPerAttribute]};
   }
-  function capture(geometry, renderId, attributeNames = null) {
+  function inspectIndex(attribute, captureIndexAttribute) {
+    const captured = snapshotComputeAttributeView(attribute), shape = captured ?? attribute;
+    const storage = shape?.isStorageBufferAttribute || shape?.isStorageInstancedBufferAttribute;
+    if (!storage) return inspect(attribute);
+    // An index-first source allocation has INDEX|STORAGE usage. Admit Uint32
+    // directly: narrow source indices also need primitive-restart promotion,
+    // which the shared compute uploader does not perform.
+    if (!(shape.array instanceof Uint32Array) || shape.itemSize !== 1 ||
+        shape.isInterleavedBufferAttribute || shape.normalized ||
+        !Number.isSafeInteger(shape.count) || shape.count < 1 ||
+        shape.array.length !== shape.count || !(shape.array.buffer instanceof ArrayBuffer) ||
+        shape.array.buffer.resizable || !Number.isSafeInteger(shape.version) || shape.version < 0)
+      reject('ATTRIBUTE', 'Native storage indices require fixed scalar Uint32 source attributes');
+    if (captured) return inspect(attribute);
+    if (typeof captureIndexAttribute !== 'function')
+      reject('ATTRIBUTE', 'Native storage indices require the renderer storage owner');
+    let view = indexViews.get(attribute);
+    if (!view) { view = Object.create(attribute); indexViews.set(attribute, view); }
+    // Use the same first-geometry-use upload gate as generated vertex inputs.
+    // A later shader-storage update may advance this allocation before submit;
+    // refreshStorage derives the final immutable index proof for that render.
+    captureIndexAttribute(attribute, view).install();
+    return inspect(view);
+  }
+  function capture(geometry, renderId, attributeNames = null, captureIndexAttribute = null) {
     live();
     if (!geometry?.attributes || !Number.isSafeInteger(renderId) || renderId < 0)
       reject('GEOMETRY', 'Bundle geometry capture needs attributes and a logical render id');
@@ -131,9 +161,7 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
     const attributes = attributeNames === null ? Object.entries(geometry.attributes)
       : [...new Set(attributeNames)].map(name => [name, geometry.attributes[name]]).filter(([, attribute]) => attribute !== undefined);
     const selection = attributes.map(([name, attribute]) => ({name, ...inspect(attribute)}));
-    if (geometry.index) selection.push({name: null, ...inspect(geometry.index)});
-    if (selection.some(source => source.gpu && source.name === null))
-      reject('ATTRIBUTE', 'Captured node storage views are vertex inputs, not indices');
+    if (geometry.index) selection.push({name: null, ...inspectIndex(geometry.index, captureIndexAttribute)});
     const unique = new Map(selection.filter(source => !source.gpu).map(source => [source.owner, source]));
     let addedBytes = 0;
     for (const source of unique.values()) {
@@ -242,7 +270,10 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
   function makeView(state, selected, range, vertexCount, instanced, key) {
     const privateOwners = new Map(), capturedAttributes = {}; let index = null;
     for (const source of selected) {
-      if (source.gpu) { capturedAttributes[source.name] = source.attribute; continue; }
+      if (source.gpu) {
+        if (source.name === null) index = source.attribute; else capturedAttributes[source.name] = source.attribute;
+        continue;
+      }
       const [count, itemSize, stride, offset, normalized, gpuType, half, instanceAttribute, instanceBuffer, divisor] = source.shape;
       let owner = privateOwners.get(source.owner);
       if (!owner) {

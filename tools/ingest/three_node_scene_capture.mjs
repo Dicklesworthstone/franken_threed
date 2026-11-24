@@ -356,6 +356,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         (renderer.shadowMap.type === three.VSMShadowMap || renderer.shadowMap.transmitted === true || object.shadow?.shadowNode != null)) &&
         object.castShadow === true && object.layers.test(camera.layers) ||
         object.geometry?.isInstancedBufferGeometry === true || object.isBatchedMesh === true ||
+        object.geometry?.index?.isStorageBufferAttribute === true ||
+        object.geometry?.index?.isStorageInstancedBufferAttribute === true ||
         object.geometry?.index?.array instanceof Uint8Array ||
         (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
           nativeMaterialFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material) ||
@@ -482,7 +484,11 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     (object.isMesh === true || object.isSprite === true) && effective.some(material =>
       object.isMesh === true && (material?.isSpriteMaterial === true || material?.isSpriteNodeMaterial === true) ||
       material?.isPointsMaterial === true || material?.isPointsNodeMaterial === true) ||
-    // Native source indices treat 255 as a vertex, not a restart marker.
+    // Storage indices must keep the shared compute allocation, including for
+    // ordinary materials without authored TSL slots. Native source byte indices
+    // also treat 255 as a vertex, not a restart marker.
+    object.geometry?.index?.isStorageBufferAttribute === true ||
+    object.geometry?.index?.isStorageInstancedBufferAttribute === true ||
     object.geometry?.index?.array instanceof Uint8Array || object.geometry?.indirect != null ||
     effective.some(nativeMaterial);
   // Native node updates can change ordinary companions before or after their
@@ -1113,7 +1119,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         ...(draw.nodeBundle ? {bundle: draw.binding.bundle, bundleToken: draw.binding.bundleToken,
           renderContext: {width: destination?.width ?? renderer.domElement?.width ?? 1,
             height: destination?.height ?? renderer.domElement?.height ?? 1}} : {}),
-        ...(bundles ? {captureGeometry: (view, attributes, inputs) => bundles.captureGeometry(view, attributes, renderId, inputs)} : {})};
+        ...(bundles ? {captureGeometry: (view, attributes, inputs) => bundles.captureGeometry(view, attributes, renderId, inputs, captureVertexAttribute)} : {})};
       if (draw.nodeBundle || updateContext.fogRenderContext !== undefined)
         updateContext.refreshType = programs.refresh(draw.binding.nodeProgram, updateContext);
       // ShadowNode recursively renders here. Keep the complete source before
@@ -1689,7 +1695,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         const updateContext = {...frameContext, ...(updateNodes ? {renderId: frame.renderId, frameId: frame.frameId, time: frame.time, deltaTime: frame.deltaTime} : {}),
           object: binding.object, material: binding.material, clippingContext: binding.clippingContext, captureVertexAttribute,
           captureIndirect: () => captureIndirectUpload(binding.object, binding.geometry),
-          ...(bundles ? {captureGeometry: (view, attributes, inputs) => bundles.captureGeometry(view, attributes, renderId, inputs)} : {})};
+          ...(bundles ? {captureGeometry: (view, attributes, inputs) => bundles.captureGeometry(view, attributes, renderId, inputs, captureVertexAttribute)} : {})};
         withBinding(binding, () => {
           // Public source compilation executes before -> geometry -> current;
           // raw graph/pipeline preparation remains inert. Keep the immutable
@@ -1700,7 +1706,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           const indirect = updateNodes ? captured.indirect : captureIndirectUpload(binding.object, binding.geometry);
           if (indirect) preparedIndirectUses.push(indirect.lease);
           if (bundles) {
-            const lease = captured?.bundleGeometry ?? bundles.captureGeometry(attributes?.geometry ?? binding.programGeometry, null, renderId, binding.nodeProgram.attributes);
+            const lease = captured?.bundleGeometry ?? bundles.captureGeometry(attributes?.geometry ?? binding.programGeometry, null, renderId, binding.nodeProgram.attributes, captureVertexAttribute);
             bundleGeometries.push(lease);
             ready.push(Object.freeze({...binding, programGeometry: lease.geometry}));
           } else ready.push(binding);

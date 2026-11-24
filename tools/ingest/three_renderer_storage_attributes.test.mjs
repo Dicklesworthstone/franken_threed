@@ -58,6 +58,40 @@ const computeStorage = pass => [...pass.groups.values()].flatMap(group => group.
 const words = (draw, buffer, Type = Float32Array) => [...new Type(draw.contents.get(buffer).buffer)];
 const kernel = storage => N.Fn(() => { storage.element(N.instanceIndex).addAssign(N.vec3(0)); })().compute(storage.value.count);
 
+test('ordinary indexed materials share compiled storage with queued compute-produced topology', async t => {
+  const f = fixture(t), material = new T.MeshBasicMaterial({color: 0x6699cc});
+  const initial = [0,1,2,2,3,0], generated = [3,2,1,1,0,3];
+  const attribute = new T.StorageBufferAttribute(new Uint32Array(initial), 1);
+  f.mesh.material = material; f.mesh.geometry.setIndex(attribute);
+  const storage = N.storage(attribute, 'uint', attribute.count);
+  const compute = N.Fn(() => { storage.element(N.instanceIndex).addAssign(N.uint(0)); })().compute(attribute.count);
+  t.after(() => { compute.dispose(); material.dispose(); });
+  // Index-first compilation is the source-valid allocation lifecycle. The
+  // ordinary material has no authored node that could otherwise select it.
+  await f.renderer.compileAsync(f.scene, f.camera);
+  const buffer = captureComputeStorage(f.device, attribute).resolve().buffer;
+  assert.equal(buffer.usage & (16 | 128), 16 | 128);
+  f.device.onCompute = pass => {
+    assert.equal(computeStorage(pass)[0], buffer);
+    new Uint32Array(buffer.data).set(generated);
+  };
+  f.renderer.render(f.scene, f.camera);
+  const computation = f.renderer.compute(compute);
+  f.renderer.render(f.scene, f.camera);
+  attribute.array.fill(99);
+  await Promise.all([computation, drain(f.renderer)]);
+  f.mesh.geometry.setDrawRange(1, 3);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const selected = draws(f.device).filter(draw => draw.index?.buffer === buffer);
+  assert.equal(selected.length, 3);
+  assert.ok(selected.every(draw => draw.index.format === 'uint32'));
+  assert.deepEqual(selected.map(draw => words(draw, buffer, Uint32Array)), [initial, generated, generated]);
+  assert.deepEqual(selected[2].args.slice(0, 3), [3, 1, 1]);
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, 1,
+    'compile, compute and native draws never restore the stale CPU index array');
+  assert.equal(f.device.computePasses.length, 1); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 // Run the pinned upload implementation and its actual finishRender submission
 // boundary. The recording device establishes queue-visible buffer history;
 // it does not execute the reference shader or establish real-GPU pixel parity.

@@ -1609,10 +1609,22 @@ upload per logical render; later object callbacks cannot independently upload
 that vertex stream. Preparation publishes the complete accepted shader/vertex
 history once, and submission reuses its final allocation without replaying old
 CPU snapshots. Float, signed and unsigned vertex layouts retain their exact
-format, stride, instance mode and ownership checks. Combined generated-vertex and
-indirect histories, generated index aliases and allocation-layout changes remain
-rejected. Mixed writable and read-only aliases retain their render-pass hazard
-rejection.
+format, stride, instance mode and ownership checks. Combined generated-geometry
+and indirect histories and allocation-layout changes remain rejected. Mixed
+writable and read-only aliases retain their render-pass hazard rejection.
+
+Native captured geometry also accepts nonempty scalar `Uint32Array` storage
+indices. Compile or render the index before compute, as required by the pinned
+source's index-first allocation lifecycle. Ordinary materials, node materials,
+shadows and retained bundles use the shared compute-owned index allocation
+without CPU topology copies or an unchanged-version re-upload. Immutable index
+proofs retain accepted shape, ownership and queued versions. The first geometry
+upload may follow earlier shader updates or accepted retained reads; later
+shader uploads preserve their ordered partial ranges and untouched GPU words.
+Narrow, normalized, interleaved and multicomponent storage indices remain outside
+this profile, and wireframe edges continue using source CPU-derived topology.
+Recording-device regressions check submitted index bytes and resource lifetime;
+they do not establish real-GPU image parity or a performance result.
 
 Native storage attributes using `DynamicDrawUsage` now capture the current CPU
 bytes at each source-admitted update without requiring `needsUpdate`. This covers
