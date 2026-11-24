@@ -81,10 +81,11 @@ export function createThreeComputeTargets({targets, device, signal = null,
     try { return run(); }
     finally {
       const scopes = native(() => [device.popErrorScope(), device.popErrorScope()]);
-      watch(Promise.all(scopes).then(errors => {
-        const error = errors.find(Boolean);
+      // GPUError is a fulfilled scope result. Reject each report before joining
+      // so a known failure cannot wait for an unrelated, unresolved scope.
+      watch(Promise.all(scopes.map(scope => Promise.resolve(scope).then(error => {
         if (error) throw new ThreeComputeTargetError('GPU', error.message ?? 'Native compute target binding failed');
-      }), true);
+      }))), true);
     }
   }
   return {

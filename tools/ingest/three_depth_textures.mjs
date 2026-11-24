@@ -69,11 +69,12 @@ export function createThreeDepthTextures({three, device, getSamples = () => 1, s
     let result, error;
     try { result = run(); } catch (cause) { error = cause; }
     const scopes = [device.popErrorScope(), device.popErrorScope()];
-    track(Promise.all(scopes).then(errors => {
+    // Observe failures independently; successful preparation still joins both
+    // reports, and every popped scope retains a rejection handler after stop.
+    track(Promise.all(scopes.map(scope => Promise.resolve(scope).then(invalid => {
       if (error) throw error;
-      const invalid = errors.find(Boolean);
       if (invalid) throw new ThreeDepthTextureError('GPU', invalid.message ?? 'Depth texture allocation or binding failed');
-    }), true);
+    }))), true);
     if (error) { stop(error); throw error; }
     return result;
   }

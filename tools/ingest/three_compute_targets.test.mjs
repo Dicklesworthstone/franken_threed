@@ -31,6 +31,46 @@ test('target-input compilation rejects delayed binding errors before source afte
   assert.equal(after, 0); assert.equal(dispatches(r).length, 0);
 });
 
+for (const failingScope of [0, 1])
+  test(`target-input compilation rejects scope ${failingScope} without waiting for its sibling`, async t => {
+    const r = await rig(), target = new RenderTarget(), scopes = [deferred(), deferred()];
+    r.renderer.produce(target, 17);
+    r.scopePromises.push(...scopes.map(scope => scope.promise));
+    t.after(() => { for (const scope of scopes) scope.resolve(null); r.renderer.dispose(); });
+    const compute = kernel([sampled(target.texture)]); let after = 0, progress = 0, outcome;
+    compute.after = [() => after++];
+    const task = r.renderer.compileComputeAsync(compute, () => progress++);
+    task.then(() => { outcome = 'success'; }, error => { outcome = error; });
+    const draining = r.renderer.flush();
+    await new Promise(resolve => setImmediate(resolve));
+    scopes[failingScope].resolve({message: `target binding scope ${failingScope} failed`});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(outcome?.code, 'THREE_COMPUTE_TARGET_GPU', 'a known binding error must settle public compilation');
+    assert.match(outcome.message, /target binding scope/);
+    await assert.rejects(task, error => error === outcome); await draining;
+    assert.equal(after, 0); assert.equal(progress, 0); assert.equal(dispatches(r).length, 0);
+    target.dispose();
+    assert.equal(r.targets.allocatedBytes, 0, 'failed preparation releases its captured target generation');
+    assert.equal(r.storages[0].disposed, true);
+    scopes[1 - failingScope].reject(new Error('late sibling rejection'));
+    await new Promise(resolve => setImmediate(resolve));
+    await assert.rejects(r.renderer.waitForGPU(), error => error === outcome);
+  });
+
+test('successful target-input compilation still joins both native scope reports', async t => {
+  const r = await rig(), target = new RenderTarget(), scopes = [deferred(), deferred()];
+  r.renderer.produce(target, 17); r.scopePromises.push(...scopes.map(scope => scope.promise));
+  t.after(() => { for (const scope of scopes) scope.resolve(null); r.renderer.dispose(); });
+  let settled = false;
+  const task = r.renderer.compileComputeAsync(kernel([sampled(target.texture)]));
+  task.then(() => { settled = true; }, () => { settled = true; });
+  const draining = r.renderer.flush();
+  scopes[0].resolve(null); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  scopes[1].resolve(null); await task; await draining;
+  assert.equal(settled, true); assert.equal(dispatches(r).length, 0);
+});
+
 test('public compute samples the native color produced by rendering, without a replica or CPU upload', async () => {
   const r = await rig(), target = new RenderTarget(); r.renderer.produce(target, 17);
   r.renderer.compute(kernel([sampled(target.texture), sampler(target.texture), {...sampled({isStorageTexture: true}), store: true}]));

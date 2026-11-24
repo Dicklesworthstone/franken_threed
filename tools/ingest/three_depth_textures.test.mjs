@@ -34,6 +34,48 @@ test('depth compilation validation excludes in-flight GPU fences and reports del
   await assert.rejects(proof, /invalid detached depth allocation/); f.owner.release(read);
 });
 
+for (const failingScope of [0, 1])
+  test(`depth scope ${failingScope} failure interrupts validation while submitted storage retains its fence`, async t => {
+    const f = fixture(t), texture = new T.DepthTexture(2, 2), scopes = [deferred(), deferred()], completion = deferred();
+    const pop = f.device.popErrorScope; let popped = 0;
+    f.device.popErrorScope = () => { const value = pop(); return scopes[popped++]?.promise ?? value; };
+    f.controls.completion = completion;
+    t.after(() => { for (const scope of scopes) scope.resolve(null); completion.resolve(); });
+    const token = f.owner.captureBinding(sampled(texture)), [view] = f.use([token]);
+    const validation = f.owner.validationSnapshot(), idle = f.owner.whenIdle();
+    let outcome, idleOutcome;
+    validation.then(() => { outcome = 'success'; }, error => { outcome = error; });
+    idle.then(() => { idleOutcome = 'success'; }, error => { idleOutcome = error; });
+    scopes[failingScope].resolve({message: `depth scope ${failingScope} failed`});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(outcome?.code, 'THREE_DEPTH_TEXTURE_GPU', 'known failure must not wait for sibling scopes or GPU completion');
+    assert.equal(idleOutcome, outcome); assert.match(outcome.message, /depth scope/);
+    assert.throws(() => f.owner.validateDispatch([token]), error => error === outcome);
+    f.owner.release(token);
+    assert.equal(view.texture.destroyed, 0, 'issued work retains physical storage until its completion fence');
+    completion.resolve(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(view.texture.destroyed, 1); assert.equal(f.owner.diagnostics.bytes, 0);
+    scopes[1 - failingScope].reject(new Error('late sibling rejection'));
+    await new Promise(resolve => setImmediate(resolve));
+    await assert.rejects(f.owner.whenIdle(), error => error === outcome);
+    assert.equal(view.texture.destroyed, 1);
+  });
+
+test('successful depth validation still awaits both scope reports without fencing the queue', async t => {
+  const f = fixture(t), scopes = [deferred(), deferred()], completion = deferred();
+  const pop = f.device.popErrorScope; let popped = 0;
+  f.device.popErrorScope = () => { const value = pop(); return scopes[popped++]?.promise ?? value; };
+  f.controls.completion = completion;
+  t.after(() => { for (const scope of scopes) scope.resolve(null); completion.resolve(); });
+  const token = f.owner.captureBinding(sampled(new T.DepthTexture(2, 2))); f.use([token]);
+  let settled = false;
+  const validation = f.owner.validationSnapshot(); validation.then(() => { settled = true; });
+  scopes[0].resolve(null); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  scopes[1].resolve(null); await validation;
+  assert.equal(settled, true); assert.equal(f.textures[0].destroyed, 0); f.owner.release(token);
+});
+
 test('detached depth version zero has allocation-free depth metadata without source mutation', t => {
   const f = fixture(t), texture = new T.DepthTexture(1, 1), source = texture.source, image = texture.image;
   const nextId = new T.Texture().id;
