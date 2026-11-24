@@ -352,7 +352,7 @@ test('packing refuses Request replacement in other document modules or classic s
   }
 });
 
-test('imported document resources retain native responses, effects and document bases after relocation and packing', async () => {
+test('imported document resources and default exports retain responses, effects and bases after relocation and packing', async () => {
   const f = fixture({
     'index.html': '<script type="module" src="src/main.mjs"></script>',
     'src/main.mjs': `import {selected, log} from '../config/relay.mjs';
@@ -368,7 +368,7 @@ test('imported document resources retain native responses, effects and document 
         return {initial,left,right,raw,wasm:wasm.instance.exports.run(),log:log.slice()};}`,
     'config/relay.mjs': `export {first as selected, log} from './paths.mjs';`,
     'config/paths.mjs': `export const log=[];export const first=(log.push('configuration'),'data/left.json?v=1#selected');
-      export default 'data/right.json';export const raw='raw/body.txt';export const wasm='kernel.wasm';`,
+      export default (log.push('default'),'data/right.json');export const raw='raw/body.txt';export const wasm='kernel.wasm';`,
     'data/left.json': '{"value":42}', 'data/right.json': '{"value":7}',
     'raw/body.txt': 'document-relative imported bytes',
     'kernel.wasm': Buffer.from('0061736d010000000105016000017f030201000707010372756e00000a06010400412a0b', 'hex'),
@@ -394,8 +394,8 @@ test('imported document resources retain native responses, effects and document 
   fs.renameSync(relocated,path.join(f.root,'build-unavailable'));
   assert.deepEqual(await execute(direct),expected);
   assert.deepEqual(await execute(packed),expected);
-  assert.deepEqual(expected.initial,['configuration']);
-  assert.deepEqual(expected.log,['configuration','url','options','url','options']);
+  assert.deepEqual(expected.initial,['configuration','default']);
+  assert.deepEqual(expected.log,['configuration','default','url','options','url','options']);
   assert.equal(expected.left.uri,'data/left.json?v=1#selected');
   assert.equal(expected.left.value.value,42);assert.equal(expected.right.value.value,7);
   assert.equal(expected.raw,'document-relative imported bytes');assert.equal(expected.wasm,42);

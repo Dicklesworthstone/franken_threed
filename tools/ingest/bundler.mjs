@@ -937,6 +937,9 @@ export async function bundleWithRollup(entryPath, options = {}) {
 
     const { output } = await bundle.generate({
       format: "es",
+      // Keep generated default-export bindings immutable so a subsequent pack
+      // can prove their resource selectors without admitting authored var/let.
+      generatedCode: { constBindings: true },
       // r186 applications use native import attributes; Rollup's default
       // legacy `assert` syntax is rejected by current supported hosts.
       importAttributesKey: "with",
