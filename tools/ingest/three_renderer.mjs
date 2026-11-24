@@ -2476,6 +2476,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     async waitForGPU() {
       this._gpuWaiters = (this._gpuWaiters ?? 0) + 1;
       try {
+        // A failed submission can finish and retire its destination before a
+        // caller starts waiting. The absent drain/owner is not proof of success.
+        // Preserve the error for the existing source render/compile boundary.
+        if (this._deferredError) throw this._deferredError;
         while (this._drain) await this._drain;
         if (this._preparing) await this._preparing;
         await this._canvases.whenIdle();
@@ -2491,6 +2495,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           for (const release of releases) try { release(); } catch (error) { this._deferredError ??= error; }
         }
       }
+      // Fire-and-forget transfers and retired-resource cleanup can fail while
+      // the awaited owners settle, after removing their own pending records.
+      if (this._deferredError) throw this._deferredError;
     }
 
     // ---- animation loop (source Animation semantics: callback(time, xrFrame)) ----

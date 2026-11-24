@@ -497,6 +497,44 @@ test('failed preview preparation preserves the restored public canvas and releas
   assert.equal(f.main.counts.unconfigure, 0);
 });
 
+test('waitForGPU reports an already settled preparation failure after its canvas retires', async t => {
+  const f = fixture(t), r = f.renderer, failure = new Error('retired preview preparation rejected');
+  await r.init();
+  f.device.createRenderPipelineAsync = async () => { throw failure; };
+  r.setCanvasTarget(f.previewTarget); f.quad.render(r);
+  r.backend.delete(f.previewTarget); r.setCanvasTarget(f.mainTarget);
+  // A real application can wait in a later host turn, after the renderer's
+  // fire-and-forget submission and all of its failed canvas state have drained.
+  await assert.rejects(r._drain, error => error === failure);
+  assert.equal(r._drain, null); assert.equal(f.preview.counts.unconfigure, 1);
+  await assert.rejects(r.waitForGPU(), error => error === failure);
+  assert.equal(r.getCanvasTarget(), f.mainTarget); assert.equal(r.domElement, f.main.canvas);
+  assert.equal(f.main.counts.unconfigure, 0);
+});
+
+for (const alreadyWaiting of [false, true])
+  test(`waitForGPU reports a failed source-void depth transfer (${alreadyWaiting ? 'active' : 'later'} wait)`, async t => {
+    const f = fixture(t), r = f.renderer, failure = new Error('target allocation rejected');
+    const source = new T.RenderTarget(8, 8, {depthTexture: new T.DepthTexture(8, 8)});
+    const destination = new T.RenderTarget(8, 8, {depthTexture: new T.DepthTexture(8, 8)});
+    t.after(() => { source.dispose(); destination.dispose(); });
+    await r.init();
+    const waiting = alreadyWaiting ? r.waitForGPU() : null;
+    const rejected = waiting ? assert.rejects(waiting, error => error === failure) : null;
+    const createTexture = f.device.createTexture;
+    f.device.createTexture = () => { throw failure; };
+    assert.equal(r.copyTextureToTexture(source.depthTexture, destination.depthTexture), undefined, 'source method remains void');
+    await new Promise(resolve => setImmediate(resolve));
+    f.device.createTexture = createTexture;
+    source.dispose(); destination.dispose();
+    assert.equal(r._transfers.pendingRequests, 0);
+    assert.equal(r._transfers.allocatedBytes, 0);
+    assert.equal(r._targets.size, 0);
+    if (rejected) await rejected;
+    else await assert.rejects(r.waitForGPU(), error => error === failure);
+    assert.equal(r._gpuWaiters, 0);
+  });
+
 test('accepted preview draws and framebuffer copies keep the captured canvas when domElement changes', async t => {
   const f = fixture(t), r = f.renderer, image = new T.FramebufferTexture(8, 8);
   t.after(() => image.dispose());

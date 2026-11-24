@@ -260,6 +260,11 @@ error before `init()`), `renderAsync()`, `compileAsync()`, `setAnimationLoop()`,
 color/alpha/depth, `autoClear*`, `toneMapping`,
 `toneMappingExposure`, `shadowMap.enabled`, `info`, `dispose()`.
 
+`waitForGPU()` waits for accepted renderer work and reports deferred submission
+failures even when the failed destination has already retired. Observing a
+failure through this completion API preserves it for the next render/compile
+error boundary; an empty pending queue does not clear an unreported failure.
+
 Native `outputType: HalfFloatType` presents into `rgba16float` with the pinned
 extended canvas tone-mapping mode. Omitting the option keeps the browser's
 preferred format; explicit `UnsignedByteType` selects `bgra8unorm`, as r186 does.
