@@ -2534,6 +2534,18 @@ the source's once-per-render-call cache; context-node identity and version stay
 live. Callback changes to material version are observed at the same constructor
 and comparison boundaries as the source.
 
+Inherited and registered native materials, and ordinary materials with custom
+program keys, also accept authored `Scene.fogNode` and `Scene.environmentNode`
+graphs through this shared construction owner. Authored graphs take precedence
+over ordinary scene fog/environment inputs. Graph replacements retain the
+source's previous construction within one renderer call and select the new
+construction on the next call; uniform values remain live for each draw.
+Environment graphs become inactive while source lighting is disabled, whereas
+fog remains independent of lighting. Earlier queued draws keep their accepted
+uniform bytes. Focused pinned-source comparisons cover complete WGSL, callback
+ordering, graph sharing, replacement and lighting transitions for all three
+material ownership forms.
+
 Key callbacks execute during the source draw lifecycle, after that object's
 before hook and before its node updates. Ordinary companions use the same
 ordered capture. Public `compileAsync` retains its separate ordering: object
@@ -2551,8 +2563,8 @@ an override's original source material follows the same rule.
 The callback must keep its admitted shared construction profile and cannot
 replace its selected geometry. Authored color/output graphs and existing
 material maps can be selected by the callback before source construction.
-Custom material lighting/context and geometry combinations, authored scene fog
-or environment nodes, clipping and multiview retain the shared owner's existing
+Custom material lighting/context and geometry combinations, clipping and
+multiview retain the shared owner's existing
 admission boundaries. ArrayCamera follows the shared view-count profile above. Accessor-backed key properties
 are not admitted. A callback that leaves this domain keeps its JavaScript
 effects and fails before publishing a new GPU descriptor.

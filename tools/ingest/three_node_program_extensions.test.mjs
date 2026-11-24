@@ -184,6 +184,93 @@ test('primitive extensions reject unknown object subclasses and effectful access
   assert.equal(effects, 0); assert.equal(f.programs.diagnostics.programs, 0);
 });
 
+for (const ownership of ['inherited', 'registered', 'custom-key'])
+for (const graph of ['fog', 'environment'])
+test(`${ownership} materials retain authored scene ${graph} graphs and source construction histories`, t => {
+  // Use one exact source module graph so NodeManager, source renderGroup and
+  // the retained candidate builder share the same uniform singleton identities.
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [];
+  const family = graph === 'fog' ? 'Basic' : 'Standard';
+  const Native = T[`Mesh${family}NodeMaterial`], Ordinary = T[`Mesh${family}Material`];
+  class Extension extends Native {
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey(); }
+    setupOutput(builder, output) {
+      trace.push(['setup', builder.fogNode, builder.environmentNode]);
+      return super.setupOutput(builder, output);
+    }
+  }
+  class Application extends Ordinary {
+    constructor() { super(); this.type = 'AuthoredSceneGraphApplication'; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey(); }
+  }
+  if (ownership === 'registered') f.renderer.library.addMaterial(Extension, 'AuthoredSceneGraphApplication');
+  const material = new (ownership === 'registered' ? Application : ownership === 'inherited' ? Extension : Ordinary)();
+  if (ownership === 'custom-key') {
+    const sourceKey = material.customProgramCacheKey;
+    material.customProgramCacheKey = function () { trace.push('key'); return sourceKey.call(this); };
+  }
+  const a = f.add(material), b = f.add(material), slot = graph + 'Node';
+  const makeGraph = (rgb, strength, alternate = false) => {
+    const color = N.uniform(new T.Color(...rgb)), gain = N.uniform(strength);
+    const amount = alternate ? gain.mul(.5) : gain;
+    return {color, gain, node: graph === 'fog' ? N.fog(color, amount) : color.mul(amount)};
+  };
+  const initial = makeGraph([.125, .25, .5], .25);
+  f.scene[slot] = initial.node;
+  const phase = (item, label) => {
+    const reference = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected, `${label}: source program-key and setup effects`);
+    equalShaders(descriptor, reference);
+    const sourcePacket = f.referenceDraw(item), packet = f.capture(item, descriptor);
+    assert.deepEqual(packet.uniforms, sourcePacket.uniforms, `${label}: exact source uniform bytes`);
+    return {reference, descriptor, packet};
+  };
+  const first = phase(a, 'cold'), other = phase(b, 'shared construction');
+  assert.equal(other.reference, first.reference, 'source objects share the selected authored scene graph');
+  assert.notEqual(other.descriptor, first.descriptor, 'native objects retain independent binding wrappers');
+  assert.ok(first.packet.uniforms.length > 0);
+  const saved = first.packet.uniforms.map(bytes => bytes.slice());
+  assert.equal(phase(a, 'warm').descriptor, first.descriptor);
+
+  initial.color.value.setRGB(.75, .625, .875); initial.gain.value = .875;
+  f.renderer.info.calls++;
+  const live = phase(a, 'live uniform changes');
+  assert.equal(live.descriptor, first.descriptor);
+  assert.notDeepEqual(live.packet.uniforms, saved, 'authored scene uniforms update without reconstructing their graph');
+  assert.deepEqual(first.packet.uniforms, saved, 'accepted packets keep their earlier scene uniform bytes');
+
+  const replacement = makeGraph([.5, .375, .125], .625, true);
+  f.scene[slot] = replacement.node;
+  const sameCall = phase(a, 'same-call graph replacement');
+  assert.equal(sameCall.reference, first.reference);
+  assert.equal(sameCall.descriptor, first.descriptor,
+    'NodeManager freezes the scene/light call key until the next renderer call');
+  f.renderer.info.calls++;
+  const replaced = phase(a, 'next-call graph replacement');
+  assert.notEqual(replaced.reference, first.reference);
+  assert.notEqual(replaced.descriptor, first.descriptor);
+  assert.equal(phase(b, 'shared replacement').reference, replaced.reference);
+  assert.deepEqual(first.packet.uniforms, saved, 'reconstruction cannot change previously accepted uniforms');
+
+  f.renderer.lighting.enabled = false; f.renderer.info.calls++;
+  const disabled = phase(a, 'lighting disabled');
+  const finalGraph = makeGraph([.875, .125, .625], .375);
+  f.scene[slot] = finalGraph.node; f.renderer.info.calls++;
+  const changedWhileDisabled = phase(a, 'authored graph changes while lighting is disabled');
+  if (graph === 'environment') {
+    assert.equal(changedWhileDisabled.reference, disabled.reference);
+    assert.equal(changedWhileDisabled.descriptor, disabled.descriptor,
+      'source scene environments are inactive while renderer lighting is disabled');
+  } else {
+    assert.notEqual(changedWhileDisabled.reference, disabled.reference);
+    assert.notEqual(changedWhileDisabled.descriptor, disabled.descriptor,
+      'source scene fog remains active outside the lighting branch');
+  }
+  f.renderer.lighting.enabled = true; f.renderer.info.calls++;
+  phase(a, 'lighting restored');
+});
+
+
 for (const family of ['MeshBasic', 'MeshStandard', 'MeshPhysical'])
 test(`ordinary ${family} wireframes retain custom program-key boundaries without authored node slots`, t => {
   const f = fixture(t), material = new T[family + 'Material']({wireframe: true}), trace = [];

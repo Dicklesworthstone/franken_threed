@@ -917,6 +917,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function sceneEnvironmentNode(scene) {
     if (renderer.lighting?.enabled === false) return null;
+    // NodeManager gives an authored scene graph precedence over its texture.
+    // Keep the same node identity for source construction and its call key.
+    if (scene?.environmentNode?.isNode === true) return scene.environmentNode;
     const texture = scene?.environment;
     if (!texture) return null;
     let node = sceneEnvironmentNodes.get(texture);
@@ -1651,7 +1654,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           !instancedGeometryExtension && (attribute.isInstancedBufferAttribute || attribute.data?.isInstancedInterleavedBuffer) ||
           attribute.isStorageInstancedBufferAttribute ||
           attribute.isStorageBufferAttribute && !geometrySetup && !ordinaryGeometryExtension && !primitiveExtension) ||
-        !extension && context.scene?.environment || context.scene?.environmentNode || !extension && context.scene?.fog || context.scene?.fogNode ||
+        !extension && (context.scene?.environment || context.scene?.environmentNode || context.scene?.fog || context.scene?.fogNode) ||
         !extension && context.camera?.isArrayCamera || context.lightsNode || !extension && (context.lights?.length || lights.length ||
           context.lightingEnabled === false || renderer.lighting?.enabled === false) || rendererContextSignature !== null ||
         context.clippingContext?.unionPlanes?.length || context.clippingContext?.intersectionPlanes?.length ||
@@ -2604,10 +2607,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native MRT graph or attachment layout changed; compile its output graph again');
   }
   function checkFog(state, context) {
-    // Shared source render-object invalidation owns extension fog selection.
+    // Shared source render-object invalidation owns material-profile fog selection.
     // Its retained builder still reads the previous fog within the same call,
     // and material.fog changes require the source material invalidation.
-    if (state.sharedBuilder && materialExtension(state.material)) return;
+    if (state.sharedBuilder?.materialProfile) return;
     if (fogSignature(prepareMaterial(state.material, state.preparedPrototype), {scene: context.scene ?? state.builder.scene}) !== state.fogSignature)
       fail('CHANGED', 'Native scene fog identity, graph, kind or material enable flag changed; compile the graph again');
   }
