@@ -22,6 +22,7 @@ import { createImportedStringResolver } from "./module_string_constants.mjs";
 import { isThreeLoaderResourceModule } from "./three_loader_resources.mjs";
 import { analyzeDocumentFetch, isLocalDocumentFetchUrl } from "./document_fetch_assets.mjs";
 import { documentRelativePath, isRootRelativeDocumentUrl, normalizeDocumentRoot, resolveDocumentUrl } from "./document_urls.mjs";
+import { cssResources } from "./css_resources.mjs";
 
 export class HtmlPackingError extends Error {
   constructor(code, message) {
@@ -1101,19 +1102,15 @@ export function packHtml(
       record.key.slice("f3d-packed/".length);
     return record;
   }
-  // CSS scanner skips comments and ordinary strings; url() in content text is not an asset.
-  const CSS =
-    /\/\*[\s\S]*?\*\/|@import\s+(?:url\(\s*)?(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|([^\s'"();]+))\s*\)?|\burl\(\s*(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|([^\s'"()]+))\s*\)|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/gi;
   function css(source, from) {
-    return source.replace(CSS, (whole, ia, ib, ic, ua, ub, uc) => {
-      const raw = ia ?? ib ?? ic ?? ua ?? ub ?? uc;
-      if (raw === undefined || raw.startsWith("#") || raw.startsWith("data:")) return whole;
-      const value = raw.replace(/\\(?:([0-9a-f]{1,6})\s?|(.))/gi, (_m, hex, char) =>
-        hex ? String.fromCodePoint(parseInt(hex, 16)) : char,
-      );
-      const isImport = /^@import/i.test(whole);
-      return `${isImport ? "@import " : ""}url("${assetFor(local(value, from), isImport)}")`;
-    });
+    const replacements = [];
+    for (const { start, end, url, kind } of cssResources(source)) {
+      if (!url || url.startsWith("#") || url.startsWith("data:")) continue;
+      const embedded = assetFor(local(url, from), kind === "import");
+      replacements.push({ start, end, value: kind === "image-set" ? `"${embedded}"`
+        : `${kind === "import" ? "@import " : ""}url("${embedded}")` });
+    }
+    return edits(source, replacements);
   }
   function assetFor(url, stylesheet = false, raw = false) {
     if (url.startsWith("data:")) return url;

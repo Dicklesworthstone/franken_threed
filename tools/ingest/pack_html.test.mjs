@@ -287,6 +287,38 @@ test("embeds transitive CSS, image assets, module-relative Wasm and original scr
   assert.match(source, /new URL\("data:application\/octet-stream;base64,AP8D#mesh"\)/);
 });
 
+test("standalone CSS embeds escaped and responsive resources while preserving candidate descriptors", () => {
+  const f = build({
+    "index.html": `<style>@import './the\\\r\nme.css' layer(theme) screen;
+      .scene {background:image-set("./small.png" type("image/png") 1x, url('./large.png') 2x);
+        mask:url("./con\\\ntinued.png");}
+      .label {content:'image-set("missing.png" 1x)';}
+      .fallback {background:-webkit-image-set('./space\\20 name.png' 1x, './\\01f680.png' 2x);}
+      .local {mask:url(\\23 local);background:url(\\64 ata:image/png;base64,AQID);}</style>`,
+    "theme.css": '.theme {background:image-set("./theme.png" 1x)}',
+    "small.png": Buffer.from([1]), "large.png": Buffer.from([2]),
+    "continued.png": Buffer.from([3]), "space name.png": Buffer.from([4]),
+    "🚀.png": Buffer.from([5]), "theme.png": Buffer.from([6]),
+  });
+  assert.equal(f.result.assetCount, 7);
+  assert.match(f.html, /\) layer\(theme\) screen;/);
+  assert.match(f.html, /type\("image\/png"\) 1x/);
+  assert.match(f.html, /content:'image-set\("missing.png" 1x\)'/);
+  assert.ok(f.html.includes('url(\\23 local)'), "decoded fragment references stay source-authored");
+  assert.ok(f.html.includes('url(\\64 ata:image/png;base64,AQID)'), "already embedded resources are not reinterpreted as files");
+  for (const byte of [1, 2, 3, 4, 5]) assert.ok(f.html.includes(`;base64,${Buffer.from([byte]).toString("base64")}`));
+  const stylesheet = /@import url\("([^"]+)"\)/.exec(f.html)[1];
+  assert.match(dataText(stylesheet), /image-set\("data:image\/png;f3d-resource=[^,]+;base64,Bg==" 1x\)/);
+});
+
+test("standalone image-set does not silently retain remote, missing or escaping images", () => {
+  for (const reference of ["https://example.invalid/live.png", "missing.png", "../outside.png"]) {
+    const f = fixture({"index.html": `<style>body{background:image-set("${reference}" 1x)}</style>`});
+    assert.throws(() => packHtml(f.entry, f.out));
+    assert.equal(fs.existsSync(f.out), false);
+  }
+});
+
 test("HTML raw text and comments are not scanned as resource tags; closing script text is encoded", () => {
   const f = build({
     "index.html": `<!doctype html><!-- <img src="missing.png"> --><textarea><img src="missing.png"></textarea><script>const fake='<img src="missing.png">';</script><script type="module" src="app.mjs"></script>`,

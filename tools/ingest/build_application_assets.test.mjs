@@ -158,6 +158,57 @@ test("inline document assets resolve against the first local base while source C
   assert.match(standalone, /data:image\/svg\+xml;f3d-resource=/);
 });
 
+test("normal and standalone builds close responsive CSS images and continued URLs without source files", async () => {
+  const html = `<!doctype html><link rel="stylesheet" href="./styles/main.css">
+    <style>.inline{background:image-set("./images/inline.svg" 1x, "./images/dense.svg" 2x)}</style>
+    <div style="background:-webkit-image-set(&quot;./images/legacy.svg&quot; 1x, url('./images/dense.svg') 2x)"></div>
+    <script type="module" src="./main.mjs"></script>`;
+  const style = `@import './the\\\r\nme.css' layer(theme) supports(display:grid) screen;
+    .scene {background:image-set("../images/small.svg" 1x type("image/svg+xml"),
+      "../images/space\\20 name.svg" 2x, url("../images/con\\\ntinued.svg") 3x);}
+    .label::before {content:'image-set("missing.svg" 1x)';}`;
+  const image = color => `<svg xmlns="http://www.w3.org/2000/svg"><rect width="4" height="4" fill="${color}"/></svg>`;
+  const resources = {
+    "styles/main.css": style,
+    "styles/theme.css": `.theme {background:image-set('../images/theme.svg' 1x)}`,
+    "images/inline.svg": image("red"), "images/dense.svg": image("green"),
+    "images/legacy.svg": image("blue"), "images/small.svg": image("cyan"),
+    "images/space name.svg": image("magenta"), "images/continued.svg": image("yellow"),
+    "images/theme.svg": image("purple"),
+  };
+  const f = fixture({"index.html": html, "main.mjs": "export const ready = 42;", ...resources});
+  const result = await buildApplication(f.entry, f.out);
+  assert.equal(fs.readFileSync(path.join(f.out, "styles/main.css"), "utf8"), style);
+  assert.ok(fs.readFileSync(path.join(f.out, "index.html"), "utf8").includes('image-set("./images/inline.svg"'));
+  for (const [name, bytes] of Object.entries(resources)) {
+    assert.ok(result.emittedFiles.includes(name), name);
+    assert.deepEqual(fs.readFileSync(path.join(f.out, name)), Buffer.from(bytes));
+  }
+  fs.renameSync(f.source, path.join(f.root, "source-unavailable"));
+  const output = path.join(f.root, "responsive.html");
+  assert.equal(packHtml(path.join(f.out, "index.html"), output).assetCount, Object.keys(resources).length);
+  fs.renameSync(f.out, path.join(f.root, "dist-unavailable"));
+  const packed = fs.readFileSync(output, "utf8"), embedded = embeddedResources(packed);
+  for (const [name, bytes] of Object.entries(resources)) {
+    if (!name.endsWith(".css")) assert.ok(embedded.some(value => value.equals(Buffer.from(bytes))), name);
+  }
+  const css = embedded.map(value => value.toString("utf8")).find(value => value.includes("supports(display:grid)"));
+  assert.match(css, /\) layer\(theme\) supports\(display:grid\) screen;/);
+  assert.match(css, /1x type\("image\/svg\+xml"\)/);
+  assert.match(css, /content:'image-set\("missing.svg" 1x\)'/);
+  const moduleUrl = /<script type="module" src="([^"]+)"/.exec(packed)[1];
+  assert.equal((await import(moduleUrl)).ready, 42);
+});
+
+test("responsive CSS images use the existing missing-file and root containment checks", async () => {
+  for (const [reference, expected] of [["missing.svg", /Unresolved relative resource/],
+    ["../outside.svg", /escapes application root directory/]]) {
+    const f = fixture({"index.html": `<style>body{background:image-set("${reference}" 1x)}</style>`});
+    await assert.rejects(buildApplication(f.entry, f.out), expected);
+    assert.equal(fs.existsSync(path.join(f.out, "index.html")), false);
+  }
+});
+
 test("inline CSS resources use existing missing-file and application-root checks before emission", async () => {
   for (const [reference, expected] of [
     ["missing.svg", /Unresolved relative resource/],

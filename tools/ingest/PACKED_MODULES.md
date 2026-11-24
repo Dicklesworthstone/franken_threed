@@ -61,6 +61,15 @@ fragments keep their module identities. Protocol-relative and explicit remote
 URLs retain their host routes; this option never downloads them. Omitting the
 option preserves the existing local path and host-resource behavior.
 
+CSS discovery is shared by ordinary builds and standalone packing. It includes
+`url()`, `@import`, and quoted image candidates in `image-set()` and
+`-webkit-image-set()`, including CSS escapes and continued quoted URLs. Normal
+builds preserve stylesheet bytes and copy the referenced files; standalone
+packing embeds them while preserving density/type descriptors and import
+layer, supports, and media conditions. Comments and ordinary CSS strings do not
+create dependencies. Missing or escaping images remain build errors, and a
+standalone export rejects remote image candidates it cannot embed.
+
 ## Runtime imports in ordinary module builds
 
 HTML applications with an import map and an open `import(name)` can keep the

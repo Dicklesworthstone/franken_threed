@@ -52,6 +52,8 @@ import { assertUnbundledModule, commonjsFormat } from "./commonjs_modules.mjs";
 import { createImportedStringResolver } from "./module_string_constants.mjs";
 import { moduleWorkerRollupPlugin, workerGlobalBindings } from "./module_workers.mjs";
 import { analyzeDocumentFetch, collectDocumentFetchAssets } from "./document_fetch_assets.mjs";
+import { cssResources } from "./css_resources.mjs";
+export { CSS_RESOURCE_REGEX } from "./css_resources.mjs";
 import { gltfAssetUris } from "./pack_gltf.mjs";
 import { evaluateGraphRoutes, isInternalLibraryModule } from "./route_bridge.mjs";
 import { resolveClosedRendererGroups } from "./renderer_resource_groups.mjs";
@@ -347,34 +349,7 @@ export function stripCssComments(css) {
 }
 
 /**
- * Contextual scanner regex for CSS resources.
- * Disambiguates comments, @import rules, url(...) functional notations, and string literals,
- * so that url(...) inside quoted strings (e.g. content: "url(phantom.png)") or inside comments
- * is never extracted as a resource dependency.
- */
-export const CSS_RESOURCE_REGEX =
-  /(\/\*[\s\S]*?\*\/)|(@import\s+(?:url\(\s*)?(?:"([^"\\]*(?:\\[\s\S][^"\\]*)*)"|'([^'\\]*(?:\\[\s\S][^'\\]*)*)'|((?:\\(?:[0-9a-f]{1,6}(?:\r\n|[ \t\r\n\f])?|[^\r\n\f0-9a-f])|[^\\'"\s();])+))\s*\)?)|(\burl\(\s*(?:"([^"\\]*(?:\\[\s\S][^"\\]*)*)"|'([^'\\]*(?:\\[\s\S][^'\\]*)*)'|((?:\\(?:[0-9a-f]{1,6}(?:\r\n|[ \t\r\n\f])?|[^\r\n\f0-9a-f])|[^\\'"()\s])+))\s*\))|("(?:[^"\\]|\\[\s\S])*")|('(?:[^'\\]|\\[\s\S])*')/gi;
-
-/** Decode CSS string/URL escapes without changing the emitted stylesheet bytes.
- * https://www.w3.org/TR/css-syntax-3/#consume-escaped-code-point
- * Quoted strings additionally discard escaped newlines (CRLF is one newline).
- */
-function decodeCssResourceUrl(rawUrl) {
-  return rawUrl.replace(
-    /\\(?:([0-9a-f]{1,6})(?:\r\n|[ \t\r\n\f])?|(\r\n|[\r\n\f])|([\s\S]))/gi,
-    (_escape, hex, continuation, character) => {
-      if (continuation) return "";
-      if (!hex) return character;
-      const codePoint = Number.parseInt(hex, 16);
-      return codePoint === 0 || codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)
-        ? "\uFFFD"
-        : String.fromCodePoint(codePoint);
-    },
-  );
-}
-
-/**
- * Extracts relative resource URLs (url(...) and @import) from CSS content.
+ * Extracts relative resource URLs (url(...), @import and image-set) from CSS content.
  * Skips url(...) occurrences inside single- or double-quoted CSS strings and comments.
  *
  * @param {string} cssContent
@@ -383,37 +358,8 @@ function decodeCssResourceUrl(rawUrl) {
 export function extractRelativeCssUrls(cssContent, documentRoot = null) {
   if (!cssContent || typeof cssContent !== "string") return [];
   const urls = new Set();
-  const regex = new RegExp(CSS_RESOURCE_REGEX.source, "gi");
-  let match;
-
-  while ((match = regex.exec(cssContent)) !== null) {
-    // match[1]: comment -> ignore
-    // match[10]: double-quoted string -> ignore
-    // match[11]: single-quoted string -> ignore
-    if (match[1] || match[10] || match[11]) {
-      continue;
-    }
-
-    // match[2]: @import statement
-    if (match[2]) {
-      const rawUrl =
-        match[3] !== undefined ? match[3] : match[4] !== undefined ? match[4] : match[5];
-      const url = rawUrl ? decodeCssResourceUrl(rawUrl) : "";
-      if (isDocumentResourceUrl(url, documentRoot)) {
-        urls.add(url);
-      }
-      continue;
-    }
-
-    // match[6]: url(...) function
-    if (match[6]) {
-      const rawUrl =
-        match[7] !== undefined ? match[7] : match[8] !== undefined ? match[8] : match[9];
-      const url = rawUrl ? decodeCssResourceUrl(rawUrl) : "";
-      if (isDocumentResourceUrl(url, documentRoot)) {
-        urls.add(url);
-      }
-    }
+  for (const { url } of cssResources(cssContent)) {
+    if (isDocumentResourceUrl(url, documentRoot)) urls.add(url);
   }
 
   return Array.from(urls);
