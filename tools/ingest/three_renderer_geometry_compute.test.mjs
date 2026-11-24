@@ -201,6 +201,68 @@ test('computeAsync keeps public overrides and waits for its submission without j
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
+test('disposing initialized kernels after compute retains source dispatch order across a pending render', async t => {
+  const f = fixture(t, {background: false}), reference = fixture(t, {background: false});
+  const values = N.instancedArray(1, 'vec4'), amount = N.uniform(.125).setName('retiredAmount');
+  const kernel = N.Fn(() => { values.element(0).addAssign(N.vec4(amount)); })().compute(1).setName('first-generation');
+  let initializations = 0; kernel.onInit(() => initializations++);
+
+  // The pinned public method and backend submit both generations before each
+  // initialized compute() returns. Cache disposal cannot retract that work.
+  const backend = new SourceWebGPUBackend(); backend.device = reference.device;
+  const compiled = new Map(), sourceKernel = N.Fn(() => {})().compute(1).setName('first-generation');
+  let sourceInitializations = 0; sourceKernel.onInit(() => sourceInitializations++);
+  const source = {_initialized: true, _isDeviceLost: false, backend, info: reference.renderer.info,
+    inspector: {beginCompute() {}, finishCompute() {}},
+    _nodes: {nodeFrame: {renderId: 0}, updateBeforeForCompute() {}, updateForCompute() {}, updateAfterForCompute() {}, delete() {}},
+    _bindings: {updateForCompute() {}, getForCompute: () => [], deleteForCompute() {}},
+    _pipelines: {has: node => compiled.has(node), delete: node => compiled.delete(node), getForCompute(node) {
+      if (!compiled.has(node)) {
+        const pipeline = {}; compiled.set(node, pipeline);
+        backend.get(pipeline).pipeline = {compute: {module: {label: node.name}}};
+      }
+      return compiled.get(node);
+    }}};
+  backend.renderer = source;
+  assert.equal(SourceRenderer.prototype.compute.call(source, sourceKernel), undefined);
+  assert.deepEqual(reference.events, ['first-generation']);
+  sourceKernel.dispose(); sourceKernel.setName('second-generation');
+  assert.equal(SourceRenderer.prototype.compute.call(source, sourceKernel, [3]), undefined);
+  sourceKernel.dispose();
+
+  let release, entered;
+  const held = new Promise(resolve => { release = resolve; }), preparing = new Promise(resolve => { entered = resolve; });
+  t.after(() => { release(); kernel.dispose(); sourceKernel.dispose(); });
+  await f.renderer.init();
+  const prepare = f.renderer._prepare;
+  f.renderer._prepare = function(destination, request) {
+    entered(); return held.then(() => prepare.call(this, destination, request));
+  };
+  f.renderer.render(f.scene, f.camera); await preparing;
+  assert.equal(f.renderer.compute(kernel), undefined);
+  kernel.dispose(); amount.value = .625; kernel.setName('second-generation');
+  const second = f.renderer.computeAsync(kernel, [3]);
+  second.catch(() => {});
+  kernel.dispose(); amount.value = 99; kernel.setName('future-generation');
+  assert.equal(f.computes.length, 0, 'accepted compute waits behind render preparation');
+  release(); await second; await drain(f.renderer);
+  assert.deepEqual(f.events, ['render', ...reference.events]);
+  assert.deepEqual(f.computes.map(pass => pass.dispatches), reference.computes.map(pass => pass.dispatches));
+  assert.equal(initializations, sourceInitializations); assert.equal(initializations, 2);
+  const uniforms = pass => [...pass.groups.values()].flatMap(group => group.entries)
+    .map(entry => entry.resource?.buffer).filter(buffer => buffer?.usage & 64);
+  const capturedWords = pass => pass.bytes.flatMap(bytes => [...new Float32Array(bytes.buffer)]);
+  assert.ok(capturedWords(f.computes[0]).includes(.125));
+  assert.ok(capturedWords(f.computes[1]).includes(.625));
+  assert.ok(f.computes.every(pass => !capturedWords(pass).includes(99)));
+  assert.notEqual(uniforms(f.computes[0])[0], uniforms(f.computes[1])[0]);
+  assert.ok(f.computes.flatMap(uniforms).every(buffer => buffer.destroyed), 'retired uniform generations release after submission');
+  const buffer = storage(f.computes[0])[0];
+  assert.equal(storage(f.computes[1])[0], buffer); assert.equal(buffer.destroyed, false);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+  f.renderer.dispose(); assert.equal(buffer.destroyed, true);
+});
+
 test('pre-init compute retains its source Promise and completes its accepted dispatch', async t => {
   const f = fixture(t, {background: false}), values = N.instancedArray(1, 'vec4');
   const kernel = N.Fn(() => { values.element(0).assign(N.vec4(.25)); })().compute(1).setName('before-init');

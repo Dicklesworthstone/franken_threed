@@ -579,9 +579,14 @@ function createThreeCompute(renderer, three) {
       // pending HTML snapshot after its live source becomes a canvas. Every
       // upload in this call must survive the image-readiness boundary too.
       if (preparation && !deferred) for (const record of held) deferUpload(record);
+      if (listeners.get(node) !== epoch) fail('STALE', 'Compute node was disposed while capturing its queued use');
       const issue = (dispatch = true) => {
         live();
-        if (listeners.get(node) !== epoch) fail('STALE', 'Compute node was disposed before its queued use');
+        // Source compute submits before returning. A later node disposal only
+        // retires its cache; an accepted dispatch keeps this program and its
+        // captured bindings alive through entry.uses until submission finishes.
+        // Compilation still requires the initialized generation to remain live.
+        if (!dispatch && listeners.get(node) !== epoch) fail('STALE', 'Compute node was disposed before its queued use');
         if (issuing) fail('REENTRY', 'Cannot submit compute from an upload callback');
         textureOwner.validateDispatch(textureUses);
         issuing = true;

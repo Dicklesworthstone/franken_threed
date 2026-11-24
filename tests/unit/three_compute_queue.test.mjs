@@ -278,13 +278,65 @@ test('an after-update exception does not drop its already-queued kernel', async 
   assert.deepEqual(await read(renderer, data), [1]); renderer.dispose();
 });
 
-test('disposed and recreated nodes cannot impersonate an earlier queued generation', async () => {
-  const {renderer, block, events} = setup(), kernel = node();
+test('disposing and reusing a node preserves both accepted queued shader generations', async t => {
+  const {renderer, block, events} = setup(); let initializations = 0;
+  const kernel = node([], {name: 'first', onInitFunction() { initializations++; }});
+  t.after(() => renderer.dispose());
   const gate = block(), old = renderer.computeAsync(kernel);
   kernel.dispose();
-  const current = renderer.computeAsync(kernel);
-  gate.open(); await assert.rejects(old, /STALE/); await current;
-  assert.equal(events.filter(e => e[0] === 'dispatch').length, 1); renderer.dispose();
+  kernel.name = 'second';
+  const current = renderer.computeAsync(kernel, [3]);
+  kernel.name = 'future'; kernel.dispose();
+  gate.open(); await Promise.all([old, current]);
+  assert.deepEqual(events.filter(e => e[0] === 'dispatch'), [
+    ['dispatch', 'first', 2, 1, 1], ['dispatch', 'second', 3, 1, 1]]);
+  assert.equal(initializations, 2);
+});
+
+test('retired queued kernels retain captured uniforms through dispatch and then release them', async t => {
+  const {renderer, block, buffers} = setup(), data = attribute(new Float32Array([0]));
+  data.usage = 35044;
+  const firstUniform = {isUniformBuffer: true, buffer: new Float32Array([2, 0, 0, 0])};
+  const secondUniform = {isUniformBuffer: true, buffer: new Float32Array([7, 0, 0, 0])};
+  const kernel = node([storage(data), firstUniform]);
+  t.after(() => renderer.dispose()); await renderer.compileComputeAsync(kernel);
+  const oldBuffer = buffers.find(buffer => buffer.usage & 64), gate = block();
+  const first = renderer.computeAsync(kernel); kernel.dispose();
+  assert.equal(oldBuffer.destroyed, 0, 'retirement cannot release an accepted generation');
+  kernel.bindings = [storage(data), secondUniform];
+  const second = renderer.computeAsync(kernel);
+  firstUniform.buffer.fill(99); secondUniform.buffer.fill(99);
+  gate.open(); await Promise.all([first, second]);
+  assert.deepEqual(await read(renderer, data), [9]);
+  assert.equal(oldBuffer.destroyed, 1);
+  const currentBuffer = buffers.filter(buffer => buffer.usage & 64).at(-1);
+  assert.notEqual(currentBuffer, oldBuffer); assert.equal(currentBuffer.destroyed, 0);
+  kernel.dispose(); assert.equal(currentBuffer.destroyed, 1);
+  assert.equal(buffers.find(buffer => buffer.usage & 128).destroyed, 0,
+    'kernel retirement preserves shared renderer storage');
+});
+
+for (const phase of ['initialization', 'capture'])
+test(`node disposal during ${phase} rejects an unaccepted dispatch`, async t => {
+  const {renderer, events, buffers} = setup(), kernel = node();
+  t.after(() => renderer.dispose());
+  if (phase === 'initialization') kernel.onInitFunction = () => kernel.dispose();
+  else kernel.bindings = [{isUniformBuffer: true, buffer: new Float32Array(4), update: () => kernel.dispose()}];
+  await assert.rejects(renderer.computeAsync(kernel), /STALE/);
+  assert.equal(events.some(event => event[0] === 'dispatch'), false);
+  assert.equal(buffers.length, 0);
+});
+
+test('node disposal still invalidates outstanding asynchronous compilation', async t => {
+  const compilation = deferred(), {renderer, events, buffers} = setup({compilation});
+  const kernel = node([{isUniformBuffer: true, buffer: new Float32Array(4)}]);
+  t.after(() => { compilation.resolve(); renderer.dispose(); });
+  const task = renderer.compileComputeAsync(kernel), rejected = assert.rejects(task, /STALE/);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(buffers.length > 0, 'compilation has captured this initialized generation');
+  kernel.dispose(); compilation.resolve(); await rejected;
+  assert.equal(events.some(event => event[0] === 'dispatch'), false);
+  assert.ok(buffers.every(buffer => buffer.destroyed === 1));
 });
 
 test('zero workgroup dimensions and zero count remain zero; invalid grids do not truncate', () => {

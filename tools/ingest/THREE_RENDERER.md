@@ -418,8 +418,11 @@ shader-only object; later shader bindings can add full or partial uploads, and
 every indirect draw consumes the final accumulated allocation at submission.
 Indirect-only changes after that first use do not independently force uploads.
 Untouched GPU-produced words and retained command bundles remain intact.
-Multi-version histories combining generated vertex and indirect aliases,
-generated index aliases and allocation-layout changes remain explicitly
+Scalar unsigned generated indices also share this storage owner through native
+index capture. Index-first creation and initial narrow-array promotion follow
+the pinned source; see [THREE_NODE_PROGRAMS.md](./THREE_NODE_PROGRAMS.md) for the
+index profile. Multi-version histories combining generated vertex and indirect
+aliases and allocation-layout changes remain explicitly
 unsupported; writable-versus-read-only storage hazards still apply.
 
 Standard and Physical materials, including their default node-material forms,
@@ -491,6 +494,15 @@ return value, including when earlier rendering defers its submission.
 `computeAsync()` still observes its own submission and public `compute()`
 override without waiting for unrelated rendering queued afterward. A compute
 call before initialization retains its source Promise.
+
+Disposing a `ComputeNode` after its dispatch has been accepted does not cancel
+that queued work. The accepted request retains its shader, binding snapshots and
+resource histories until submission and release, matching the source's already
+submitted dispatch. Reusing the node after disposal initializes a new generation
+without replacing earlier queued uniforms. Disposal during capture or unfinished
+asynchronous compilation remains rejected, and renderer disposal still stops
+submission. The existing retained-entry owner releases retired uniform storage
+after its last accepted use.
 
 The focused guards and recording-device integration cases pass under Node:
 `node --test tools/ingest/three_node_capture.test.mjs
