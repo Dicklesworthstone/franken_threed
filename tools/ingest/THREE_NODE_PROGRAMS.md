@@ -3560,8 +3560,11 @@ renderer and attachment/depth scopes. Source material-version and dynamic-key
 checks precede the effectful clipping-key check: simultaneous changes can retain
 the previous builder for one draw. Its original plane-array lifetime, uniform
 allocation, key exceptions and self-disposing callbacks remain source-owned.
+Disposing native program ownership releases that renderer's retained clipping
+contexts. Recreated support uses fresh group identities while previously
+captured plane snapshots and uniform packets keep their original values.
 
-The 26 native clipping-extension regressions compare pinned builder/callback
+The 27 native clipping-extension regressions compare pinned builder/callback
 traces, complete WGSL and uniform bytes for six mesh material families, nested
 groups, mode/count changes and one/four-sample coverage. A public renderer case
 with a recording device checks four queued draws and their exact

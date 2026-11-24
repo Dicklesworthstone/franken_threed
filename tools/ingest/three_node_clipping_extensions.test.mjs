@@ -177,6 +177,36 @@ test('clipping projection retains source group keys per render context and freez
   }
 });
 
+test('disposing program ownership recreates clipping contexts without changing accepted snapshots', t => {
+  const f = fixture(t), group = f.group(), item = f.add(group), otherOwner = {};
+  const hierarchy = new Map(), visibility = new Map();
+  f.scene.traverse(object => { hierarchy.set(object, object.children.slice()); visibility.set(object, object.visible); });
+  const project = (contextOwner = f.renderer) => captureThreeNodeClipping(T, {
+    root: f.scene, camera: f.camera, hierarchy, visibility, contextOwner, renderContext: 'canvas',
+    fail: (_, message) => assert.fail(message),
+  }).get(item.object);
+  const before = project(), other = project(otherOwner);
+  const descriptor = f.programs.compile(item.material, item.object, f.context(item, before));
+  const packet = f.capture(item, before, descriptor), bytes = packet.uniforms.map(value => value.slice());
+  const planes = before.unionPlanes.map(plane => plane.toArray());
+  assert.equal(project().cacheKey, before.cacheKey, 'live ownership retains the selected context');
+
+  f.programs.dispose();
+  const programs = createThreeNodePrograms({three: T, renderer: f.renderer});
+  t.after(() => programs.dispose());
+  const recreated = project();
+  assert.notEqual(recreated.cacheKey, before.cacheKey, 'source RenderContexts disposal releases old group identities');
+  assert.equal(project().cacheKey, recreated.cacheKey, 'recreated ownership retains its new context');
+  assert.equal(project(otherOwner).cacheKey, other.cacheKey, 'another renderer keeps its own context');
+  group.clippingPlanes[0].constant = .875; f.renderer.info.calls++;
+  const after = project(), context = f.context(item, after);
+  const next = programs.compile(item.material, item.object, context);
+  const updated = programs.captureDraw(next, context);
+  assert.notDeepEqual(updated.uniforms, bytes, 'new draws observe the new projected planes');
+  assert.deepEqual(before.unionPlanes.map(plane => plane.toArray()), planes);
+  assert.deepEqual(packet.uniforms, bytes, 'recreating ownership cannot rewrite accepted uniform packets');
+});
+
 for (const family of ['MeshBasic', 'MeshStandard', 'MeshPhysical'])
 test(`ordinary ${family} custom keys compose with clipped source builders`, t => {
   const f = fixture(t), group = f.group(), material = new T[family + 'Material'](), calls = [];

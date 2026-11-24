@@ -38,7 +38,8 @@ import {inspectThreeNativeShadowFilter, inspectThreeNativeShadowGraph, captureTh
   registerThreeNativeShadow, updateThreeNativeShadow, withThreeNativeComputePrerequisites} from './three_node_shadows.mjs';
 import {inspectThreePipelineContext, inspectThreeLightingContext, inspectThreeNativePass,
   updateThreeNativePass, inspectThreeMRT, inspectThreeNativeCamera} from './three_node_passes.mjs';
-import {inspectThreeNodeClipping, updateThreeNodeClipping, threeNodeClippingCacheKey, threeNodeClippingSource} from './three_node_clipping.mjs';
+import {inspectThreeNodeClipping, updateThreeNodeClipping, threeNodeClippingCacheKey,
+  threeNodeClippingSource, releaseThreeNodeClipping} from './three_node_clipping.mjs';
 import {createThreeNodeEffects} from './three_node_effects.mjs';
 import {inspectThreeNativeBatch} from './three_node_batch.mjs';
 import {createThreeNodeWireframes} from './three_node_wireframe.mjs';
@@ -2903,6 +2904,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     vertexStorage(descriptor) { const state = stateOf(descriptor); return state.generated ? generatedAttributes.storage(state.attributeOwner) : []; },
     release(descriptor) { for (const entry of entries) if (entry.descriptor === descriptor) { retire(entry); break; } },
     dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry);
+      releaseThreeNodeClipping(renderer);
       for (const record of [...customKeyRecords]) record.dispose();
       for (const record of bundleGeometryRecords) releaseBundleGeometry(record);
       for (const record of fogResourceRecords) releaseFogResources(record);

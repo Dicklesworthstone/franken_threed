@@ -8,6 +8,12 @@ let contextSerial = 0;
 const contextState = () => ({id: contextSerial++, version: 0, cacheKey: '', parentVersion: null,
   clipIntersection: null, unionPlanes: [], intersectionPlanes: []});
 
+/** Renderer disposal clears source RenderContexts. Already captured snapshots
+ * and builders retain their arrays; later ownership starts fresh contexts. */
+export function releaseThreeNodeClipping(contextOwner) {
+  contextOwners.delete(contextOwner);
+}
+
 export function captureThreeNodeClipping(three, {root, camera, hierarchy, visibility,
   shadowPass = false, maxPlanes = 8192, backgroundMesh = null, contextOwner = root,
   renderContext = 'default', fail} = {}) {
