@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
+import {getFormat} from '../../upstream/three.js/src/renderers/webgpu/utils/WebGPUTextureUtils.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
@@ -29,12 +30,12 @@ function fixture(t, limits = {}) {
     const encoder = encode(), compute = [];
     return {...encoder, beginComputePass() {
       const pass = {draws: [], compute: true, groups: []}; compute.push(pass);
-      return {setPipeline() {}, setBindGroup(index, group) { pass.groups[index] = group; }, dispatchWorkgroups() {}, end() {}};
+      return {setPipeline(pipeline) { pass.pipeline = pipeline; }, setBindGroup(index, group) { pass.groups[index] = group; }, dispatchWorkgroups() {}, end() {}};
     }, finish() { return [...encoder.finish(), ...compute]; }};
   };
   device.queue.submit = commands => {
     for (const passes of commands) for (const pass of passes) {
-      if (pass.compute) events.push({compute: pass.groups.flatMap(group => group.entries).filter(entry => entry.resource.texture)});
+      if (pass.compute) events.push({compute: pass.groups.flatMap(group => group.entries).filter(entry => entry.resource.texture), pipeline: pass.pipeline});
       else for (const draw of pass.draws) if (draw.pipeline.vertex.entryPoint === 'main') events.push({draw});
     }
     submit(commands);
@@ -52,14 +53,14 @@ function fixture(t, limits = {}) {
   t.after(() => { renderer.dispose(); material.dispose(); mesh.geometry.dispose(); });
   return {renderer, device, material, mesh, scene, camera, textures, captures, events};
 }
-function storage(t, {array = false, type = T.UnsignedByteType, format = T.RGBAFormat} = {}) {
-  const texture = array ? new T.StorageArrayTexture(4, 4, 2) : new T.StorageTexture(4, 4);
+function storage(t, {array = false, volume = false, type = T.UnsignedByteType, format = T.RGBAFormat} = {}) {
+  const texture = volume ? new T.Storage3DTexture(4, 4, 2) : array ? new T.StorageArrayTexture(4, 4, 2) : new T.StorageTexture(4, 4);
   Object.assign(texture, {type, format, generateMipmaps: true, mipmapsAutoUpdate: false,
     minFilter: T.NearestFilter, magFilter: T.NearestFilter});
   t.after(() => texture.dispose()); return texture;
 }
 function graph(f, texture, mip = 1) {
-  let node = N.storageTexture(texture, N.ivec2(0, 0)).setSampler(false).setMipLevel(mip);
+  let node = N.storageTexture(texture, texture.is3DTexture ? N.ivec3(0) : N.ivec2(0, 0)).setSampler(false).setMipLevel(mip);
   if (texture.isArrayTexture) node = node.depth(N.int(1));
   f.material.colorNode = N.vec3(node.xyz);
   f.material.positionNode = N.positionLocal.add(N.vec3(node.x.toFloat().mul(.01), 0, 0));
@@ -98,6 +99,63 @@ for (const profile of [
   assert.equal(vertex.texture.format, profile.native); assert.ok(vertex.texture.usage & 8);
   assert.equal(vertex.texture.depthOrArrayLayers, profile.array ? 2 : 1);
   assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+const compactFormats = [
+  {type: T.UnsignedByteType, format: T.RedFormat, native: 'r8unorm'},
+  {type: T.UnsignedByteType, format: T.RGFormat, native: 'rg8unorm'},
+  {type: T.HalfFloatType, format: T.RedFormat, native: 'r16float'},
+  {type: T.HalfFloatType, format: T.RGFormat, native: 'rg16float'},
+];
+for (const profile of compactFormats) for (const dimension of ['2d', '2d-array', '3d'])
+test(`compact ${profile.native} ${dimension} compute and graphics preserve source shaders and shared storage`, async t => {
+  const f = fixture(t), texture = storage(t, {...profile, array: dimension === '2d-array', volume: dimension === '3d'});
+  f.device.features.add('texture-formats-tier1'); graph(f, texture);
+  let output = N.storageTexture(texture).toWriteOnly().setMipLevel(1);
+  if (texture.isArrayTexture) output = output.depth(N.int(1));
+  const compute = N.Fn(() => { N.textureStore(output, texture.is3DTexture ? N.uvec3(0) : N.uvec2(0), N.vec4(.25, .5, .75, 1)); })().compute(1);
+  t.after(() => compute.dispose()); await f.renderer.init();
+  assert.equal(getFormat(texture, f.device), profile.native, 'allocation format is the pinned source format');
+  const sourceCompute = new T.WGSLNodeBuilder(null, f.renderer); sourceCompute.compute = compute; sourceCompute.build();
+  const source = sourceShaders(f);
+  f.renderer.compute(compute); f.renderer.render(f.scene, f.camera);
+  f.renderer.compute(compute); f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  const selected = draws(f).filter(draw => views(draw).some(view => view.texture.format === profile.native));
+  assert.equal(selected.length, 2);
+  assert.equal(descriptor(f).vertex, source.vertexShader); assert.equal(descriptor(f).fragment, source.fragmentShader);
+  const produced = f.events.filter(event => event.compute);
+  assert.equal(produced.length, 2);
+  assert.ok(produced.every(event => event.pipeline.compute.module.code === sourceCompute.computeShader));
+  assert.match(sourceCompute.computeShader, new RegExp(`texture_storage_${dimension === '3d' ? '3d' : dimension === '2d-array' ? '2d_array' : '2d'}<${profile.native}, write>`));
+  assert.ok(selected.every(draw => layouts(draw).filter(entry => entry.storageTexture).every(entry =>
+    entry.storageTexture.access === 'read-only' && entry.storageTexture.format === profile.native)));
+  const native = produced[0].compute[0].resource.texture;
+  assert.ok(produced.every(event => event.compute[0].resource.texture === native));
+  assert.ok(selected.every(draw => views(draw).every(view => view.texture === native && view.baseMipLevel === 1)));
+  assert.deepEqual(f.events.filter(event => event.compute || event.draw && views(event.draw).some(view => view.texture === native))
+    .map(event => event.compute ? 'compute' : 'draw'), ['compute', 'draw', 'compute', 'draw']);
+  let sampled = texture.is3DTexture ? N.texture3D(texture, N.vec3(.5)) : N.texture(texture, N.vec2(.5));
+  if (texture.isArrayTexture) sampled = sampled.depth(N.int(1));
+  f.material.colorNode = sampled.xyz; f.material.positionNode = null; f.material.needsUpdate = true;
+  await f.renderer.renderAsync(f.scene, f.camera);
+  const sampledDraw = draws(f).filter(draw => views(draw).some(view => view.texture === native)).at(-1);
+  const sourceSampled = sourceShaders(f);
+  assert.equal(descriptor(f).vertex, sourceSampled.vertexShader); assert.equal(descriptor(f).fragment, sourceSampled.fragmentShader);
+  assert.ok(layouts(sampledDraw).some(entry => entry.texture?.sampleType === 'float' && entry.texture.viewDimension === dimension));
+  assert.equal(f.textures.filter(value => value.label === 'f3d-storage-texture').length, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const profile of compactFormats)
+test(`compact ${profile.native} public compute and storage reads require the enabled tier1 feature`, async t => {
+  const f = fixture(t), texture = storage(t, profile); graph(f, texture);
+  const output = N.storageTexture(texture).toWriteOnly();
+  const compute = N.Fn(() => { N.textureStore(output, N.uvec2(0), N.vec4(1)); })().compute(1);
+  t.after(() => compute.dispose()); await f.renderer.init();
+  assert.throws(() => f.renderer.compute(compute), /texture-formats-tier1/);
+  assert.throws(() => f.renderer.render(f.scene, f.camera), /texture-formats-tier1/);
+  assert.equal(f.textures.filter(value => value.label === 'f3d-storage-texture').length, 0);
+  assert.equal(f.device.submissions.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
 test('queued texture replacements retain storage identity while compatible source programs are reused', async t => {

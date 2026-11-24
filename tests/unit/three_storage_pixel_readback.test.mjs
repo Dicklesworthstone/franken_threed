@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createStorageTextureTransfers} from '../../tools/ingest/three_storage_texture_transfer.mjs';
 import {deferred} from './storage_texture_fixture.mjs';
-import {setup, texture, formats} from './storage_pixel_fixture.mjs';
+import {setup, texture, formats, compactFormats} from './storage_pixel_fixture.mjs';
 
 for (const dimension of ['2d', '2d-array', '3d']) for (const format of formats) {
   test(`readback ${format[2]} ${dimension} returns exact packed bytes without retaining mapped storage`, async () => {
@@ -17,6 +17,34 @@ for (const dimension of ['2d', '2d-array', '3d']) for (const format of formats) 
     assert.equal(output.byteLength, input.byteLength); assert.equal(t.image.data, undefined); s.renderer.dispose();
   });
 }
+
+for (const dimension of ['2d', '2d-array', '3d']) for (const format of compactFormats)
+test(`compact ${format[2]} ${dimension} transfers retain odd-width pixels and aligned readback maps`, async t => {
+  const s = setup({features: ['texture-formats-tier1']}), image = texture(dimension, 3, 2, 2, format);
+  t.after(() => s.renderer.dispose());
+  const length = 3 * 2 * (dimension === '2d' ? 1 : 2) * format[3];
+  const input = Uint8Array.from({length}, (_, i) => (i * 181 + 255) & 255);
+  await s.renderer.writeStorageTexturePixelsAsync(image, input);
+  const mapping = s.device.createBuffer;
+  s.device.createBuffer = descriptor => {
+    assert.equal(descriptor.size % 4, 0, 'mapAsync and getMappedRange need a complete final word');
+    return mapping(descriptor);
+  };
+  assert.deepEqual(await s.renderer.readStorageTexturePixelsAsync(image), input);
+  assert.equal(s.device.textures.length, 1); assert.equal(s.owner.allocatedBytes, length);
+  assert.equal(s.writes[0].layout.bytesPerRow, 3 * format[3]);
+  assert.equal(s.device.buffers[0].size, Math.ceil(((dimension === '2d' ? 1 : 3) * 256 + 3 * format[3]) / 4) * 4);
+  const offset = format[3], patch = new Uint8Array(format[3]).fill(71);
+  s.renderer._drain = true;
+  const before = s.renderer.readStorageTexturePixelsAsync(image, {x: 1, y: 0, width: 1, height: 1, depth: 1});
+  const update = s.renderer.writeStorageTexturePixelsAsync(image, patch, {x: 1, y: 0, width: 1, height: 1, depth: 1});
+  const after = s.renderer.readStorageTexturePixelsAsync(image, {x: 1, y: 0, width: 1, height: 1, depth: 1});
+  patch.fill(99); s.renderer.flush(); await update;
+  assert.deepEqual(await before, input.slice(offset, offset + format[3]));
+  assert.deepEqual(await after, new Uint8Array(format[3]).fill(71));
+  assert.ok(s.device.buffers.every(buffer => buffer.destroyed === 1));
+  assert.equal(image.image.data, undefined);
+});
 
 test('read/write/read preserves each FIFO state while GPU mapping is delayed', async () => {
   const mapping = deferred(), s = setup({mapping}), t = texture('2d', 1, 1);

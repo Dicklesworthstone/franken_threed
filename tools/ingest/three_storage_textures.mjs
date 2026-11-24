@@ -16,6 +16,7 @@ export class ThreeStorageTextureError extends Error {
 const fail = (code, message) => { throw new ThreeStorageTextureError(code, message); };
 const positive = n => Number.isSafeInteger(n) && n > 0;
 const accessNames = new Map([['readOnly', 'read-only'], ['writeOnly', 'write-only'], ['readWrite', 'read-write']]);
+const tier1StorageFormats = new Set(['r8unorm', 'rg8unorm', 'r16float', 'rg16float']);
 
 export function inspectThreeStorageTexture(texture, three) {
   if (typeof three?.Texture !== 'function' || !(texture instanceof three.Texture) || !texture.isStorageTexture)
@@ -31,9 +32,12 @@ export function inspectThreeStorageTexture(texture, three) {
       ![three.NoColorSpace, three.LinearSRGBColorSpace].includes(texture.colorSpace))
     fail('FORMAT', 'Storage textures require linear GPU-authored data and no internal-format override');
   let format, texelBytes, integerType = null;
-  if (texture.type === three.UnsignedByteType && texture.format === three.RGBAFormat) [format, texelBytes] = ['rgba8unorm', 4];
-  else if (texture.type === three.HalfFloatType && texture.format === three.RGBAFormat) [format, texelBytes] = ['rgba16float', 8];
-  else if (texture.type === three.FloatType) {
+  if (texture.type === three.UnsignedByteType || texture.type === three.HalfFloatType) {
+    const channel = [[three.RedFormat, 'r', 1], [three.RGFormat, 'rg', 2], [three.RGBAFormat, 'rgba', 4]]
+      .find(([source]) => texture.format === source);
+    if (channel) [format, texelBytes] = texture.type === three.UnsignedByteType
+      ? [`${channel[1]}8unorm`, channel[2]] : [`${channel[1]}16float`, channel[2] * 2];
+  } else if (texture.type === three.FloatType) {
     if (texture.format === three.RedFormat) [format, texelBytes] = ['r32float', 4];
     else if (texture.format === three.RGFormat) [format, texelBytes] = ['rg32float', 8];
     else if (texture.format === three.RGBAFormat) [format, texelBytes] = ['rgba32float', 16];
@@ -48,7 +52,7 @@ export function inspectThreeStorageTexture(texture, three) {
       .find(([ordinary, explicit]) => texture.format !== undefined && (texture.format === ordinary || texture.format === explicit));
     if (channels) [format, texelBytes] = [`${channels[2]}32${integerType}`, channels[3]];
   }
-  if (!format) fail('FORMAT', 'Storage color must be RGBA8, RGBA16F or R/RG/RGBA32 float, sint or uint');
+  if (!format) fail('FORMAT', 'Storage color must be R/RG/RGBA8 unorm, 16F or 32-bit float, sint or uint');
   // r186 StorageArrayTexture/Storage3DTexture omit mipmapsAutoUpdate. Undefined
   // is disabled there; preserve the source object rather than inventing a flag.
   if (typeof texture.generateMipmaps !== 'boolean' ||
@@ -191,8 +195,15 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     return entry && entries.get(entry.texture) === entry && identityOf(entry.texture) === entry.proof.identity
       ? entry.proof : null;
   }
+  function checkFormat(shape) {
+    // These source formats are filterable images, but storage usage needs
+    // tier1 even for copies and sampled consumers of a StorageTexture.
+    if (tier1StorageFormats.has(shape.format) && !device().features?.has?.('texture-formats-tier1'))
+      fail('FEATURE', 'Compact storage textures require texture-formats-tier1');
+  }
   function checkExtent(shape) {
     const d = device(), {width, height, depth, viewDimension} = shape;
+    checkFormat(shape);
     const volume = viewDimension === '3d';
     const limit = volume ? (d.limits.maxTextureDimension3D ?? 2048) : d.limits.maxTextureDimension2D;
     if (width > limit || height > limit || (volume && depth > limit)) fail('LIMIT', 'Storage texture exceeds device dimensions');
@@ -249,6 +260,7 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
   }
   function bindingSnapshot(binding, entry) {
     const d = device();
+    checkFormat(entry.shape);
     // r186 SampledTexture extends Sampler, so both flags are true.
     if (binding.isSampler && !binding.isSampledTexture) return {entry, kind: 'sampler', sampler: samplerOf(binding.texture, three, entry.shape, d)};
     if (!binding.isSampledTexture) fail('BINDING', 'Expected a sampled or storage texture binding');
@@ -256,6 +268,12 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     const access = accessNames.get(binding.access), mipLevel = binding.mipLevel ?? 0;
     if (!access || !Number.isSafeInteger(mipLevel) || mipLevel < 0 || mipLevel >= entry.shape.mipLevelCount)
       fail('BINDING', 'Expected source storage access and an allocated mip level');
+    if (tier1StorageFormats.has(entry.shape.format) && access === 'read-write') {
+      if (entry.shape.format === 'rg8unorm' || entry.shape.format === 'rg16float')
+        fail('ACCESS', 'Two-channel compact storage textures require separate read-only and write-only uses');
+      if (!d.features?.has?.('texture-formats-tier2'))
+        fail('FEATURE', 'Read-write compact storage textures require texture-formats-tier2');
+    }
     // Integer labels have no implicit interpolation/reduction policy. Admit
     // manual mips, but never feed integer storage into float-only mip shaders.
     // Check the captured write controls, not later changes during a queued use.

@@ -2,7 +2,8 @@
  * All three spatial dimensions shrink. Eight clamped textureLoad taps retain
  * float32 precision and work without float32-filterable. Each dependent mip
  * runs in a separate pass; the caller owns scopes, lifetime and cache. */
-const FORMATS = new Set(['rgba8unorm', 'rgba16float', 'r32float', 'rg32float', 'rgba32float']);
+const FORMATS = new Set(['r8unorm', 'rg8unorm', 'rgba8unorm', 'r16float', 'rg16float', 'rgba16float',
+  'r32float', 'rg32float', 'rgba32float']);
 export function storageVolumeMipShader(format) {
   if (!FORMATS.has(format)) throw new Error('Unsupported storage mip format');
   return `

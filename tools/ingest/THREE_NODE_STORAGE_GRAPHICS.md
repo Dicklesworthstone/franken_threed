@@ -38,7 +38,11 @@ bindings rather than retargeting them to another allocation.
 
 ## Admitted reads
 
-The shared float-sample formats are linear RGBA8, RGBA16F, and R/RG/RGBA32F.
+The shared float-sample formats are linear R/RG/RGBA8 unorm, R/RG/RGBA16F and
+R/RG/RGBA32F. Compact R8/RG8 unorm and R16/RG16F storage requires
+`texture-formats-tier1` on the actual GPUDevice. These formats support both
+ordinary sampled reads and source read-only storage views without converting
+the image to RGBA or allocating a second texture.
 2D, 2D-array and 3D storage inputs are supported. Array reads use the source
 TextureNode layer coordinate; layers are not collapsed into a 2D image. Volume
 reads require the exact pinned Texture3DNode and a Storage3DTexture, preserving

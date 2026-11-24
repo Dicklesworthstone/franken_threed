@@ -20,8 +20,10 @@ await renderer.writeStorageTexturePixelsAsync(state, seed);
 // Kernels may now read/update state; no integer-to-float conversion occurred.
 ```
 
-Supported storage formats are the owner's RGBA8, RGBA16F and R/RG/RGBA32 float,
-signed integer and unsigned integer formats. Inputs are fixed, unshared
+Supported storage formats are R/RG/RGBA8 unorm, R/RG/RGBA16 float and
+R/RG/RGBA32 float, signed integer and unsigned integer. Compact R8/RG8 unorm
+and R16/RG16 float require `texture-formats-tier1` on the actual device, including
+when used only for transfers or sampled reads. Inputs are fixed, unshared
 ArrayBuffers or views, including DataView. Bytes are copied, not numerically
 converted: half-floats must already be encoded as half-float bits. Format and
 channel count must match the destination. This is not a DataTexture-to-Texture
@@ -69,7 +71,9 @@ Results are independent, tightly packed `Uint8Array` bytes with the texture's
 native component representation. `x/y/z`, `width/height/depth`, `mipLevel`, and
 `flipY` select/reorient the result. Upload-only `offset`, `bytesPerRow`, and
 `rowsPerImage` options are rejected, not silently ignored. Mapped 256-byte row
-padding and image strides are removed before returning the result.
+padding and image strides are removed before returning the result. Compact
+formats also round the native staging allocation to a four-byte mapping length;
+the returned bytes retain the exact logical pixel extent, including odd widths.
 
 Each pending read reserves its full padded native staging allocation AND packed
 CPU output against a 128 MiB aggregate budget. The 64-operation incomplete-transfer

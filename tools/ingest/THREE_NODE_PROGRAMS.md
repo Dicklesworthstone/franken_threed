@@ -2816,8 +2816,11 @@ compute texture owner supplies the GPU allocation and single-mip view, so a
 compute producer and its graphics consumers use the same storage without CPU
 pixel uploads or readback.
 
-The admitted formats are linear RGBA8 normalized, RGBA16 float, and
-R/RG/RGBA32 float, signed integer and unsigned integer. Native layouts retain
+The admitted formats are linear R/RG/RGBA8 unorm, R/RG/RGBA16 float, and
+R/RG/RGBA32 float, signed integer and unsigned integer. Compact R8/RG8 unorm
+and R16/RG16 float require the actual device's `texture-formats-tier1` feature.
+Their source WGSL and native storage layouts keep the exact channel count.
+Native layouts retain
 2D, array and 3D storage view dimensions. Ordinary 2D and array texel reads are
 covered by source/candidate browser execution; the pinned ordinary
 `StorageTextureNode` 3D coordinate generator still has a source shader

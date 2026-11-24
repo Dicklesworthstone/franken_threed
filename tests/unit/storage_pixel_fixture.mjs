@@ -13,6 +13,12 @@ export const formats = [
     [[THREE.RedFormat, 'r', 4], [THREE.RGFormat, 'rg', 8], [THREE.RGBAFormat, 'rgba', 16]].map(([format, name, bytes]) =>
       [type, format, name + '32' + (type === THREE.FloatType ? 'float' : type === THREE.IntType ? 'sint' : 'uint'), bytes])),
 ];
+export const compactFormats = [
+  [THREE.UnsignedByteType, THREE.RedFormat, 'r8unorm', 1],
+  [THREE.UnsignedByteType, THREE.RGFormat, 'rg8unorm', 2],
+  [THREE.HalfFloatType, THREE.RedFormat, 'r16float', 2],
+  [THREE.HalfFloatType, THREE.RGFormat, 'rg16float', 4],
+];
 export function texture(dimension = '2d', width = 3, height = 2, depth = 2, format = formats[0]) {
   const t = new THREE.Texture(width, height);
   Object.assign(t, {type: format[0], format: format[1], generateMipmaps: false, mipmapsAutoUpdate: false,
@@ -25,7 +31,7 @@ export function setup(options = {}) {
   device.limits.maxTextureDimension3D = 2048; device.limits.maxTextureArrayLayers = 256;
   const make = device.createTexture;
   device.createTexture = descriptor => {
-    const t = make(descriptor), bpp = formats.find(f => f[2] === descriptor.format)[3];
+    const t = make(descriptor), bpp = [...formats, ...compactFormats].find(f => f[2] === descriptor.format)[3];
     t.levels = Array.from({length: descriptor.mipLevelCount}, (_, level) => {
       const [width, height, depth] = descriptor.size.map((n, axis) => axis === 2 && descriptor.dimension !== '3d' ? n : Math.max(1, Math.floor(n / 2 ** level)));
       return {width, height, depth, bpp, bytes: new Uint8Array(width * height * depth * bpp)};

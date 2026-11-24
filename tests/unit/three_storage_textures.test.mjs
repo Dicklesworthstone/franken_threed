@@ -60,6 +60,63 @@ test('float32 formats retain their full storage and explicit unfilterable layout
   }
 });
 
+for (const [type, format, native, bytes] of [
+  [THREE.UnsignedByteType, THREE.RedFormat, 'r8unorm', 1],
+  [THREE.UnsignedByteType, THREE.RGFormat, 'rg8unorm', 2],
+  [THREE.HalfFloatType, THREE.RedFormat, 'r16float', 2],
+  [THREE.HalfFloatType, THREE.RGFormat, 'rg16float', 4],
+]) {
+  test(`compact ${native} storage shares exact 2D/array/volume allocations and mip pipelines`, () => {
+    for (const dimension of ['2d', '2d-array', '3d']) {
+      const {device, owner, texture} = setup({features: ['texture-formats-tier1']});
+      Object.assign(texture, {type, format, image: {width: 7, height: 3}});
+      if (dimension !== '2d') {
+        texture.image.depth = 5; texture[dimension === '3d' ? 'is3DTexture' : 'isArrayTexture'] = true;
+        texture.wrapR = THREE.ClampToEdgeWrapping;
+      }
+      const output = owner.captureBinding(write(texture)), shape = output.entry.shape;
+      assert.equal(shape.format, native); assert.equal(shape.texelBytes, bytes);
+      assert.equal(shape.bytes, bytes * (dimension === '3d' ? 7 * 3 * 5 + 3 * 1 * 2 + 1 :
+        (7 * 3 + 3 * 1 + 1) * (dimension === '2d-array' ? 5 : 1)));
+      const view = owner.resolve(output); owner.written([output]);
+      const binding = owner.bindingsFor().get(texture);
+      assert.equal(binding.view.texture, view.texture); assert.equal(binding.sampleType, 'float');
+      assert.equal(binding.sampler.descriptor.magFilter, 'linear');
+      assert.equal(owner.allocatedBytes, shape.bytes); assert.equal(device.textures.length, 1);
+      if (dimension === '2d') assert.equal(device.calls.filter(call => call[0] === 'mip').length, 2);
+      else {
+        const pipelines = device.calls.filter(call => call[0] === 'pipeline').map(call => call[1]);
+        assert.equal(pipelines.length, 2);
+        assert.ok(pipelines.every(pipeline => pipeline.descriptor.compute.module.code.includes(
+          `texture_storage_${dimension === '3d' ? '3d' : '2d_array'}<${native}, write>`)));
+      }
+      assert.equal(device.calls.some(call => call[0] === 'upload'), false);
+      owner.dispose(); assert.equal(view.texture.destroyed, 1); assert.equal(owner.allocatedBytes, 0);
+    }
+  });
+
+  test(`compact ${native} storage enforces device features and source-valid access before allocation`, () => {
+    const missing = setup(); Object.assign(missing.texture, {type, format});
+    assert.throws(() => missing.owner.captureBinding(write(missing.texture)), /texture-formats-tier1/);
+    assert.throws(() => missing.owner.layoutOf(sample(missing.texture)), /texture-formats-tier1/);
+    assert.throws(() => missing.owner.ensure(missing.owner.capture(missing.texture)), /texture-formats-tier1/);
+    assert.equal(missing.device.textures.length, 0); missing.owner.dispose();
+    for (const tier2 of [false, true]) {
+      const current = setup({features: ['texture-formats-tier1', ...(tier2 ? ['texture-formats-tier2'] : [])]});
+      const {device, owner, texture} = current; Object.assign(texture, {type, format});
+      const readWrite = {...write(texture), access: 'readWrite'};
+      if (format === THREE.RGFormat) assert.throws(() => owner.captureBinding(readWrite), /ACCESS/);
+      else if (!tier2) assert.throws(() => owner.captureBinding(readWrite), /texture-formats-tier2/);
+      else assert.equal(owner.layout(owner.captureBinding(readWrite)).storageTexture.access, 'read-write');
+      assert.equal(device.textures.length, 0);
+      const output = owner.captureBinding(write(texture));
+      owner.validateDispatch([output, owner.captureBinding({...write(texture), mipLevel: 1, access: 'readOnly'})]);
+      assert.throws(() => owner.validateDispatch([output, owner.captureBinding(sample(texture))]), /FEEDBACK/);
+      owner.dispose();
+    }
+  });
+}
+
 test('sampler changes are captured at call time without replacing storage', () => {
   const {owner, texture} = setup();
   const before = owner.captureBinding({texture, isSampler: true});

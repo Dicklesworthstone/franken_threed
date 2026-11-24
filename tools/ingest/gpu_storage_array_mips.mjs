@@ -2,7 +2,8 @@
  * Layers never filter into one another. Each dependent level has its own
  * compute pass with nonoverlapping mip views of the same allocation.
  * The caller owns validation scopes, resource lifetime and the pipeline cache. */
-const FORMATS = new Set(['rgba8unorm', 'rgba16float', 'r32float', 'rg32float', 'rgba32float']);
+const FORMATS = new Set(['r8unorm', 'rg8unorm', 'rgba8unorm', 'r16float', 'rg16float', 'rgba16float',
+  'r32float', 'rg32float', 'rgba32float']);
 export function storageArrayMipShader(format) {
   if (!FORMATS.has(format)) throw new Error('Unsupported storage mip format');
   return `

@@ -145,7 +145,9 @@ export function createStorageTextureTransfers(renderer, {maxSnapshotBytes = 128 
       for (const key of ['offset', 'bytesPerRow', 'rowsPerImage'])
         if (options[key] !== undefined) fail('OPTIONS', 'Readback returns packed bytes; upload layout options do not apply');
       const [, height, depth] = plan.size, pitch = Math.ceil(plan.rowBytes / 256) * 256;
-      const size = (depth * height - 1) * pitch + plan.rowBytes;
+      // Compact R/RG texels can leave a partial word in the final row. Mapping
+      // requires four-byte lengths; the returned pixels still omit padding.
+      const size = Math.ceil(((depth * height - 1) * pitch + plan.rowBytes) / 4) * 4;
       // Reserve BOTH the mapped native buffer and the packed result before
       // admitting a queued request. Large skinny images can have large padding.
       const charged = size + plan.bytes;

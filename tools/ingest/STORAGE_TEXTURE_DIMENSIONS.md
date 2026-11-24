@@ -28,8 +28,12 @@ source binding check. Set `generateMipmaps = true` and
 manual storage writes can select allocated mip levels without being overwritten.
 Volume `wrapR` is captured in the sampler's W address mode.
 
-Supported formats remain linear RGBA8, RGBA16F, and R/RG/RGBA32F. Linear float32
-sampling still requires the actual `float32-filterable` device feature. Positive
+Supported float-sample formats are linear R/RG/RGBA8 unorm, R/RG/RGBA16F and
+R/RG/RGBA32F. Compact R8/RG8 unorm and R16/RG16F storage requires the actual
+device's `texture-formats-tier1` feature. Read-write R8/R16F bindings additionally
+require `texture-formats-tier2`; RG8/RG16F uses separate read-only and write-only
+bindings. The existing array and volume mip helpers preserve these compact
+formats. Linear float32 sampling still requires `float32-filterable`. Positive
 integer dimensions, depth-aware memory budgets, 3D spatial limits, array-layer
 limits, stale generations, and conflicting sampled/storage usage are checked.
 This does not make a standard 2D material map accept a 3D texture: consumers must
