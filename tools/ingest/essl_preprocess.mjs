@@ -4,8 +4,9 @@
  * parsing: comments, line continuation, object/function-like #define (with
  * argument pre-expansion, # stringizing is not part of ESSL, ## pasting is
  * rejected), #undef, #if/#ifdef/#ifndef/#elif/#else/#endif with defined() and
- * integer expressions, #error. #version/#extension/#pragma/#line are recorded
- * and dropped. Undefined identifiers in #if evaluate to 0 (ESSL rule).
+ * integer expressions, #error. #version selects __VERSION__ before conditional
+ * expansion; #extension/#pragma/#line are recorded and dropped. Undefined
+ * identifiers in #if currently evaluate to 0.
  * Errors throw EsslError with a line number; nothing is silently skipped.
  */
 export class EsslError extends Error {
@@ -122,21 +123,26 @@ function evaluate(tokens, macros, line) {
   const peek = () => toks[p]?.v, next = () => toks[p++];
   const num = t => { const v = t.v.replace(/[uU]$/, ''); return /^0[xX]/.test(v) ? parseInt(v, 16) : /^0[0-7]+$/.test(v) ? parseInt(v, 8) : parseInt(v, 10); };
   const BIN = [['||'], ['&&'], ['|'], ['^'], ['&'], ['==', '!='], ['<', '>', '<=', '>='], ['<<', '>>'], ['+', '-'], ['*', '/', '%']];
-  function unary() {
+  function unary(enabled) {
     const t = next(); if (!t) essError('Incomplete #if expression', line);
-    if (t.v === '(') { const v = ternary(); if (next()?.v !== ')') essError('Missing ) in #if', line); return v; }
-    if (t.v === '!') return unary() ? 0 : 1;
-    if (t.v === '-') return -unary();
-    if (t.v === '+') return unary();
-    if (t.v === '~') return ~unary();
+    if (t.v === '(') { const v = ternary(enabled); if (next()?.v !== ')') essError('Missing ) in #if', line); return v; }
+    if (t.v === '!') return unary(enabled) ? 0 : 1;
+    if (t.v === '-') return -unary(enabled);
+    if (t.v === '+') return unary(enabled);
+    if (t.v === '~') return ~unary(enabled);
     if (t.t === 'num') return num(t);
     essError(`Unexpected '${t.v}' in #if`, line);
   }
-  function binary(level) {
-    if (level === BIN.length) return unary();
-    let left = binary(level + 1);
+  function binary(level, enabled) {
+    if (level === BIN.length) return unary(enabled);
+    let left = binary(level + 1, enabled);
     while (BIN[level].includes(peek())) {
-      const op = next().v, right = binary(level + 1);
+      const op = next().v;
+      // Parse both sides so malformed source still fails, but never evaluate
+      // arithmetic hidden behind a source short-circuit guard.
+      const rightEnabled = enabled && (op === '&&' ? left !== 0 : op === '||' ? left === 0 : true);
+      const right = binary(level + 1, rightEnabled);
+      if (!enabled) { left = 0; continue; }
       switch (op) {
         case '||': left = left || right ? 1 : 0; break; case '&&': left = left && right ? 1 : 0; break;
         case '|': left |= right; break; case '^': left ^= right; break; case '&': left &= right; break;
@@ -151,10 +157,10 @@ function evaluate(tokens, macros, line) {
     }
     return left;
   }
-  function ternary() {
-    const c = binary(0);
+  function ternary(enabled = true) {
+    const c = binary(0, enabled);
     if (peek() !== '?') return c;
-    next(); const a = ternary(); if (next()?.v !== ':') essError('Malformed ?: in #if', line); const b = ternary();
+    next(); const a = ternary(enabled && c !== 0); if (next()?.v !== ':') essError('Malformed ?: in #if', line); const b = ternary(enabled && c === 0);
     return c ? a : b;
   }
   const v = ternary();
@@ -165,11 +171,17 @@ function evaluate(tokens, macros, line) {
 /** Preprocess one shader stage. Returns {tokens, version, extensions, pragmas}. */
 export function preprocess(source, {defines = {}} = {}) {
   const text = stripComments(source), lines = text.split('\n');
-  const macros = new Map([['GL_ES', {params: null, body: [{t: 'num', v: '1'}]}], ['__VERSION__', {params: null, body: [{t: 'num', v: '300'}]}],
+  // ESSL without a version directive is 1.00, including RawShaderMaterial.
+  // Ordinary r186 ShaderMaterial assembly prepends its own #version 300 es.
+  const macros = new Map([['GL_ES', {params: null, body: [{t: 'num', v: '1'}]}], ['__VERSION__', {params: null, body: [{t: 'num', v: '100'}]}],
     ['GL_FRAGMENT_PRECISION_HIGH', {params: null, body: [{t: 'num', v: '1'}]}]]);
-  for (const [k, v] of Object.entries(defines)) macros.set(k, {params: null, body: tokenize(String(v))});
+  const predefined = new Set(macros.keys());
+  for (const [k, v] of Object.entries(defines)) {
+    if (predefined.has(k)) essError(`Cannot redefine predefined macro ${k}`);
+    macros.set(k, {params: null, body: tokenize(String(v))});
+  }
   const stack = [], out = [], extensions = [], pragmas = [];
-  let version = null, pending = [], pendingStart = 1;
+  let version = null, pending = [], pendingStart = 1, hasSource = false;
   const active = () => stack.every(s => s.active);
   const flush = () => {
     if (!pending.length) return;
@@ -178,9 +190,25 @@ export function preprocess(source, {defines = {}} = {}) {
   };
   for (let n = 0; n < lines.length; n++) {
     const raw = lines[n], line = n + 1, m = /^\s*#\s*([A-Za-z_]*)(.*)$/.exec(raw);
-    if (!m) { if (active()) { if (!pending.length) pendingStart = line; pending.push(raw); } else if (pending.length) pending.push(''); continue; }
+    if (!m) {
+      if (raw.trim()) hasSource = true;
+      if (active()) { if (!pending.length) pendingStart = line; pending.push(raw); }
+      else if (pending.length) pending.push('');
+      continue;
+    }
     const [, directive, rest] = m;
     const tokens = () => tokenize(rest, line);
+    // The version declaration is not conditional preprocessing. Even a prior
+    // directive that emits no tokens (or an inactive branch) makes it too late.
+    if (directive === 'version') {
+      if (hasSource) essError('#version must precede all shader declarations and directives', line);
+      version = rest.trim();
+      if (!/^(?:100|300\s+es)$/.test(version)) essError(`Unsupported #version ${version}`, line);
+      macros.set('__VERSION__', {params: null, body: [{t: 'num', v: version.startsWith('100') ? '100' : '300', line}]});
+      hasSource = true;
+      continue;
+    }
+    hasSource = true;
     if (['if', 'ifdef', 'ifndef'].includes(directive)) {
       const parentActive = active();
       let value = false;
@@ -209,17 +237,18 @@ export function preprocess(source, {defines = {}} = {}) {
       const m2 = /^\s*([A-Za-z_][A-Za-z0-9_]*)(\(([^)]*)\))?(.*)$/.exec(rest);
       if (!m2) essError('Malformed #define', line);
       const [, name, paren, list, body] = m2;
-      if (name.startsWith('GL_') || name.includes('__')) {
-        // ESSL reserves these; three never defines them. Accept but warn-free.
-      }
+      if (predefined.has(name)) essError(`Cannot redefine predefined macro ${name}`, line);
       const params = paren === undefined ? null : list.trim() === '' ? [] : list.split(',').map(s => s.trim());
       const bodyTokens = tokenize(body, line);
       if (bodyTokens.some(t => t.v === '##' || t.v === '#')) essError('Token pasting/stringizing is not ESSL', line);
       macros.set(name, {params, body: bodyTokens});
       continue;
     }
-    if (directive === 'undef') { macros.delete(tokens()[0]?.v); continue; }
-    if (directive === 'version') { version = rest.trim(); continue; }
+    if (directive === 'undef') {
+      const name = tokens()[0]?.v;
+      if (predefined.has(name)) essError(`Cannot undefine predefined macro ${name}`, line);
+      macros.delete(name); continue;
+    }
     if (directive === 'extension') { extensions.push(rest.trim()); continue; }
     if (directive === 'pragma') { pragmas.push(rest.trim()); continue; }
     if (directive === 'line') continue;

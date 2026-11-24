@@ -66,6 +66,16 @@ out-of-range subscripts fail explicitly.
 
 ## Semantics preserved
 
+- Preprocessor version selection follows the submitted source: omitted
+  `#version` and explicit `#version 100` define `__VERSION__` as `100`, while
+  `#version 300 es` defines it as `300` before conditional or macro expansion.
+  This preserves version-adaptive `RawShaderMaterial` programs; ordinary r186
+  `ShaderMaterial` still receives its source-generated ESSL 3.00 prefix. Built-in
+  macro redefinition/undefinition is rejected. Logical `#if`/`#elif` guards
+  short-circuit unevaluated arithmetic while retaining syntax validation, as
+  specified by Khronos ESSL 3.00 sections 3.4 and 3.5. Compiler and production
+  material-assembly tests cover both versions; this is compatibility evidence,
+  not a performance measurement.
 - Clip depth: `gl_Position.z` remapped from GL `[-w, w]` to WebGPU `[0, w]`
   (`clipDepth: 'webgpu'` disables it for WebGPU-convention projections).
 - `rows: 'gl'` (render targets sampled later by GL-convention shaders): clip Y

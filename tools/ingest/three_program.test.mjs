@@ -43,6 +43,43 @@ test('ShaderMaterial sources follow r186 WebGLProgram: version, precision, defin
   assert.throws(() => threeProgramSources(T, shader({stencilWrite: true}), mesh, state), {code: 'THREE_PROGRAM_MATERIAL'});
 });
 
+test('production material assembly preserves raw ESSL1 version branches and the r186 ESSL3 conversion', () => {
+  const support = createThreeProgramSupport({three: T, state: () => state});
+  try {
+    for (const [Type, glslVersion, version] of [
+      [T.RawShaderMaterial, null, 100], [T.RawShaderMaterial, T.GLSL1, 100],
+      [T.RawShaderMaterial, T.GLSL3, 300], [T.ShaderMaterial, null, 300],
+    ]) {
+      const raw = Type === T.RawShaderMaterial;
+      const vertexShader = (raw ? `precision highp float;
+#if __VERSION__ >= 300
+in vec3 position;
+#else
+attribute vec3 position;
+#endif
+` : '') + 'void main(){gl_Position=vec4(position,1.);}';
+      const fragmentShader = `precision highp float;
+#if __VERSION__ == 100
+uniform vec4 legacyTint;
+#define SELECTED_TINT legacyTint
+#else
+uniform vec4 modernTint;
+#define SELECTED_TINT modernTint
+#endif
+` + (raw && version === 300 ? 'out vec4 color;\n#define RESULT color\n' : '#define RESULT gl_FragColor\n') +
+        'void main(){RESULT=SELECTED_TINT;}';
+      const material = new Type({glslVersion, vertexShader, fragmentShader});
+      const geometry = new T.PlaneGeometry(), mesh = new T.Mesh(geometry, material);
+      try {
+        const compiled = support.compile(material, mesh).program;
+        const selected = compiled.reflection.uniforms.map(uniform => uniform.name).filter(name => /Tint$/.test(name));
+        assert.deepEqual(selected, [version === 100 ? 'legacyTint' : 'modernTint'], `${Type.name}/${glslVersion}`);
+        assert.doesNotMatch(compiled.vertex + compiled.fragment, /__VERSION__|SELECTED_TINT/);
+      } finally {geometry.dispose(); material.dispose();}
+    }
+  } finally {support.dispose();}
+});
+
 test('raster state uses WebGLState: blend table, BACK culling with frontFace flips', () => {
   const additive = threeProgramRaster(T, shader({blending: T.AdditiveBlending, transparent: true}));
   assert.deepEqual(additive.blend, {color: {operation: 'add', srcFactor: 'src-alpha', dstFactor: 'one'}, alpha: {operation: 'add', srcFactor: 'one', dstFactor: 'one'}});

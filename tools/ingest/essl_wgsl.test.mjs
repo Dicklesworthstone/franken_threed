@@ -58,6 +58,77 @@ test('preprocessor: function-like macros, nested conditionals, defined() and #er
   assert.throws(() => preprocess('#if 1\n'), EsslError);
 });
 
+test('version-adaptive shaders select the declared ESSL surface before expansion', () => {
+  for (const [prefix, version] of [['', 100], ['#version 100\n', 100], ['#version 300 es\n', 300]]) {
+    const definitions = '#define VERSION_ALIAS __VERSION__\n#define MODERN(v) ((v) >= 300)\n';
+    const vertex = prefix + definitions + `
+#if MODERN(VERSION_ALIAS)
+in vec3 position;
+out vec2 sampleUv;
+#else
+attribute vec3 position;
+varying vec2 sampleUv;
+#endif
+void main(){sampleUv=position.xy;gl_Position=vec4(position,1.);}`;
+    const fragment = prefix + definitions + `
+precision highp float;
+#if VERSION_ALIAS == 100
+varying vec2 sampleUv;
+uniform vec4 legacyTint;
+#define RESULT gl_FragColor
+#define TINT legacyTint
+#elif MODERN(VERSION_ALIAS)
+in vec2 sampleUv;
+out vec4 modernColor;
+uniform vec4 modernTint;
+#define RESULT modernColor
+#define TINT modernTint
+#else
+#error unsupported version
+#endif
+void main(){RESULT=TINT+vec4(sampleUv,0.,0.);}`;
+    const compiled = program(vertex, fragment);
+    assert.deepEqual(compiled.reflection.uniforms.map(value => value.name),
+      [version === 100 ? 'legacyTint' : 'modernTint'], prefix || 'default ESSL1');
+    assert.deepEqual(compiled.reflection.outputs.map(value => value.name),
+      [version === 100 ? 'gl_FragColor' : 'modernColor']);
+    assert.equal(compiled.reflection.varyings[0].name, 'sampleUv');
+    assert.equal(preprocess(prefix + definitions + 'int selected=VERSION_ALIAS;').tokens.at(-2).v, String(version));
+  }
+});
+
+test('preprocessor version guards short-circuit unreachable arithmetic and still check syntax', () => {
+  const body = `#if __VERSION__ == 100 || 1 / (__VERSION__ - 100)
+float selected;
+#endif
+#if __VERSION__ != 100 && 1 / (__VERSION__ - 100)
+float unreachable;
+#elif 1 || (2 % 0)
+float fallback;
+#endif`;
+  assert.equal(preprocess(body).tokens.map(token => token.v).join(' '), 'float selected ; float fallback ;');
+  for (const expression of ['0 && (1 / 0)', '1 || (1 % 0)', '0 && (1 || 1 / 0)', '1 || (0 && 1 / 0)'])
+    assert.doesNotThrow(() => preprocess(`#if ${expression}\nfloat x;\n#endif`), expression);
+  for (const expression of ['1 && (1 / 0)', '0 || (1 % 0)', '1 && (0 || 1 / 0)'])
+    assert.throws(() => preprocess(`#if ${expression}\nfloat x;\n#endif`), /Division by zero/, expression);
+  for (const expression of ['0 && (1 +)', '1 || (2 *)', '0 && (1 / 0'])
+    assert.throws(() => preprocess(`#if ${expression}\nfloat x;\n#endif`), EsslError, expression);
+});
+
+test('predefined version state cannot be overwritten by shader or compiler defines', () => {
+  for (const name of ['__VERSION__', 'GL_ES', 'GL_FRAGMENT_PRECISION_HIGH']) {
+    assert.throws(() => preprocess(`#define ${name} 7\nint x=${name};`), /Cannot redefine predefined macro/);
+    assert.throws(() => preprocess(`#undef ${name}\n`), /Cannot undefine predefined macro/);
+    assert.throws(() => preprocess('void main(){}', {defines: {[name]: 7}}), /Cannot redefine predefined macro/);
+    assert.doesNotThrow(() => preprocess(`#if 0\n#define ${name} 7\n#undef ${name}\n#endif`));
+  }
+  for (const declaration of ['100 es', '300', '300 es extra', '310 es', 'VERSION'])
+    assert.throws(() => preprocess(`#version ${declaration}\nvoid main(){}`), /Unsupported #version/);
+  for (const prefix of ['#version 100\n', '#define EARLIER 1\n', '#if 0\n#endif\n', '#if 0\n', '#\n', 'float x;\n'])
+    assert.throws(() => preprocess(prefix + '#version 300 es\n'), /#version must precede/);
+  assert.equal(preprocess('// source comment\n/* another */\n#version 100\n__VERSION__').tokens[0].v, '100');
+});
+
 test('clip depth remaps GL [-w,w] to WebGPU [0,w]; gl_FragCoord is GL bottom-left; dFdy keeps GL sign', () => {
   const r = program(minimalVS, F('color = vec4(gl_FragCoord.xy, dFdy(gl_FragCoord.y), 1.0);'));
   assert.match(r.vertex, /out\.f3d_position = vec4<f32>\(f3d_Position\.xy, \(f3d_Position\.z \+ f3d_Position\.w\) \* 0\.5, f3d_Position\.w\);/);
