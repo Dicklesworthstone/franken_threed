@@ -506,7 +506,10 @@ export class WebGpuBridgeHost {
     // Synchronous execution block inside error scopes
     let submitted = false;
     const completion = this.withErrorScopes(["validation", "out-of-memory"], () => {
-      const commandEncoder = this.device.createCommandEncoder();
+      // Upfront uploads precede all encoded work. Once recording starts, uploads
+      // must occupy their packet position so earlier reads see the earlier bytes.
+      let commandEncoder = null;
+      const encoder = () => (commandEncoder ??= device.createCommandEncoder());
       const stagingBuffers = [];
       try {
         let cursor = headerLen;
@@ -613,7 +616,21 @@ export class WebGpuBridgeHost {
               if (isDetached(chunk)) {
                 throw new Error("WriteBuffer: data slice is detached");
               }
-              this.device.queue.writeBuffer(buffer, offset, chunk);
+              if (!commandEncoder) {
+                device.queue.writeBuffer(buffer, offset, chunk);
+              } else {
+                if (offset % 4 !== 0 || dataLength % 4 !== 0 || offset + dataLength > buffer.size)
+                  throw new RangeError("WriteBuffer: copy must be aligned and fit in the destination");
+                const stagingBuffer = device.createBuffer({
+                  size: Math.max(dataLength, 4),
+                  usage: GPUBufferUsage.COPY_SRC,
+                  mappedAtCreation: true,
+                });
+                stagingBuffers.push(stagingBuffer);
+                new Uint8Array(stagingBuffer.getMappedRange()).set(chunk);
+                stagingBuffer.unmap();
+                commandEncoder.copyBufferToBuffer(stagingBuffer, 0, buffer, offset, dataLength);
+              }
               break;
             }
 
@@ -737,7 +754,7 @@ export class WebGpuBridgeHost {
               }
               stagingBuffer.unmap();
 
-              commandEncoder.copyBufferToTexture(
+              encoder().copyBufferToTexture(
                 {
                   buffer: stagingBuffer,
                   offset: 0,
@@ -1325,7 +1342,7 @@ export class WebGpuBridgeHost {
                   colorAttachmentDesc.resolveTarget = colorResolveView(sourceTexture, this.textures.get(resolveTargetId));
                 }
 
-                currentPassEncoder = commandEncoder.beginRenderPass({
+                currentPassEncoder = encoder().beginRenderPass({
                   colorAttachments: [colorAttachmentDesc],
                 });
                 currentPassTargetKey = targetKey;
@@ -1591,7 +1608,7 @@ export class WebGpuBridgeHost {
                   }
                 }
 
-                currentPassEncoder = commandEncoder.beginRenderPass({
+                currentPassEncoder = encoder().beginRenderPass({
                   colorAttachments: [colorAttachmentDesc],
                   depthStencilAttachment: depthAttachmentDesc,
                 });
@@ -1719,7 +1736,7 @@ export class WebGpuBridgeHost {
               const unalignedBytesPerRow = width * 4;
               const bytesPerRow = Math.ceil(unalignedBytesPerRow / 256) * 256;
 
-              commandEncoder.copyTextureToBuffer(
+              encoder().copyTextureToBuffer(
                 { texture: texture },
                 { buffer: buffer, bytesPerRow: bytesPerRow, rowsPerImage: height },
                 [width, height, 1],
@@ -1845,7 +1862,7 @@ export class WebGpuBridgeHost {
 
               this.bufferEpochs.set(destinationBufferId, { epochHi, epochLo });
 
-              commandEncoder.copyBufferToBuffer(
+              encoder().copyBufferToBuffer(
                 srcBuffer,
                 sourceOffset,
                 dstBuffer,
@@ -2133,7 +2150,7 @@ export class WebGpuBridgeHost {
                   targetView = texture.createView();
                 }
 
-                currentPassEncoder = commandEncoder.beginRenderPass({
+                currentPassEncoder = encoder().beginRenderPass({
                   colorAttachments: [
                     {
                       view: targetView,
@@ -2580,7 +2597,7 @@ export class WebGpuBridgeHost {
                 entries: bindGroupEntries,
               });
 
-              const pass = commandEncoder.beginComputePass();
+              const pass = encoder().beginComputePass();
               pass.setPipeline(pipelineRecord.pipeline);
               pass.setBindGroup(0, bindGroup);
               pass.dispatchWorkgroups(workgroupCountX, workgroupCountY, workgroupCountZ);
@@ -2599,7 +2616,7 @@ export class WebGpuBridgeHost {
         closeActivePass();
         frameCanvasView = null;
         // Finish and submit synchronously inside the error scope
-        const commandBuffer = commandEncoder.finish();
+        const commandBuffer = encoder().finish();
         this.device.queue.submit([commandBuffer]);
         submitted = true;
       } finally {

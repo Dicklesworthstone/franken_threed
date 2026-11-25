@@ -34,7 +34,7 @@
       TARGET_OFFSCREEN,
       WebGpuBridgeHost,
     } from "./bridge_runtime.js";
-    import { testBufferCopy } from "./buffer_copy_test.js";
+    import { testBufferCopy, testInterleavedBufferUploads } from "./buffer_copy_test.js";
     import { testCanvasSubmissionLifetime } from "./canvas_lifetime_test.js";
     import { testComputeAffine } from "./compute_affine_test.js";
     import { testAffineLayoutCounterexample } from "./counterexample_affine_layout_test.js";
@@ -1743,6 +1743,7 @@
         results.tests.multisample_color_resolve.implementation_owner = "Rust/Wasm graph and packet encoder; JavaScript WebGPU adapter";
         logPass("dynamic_mesh_scene", await testMeshScene(bridge, wasmExports));
         logPass("buffer_copy", await testBufferCopy(bridge, wasmExports, canvasContext));
+        logPass("interleaved_buffer_upload", await testInterleavedBufferUploads(bridge));
         logPass("workload_b_storage_copy", await testWorkloadBStorageCopy(bridge, wasmExports));
         results.tests.workload_b_storage_copy.implementation_owner = "Rust/Wasm packer and packet encoder; JavaScript WebGPU adapter";
 

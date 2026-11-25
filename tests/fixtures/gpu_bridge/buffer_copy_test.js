@@ -1,6 +1,30 @@
 // Buffer-to-buffer copy regression using real WebGPU buffers, copyBufferToBuffer, and readback.
 // Exercises canonical Rust exports f3d_build_buffer_copy_packet and f3d_build_render_then_copy_packet.
 
+import { PacketBuilder } from "./direct_reference.js";
+
+// Two reads reuse exactly the same source range in one submission.
+export async function testInterleavedBufferUploads(host) {
+  const source = 612, dest = 613;
+  const builder = new PacketBuilder();
+  builder.createBuffer(source, 16, GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+  builder.createBuffer(dest, 16, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+  builder.writeBuffer(source, 4, Uint8Array.of(1, 2, 3, 4));
+  builder.copyBufferToBuffer(source, 4, dest, 0, 4);
+  builder.writeBuffer(source, 4, Uint8Array.of(5, 6, 7, 8));
+  builder.copyBufferToBuffer(source, 4, dest, 4, 4);
+  try {
+    await host.executePacket(builder.build());
+    const bytes = await host.readbackBuffer(dest, 16);
+    const expected = [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0];
+    if (!expected.every((value, index) => bytes[index] === value))
+      throw new Error("Interleaved uploads reordered: " + bytes.join(","));
+  } finally {
+    await drainAndCleanup(host, source, dest);
+  }
+  return "Two writes to the same source range produced both ordered snapshots in a single packet";
+}
+
 function findCopyCommandPayloadOffset(bytes) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const commandEnd = bytes.byteLength - view.getUint32(12, true);
