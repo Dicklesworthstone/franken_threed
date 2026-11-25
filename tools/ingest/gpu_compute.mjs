@@ -86,7 +86,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       !Number.isSafeInteger(maxCachedBindGroups) || maxCachedBindGroups < 0)
     fail('OPTIONS', 'Expected a GPUDevice, positive resource limits and a nonnegative bind-group cache limit');
   const buffers = new Map(), pipelines = new Map(), compiled = new Map(), staging = new Set(), pending = new Set();
-  const preparing = new Set();
+  const preparing = new Set(), dispatchGroups = new Set();
   // The cache owns only a bounded working set. Callers may retain a prepared
   // pipeline beyond eviction; weak admission preserves its use without turning
   // every shader ever seen into a renderer-lifetime allocation.
@@ -103,6 +103,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     terminal = error instanceof Error ? error : new GpuComputeError('ABORTED', String(error ?? 'Compute execution aborted'));
     releaseDeviceLoss?.(); releaseDeviceLoss = null;
     lifetime.abort(terminal);
+    for (const group of dispatchGroups) group.abort(terminal);
     attributeOwner.dispose();
     bindGroups.clear();
     bindingIds = new WeakMap(); bindingUsers = new WeakMap(); bindingLayouts = new WeakMap();
@@ -398,46 +399,106 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     run.catch(() => { if (pipelines.get(key) === run) pipelines.delete(key); });
     return pipeline;
   }
-  function dispatch(pipeline, groups, workgroups, timestamp = null, operation = null) {
+  /** One source compute call records every kernel before its final submission.
+   * Queue writes made while recording are visible to every dispatch, and an
+   * exception discards unsubmitted commands without undoing those writes.
+   * Independent groups may be nested; each owns its encoder and pass. */
+  function createDispatchGroup(timestamp = null, operationScope = null) {
     live();
-    if (!ready.has(pipeline)) fail('PIPELINE', 'Prepare the compute pipeline before dispatch');
-    let direct = null;
-    if (Array.isArray(workgroups)) {
-      const limit = device.limits?.maxComputeWorkgroupsPerDimension ?? 65535;
-      if (workgroups.length < 1 || workgroups.length > 3 ||
-          !workgroups.every(n => Number.isSafeInteger(n) && n >= 0 && n <= limit))
-        fail('DISPATCH', 'Workgroup counts must fit the device limits');
-      direct = [workgroups[0], workgroups[1] ?? 1, workgroups[2] ?? 1];
-    } else {
-      const {buffer, offset = 0} = workgroups ?? {};
-      const entry = [...buffers.values()].find(e => e.buffer === buffer && !e.uniform);
-      if (!entry || !Number.isSafeInteger(offset) || offset < 0 || offset % 4 || offset + 12 > entry.bytes)
-        fail('DISPATCH', 'Indirect dispatch requires twelve in-bounds bytes of owned storage');
-    }
-    const snapshots = captureGroups(groups);
+    let encoder = null, pass = null, state = 'open', failure = null;
     const validations = timestamp ? [] : null;
-    const issue = () => checked(() => {
-      const bindings = snapshots.map(snapshot => resolveGroup(pipeline, snapshot));
-      const encoder = device.createCommandEncoder({label: 'f3d-compute'});
+    const open = () => {
+      live();
+      if (state !== 'open') throw failure ?? new GpuComputeError('GROUP_CLOSED', 'Compute dispatch group has already been submitted');
+    };
+    const abort = error => {
+      if (state !== 'open') return;
+      state = 'aborted';
+      failure = error instanceof Error ? error : new GpuComputeError('GROUP_ABORTED', 'Compute dispatch group was aborted before submission');
+      dispatchGroups.delete(group);
+      encoder = pass = null;
+      timestamp?.cancel();
+    };
+    // Each stage owns a complete error-scope interval. The pass may survive an
+    // async preparation boundary, but no device scope survives this call.
+    const issue = run => {
+      const checkedStage = () => checked(run, validations);
+      return operationScope ? operationScope.run(checkedStage) : checkedStage();
+    };
+    const beginPass = () => {
+      if (encoder) return;
+      encoder = device.createCommandEncoder({label: 'f3d-compute'});
       const descriptor = {label: 'f3d-compute', timestampWrites: timestamp?.writes()};
-      if (operation) {
-        const {backend, context} = operation.scope;
-        const pass = backend.beginCompute(context, encoder, descriptor);
-        backend.compute(context, operation.node, bindings, pipeline, operation.dispatchSize, pass, direct ?? workgroups);
-        backend.finishCompute(context, pass);
-      } else {
-        const pass = encoder.beginComputePass(descriptor);
-        pass.setPipeline(pipeline);
-        for (const {index, group} of bindings) pass.setBindGroup(index, group);
-        if (direct) pass.dispatchWorkgroups(...direct);
-        else pass.dispatchWorkgroupsIndirect(workgroups.buffer, workgroups.offset ?? 0);
-        pass.end();
-      }
-      device.queue.submit([encoder.finish()]);
-    }, validations);
-    try { if (operation) operation.scope.run(issue); else issue(); }
-    catch (error) { timestamp?.cancel(); throw error; }
-    if (timestamp) timestamp.validate(Promise.all(validations));
+      pass = operationScope
+        ? operationScope.backend.beginCompute(operationScope.context, encoder, descriptor)
+        : encoder.beginComputePass(descriptor);
+    };
+    const group = Object.freeze({
+      begin() {
+        try { open(); if (!encoder) issue(beginPass); }
+        catch (error) { abort(error); throw error; }
+      },
+      dispatch(pipeline, groups, workgroups, operation = null) {
+        try {
+          open();
+          if (!ready.has(pipeline)) fail('PIPELINE', 'Prepare the compute pipeline before dispatch');
+          if ((operation?.scope ?? null) !== operationScope)
+            fail('GROUP', 'Compute dispatches must retain their group operation scope');
+          let direct = null;
+          if (Array.isArray(workgroups)) {
+            const limit = device.limits?.maxComputeWorkgroupsPerDimension ?? 65535;
+            if (workgroups.length < 1 || workgroups.length > 3 ||
+                !workgroups.every(n => Number.isSafeInteger(n) && n >= 0 && n <= limit))
+              fail('DISPATCH', 'Workgroup counts must fit the device limits');
+            direct = [workgroups[0], workgroups[1] ?? 1, workgroups[2] ?? 1];
+          } else {
+            const {buffer, offset = 0} = workgroups ?? {};
+            const entry = [...buffers.values()].find(e => e.buffer === buffer && !e.uniform);
+            if (!entry || !Number.isSafeInteger(offset) || offset < 0 || offset % 4 || offset + 12 > entry.bytes)
+              fail('DISPATCH', 'Indirect dispatch requires twelve in-bounds bytes of owned storage');
+          }
+          const snapshots = captureGroups(groups);
+          issue(() => {
+            const bindings = snapshots.map(snapshot => resolveGroup(pipeline, snapshot));
+            beginPass();
+            if (operationScope) {
+              operationScope.backend.compute(operationScope.context, operation.node, bindings, pipeline,
+                operation.dispatchSize, pass, direct ?? workgroups);
+            } else {
+              pass.setPipeline(pipeline);
+              for (const {index, group} of bindings) pass.setBindGroup(index, group);
+              if (direct) pass.dispatchWorkgroups(...direct);
+              else pass.dispatchWorkgroupsIndirect(workgroups.buffer, workgroups.offset ?? 0);
+            }
+          });
+        } catch (error) { abort(error); throw error; }
+      },
+      submit() {
+        try {
+          open();
+          if (encoder) issue(() => {
+            if (operationScope) operationScope.backend.finishCompute(operationScope.context, pass);
+            else pass.end();
+            device.queue.submit([encoder.finish()]);
+          });
+          else timestamp?.cancel();
+          state = 'submitted';
+          dispatchGroups.delete(group);
+          encoder = pass = null;
+          if (timestamp && validations.length) timestamp.validate(Promise.all(validations));
+        } catch (error) { abort(error); throw error; }
+      },
+      abort,
+    });
+    dispatchGroups.add(group);
+    return group;
+  }
+  function dispatch(pipeline, groups, workgroups, timestamp = null, operation = null) {
+    const group = createDispatchGroup(timestamp, operation?.scope ?? null);
+    try {
+      group.dispatch(pipeline, groups, workgroups, operation);
+      group.submit();
+    } catch (error) { group.abort(error); throw error; }
   }
   function releaseReadback(entry, error) {
     const request = entry.request;
@@ -555,7 +616,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     await interrupted(Promise.all([...pending]));
     live();
   }
-  return {upload, release, prepare, prepareSync, dispatch, read, readCaptured, whenIdle, validationSnapshot,
+  return {upload, release, prepare, prepareSync, dispatch, createDispatchGroup, read, readCaptured, whenIdle, validationSnapshot,
     captureUpload: (key, array, version) => { live(); return attributeOwner.capture(key, array, version); },
     releaseUpload: admission => attributeOwner.releaseCapture(admission),
     getBuffer: key => { live(); return buffers.get(key)?.buffer ?? null; },
