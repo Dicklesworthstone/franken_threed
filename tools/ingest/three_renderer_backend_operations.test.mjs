@@ -100,7 +100,8 @@ test('Inspector compute records and timestamp lookups retain the exact node or n
   }
   inspector.finish();
   await flush(f.renderer);
-  assert.equal(f.device.computePasses.length, 4);
+  assert.equal(f.device.computePasses.length, 3);
+  assert.deepEqual(f.device.computePasses.map(pass => pass.dispatches.length), [1, 1, 2]);
 });
 
 test('Inspector render completion receives the UID of the accepted render', async t => {
@@ -183,6 +184,34 @@ test('inspecting fixed materials preserves physical instancing and exposes every
   assert.equal(watched.events.filter(event => event.name === 'addBundle').length, 2);
 });
 
+test('nested distinct compute groups retain their own pass and captured Inspector context', async t => {
+  const f = fixture(t), watched = observe(f), N = T.TSL;
+  const values = new T.StorageBufferAttribute(new Uint32Array(16), 1), storage = N.storage(values, 'uint', 16);
+  const kernel = count => N.Fn(() => {storage.element(N.instanceIndex).assign(N.instanceIndex);})().compute(count, [4]);
+  const first = kernel(8), second = kernel(12), inner = kernel(16);
+  const outerGroup = [first, second], innerGroup = [inner];
+  second.onInit(({renderer}) => renderer.compute(innerGroup));
+  t.after(() => {first.dispose(); second.dispose(); inner.dispose();});
+  await f.renderer.init(); f.renderer.info.frame = 5;
+  f.renderer.compute(outerGroup);
+  await flush(f.renderer);
+  const events = watched.events.filter(event => event.name.includes('Compute') || event.name === 'compute');
+  assert.deepEqual(events.map(event => event.name),
+    ['beginCompute', 'compute', 'beginCompute', 'compute', 'finishCompute', 'compute', 'finishCompute']);
+  assert.deepEqual(events.map(event => event.target),
+    [outerGroup, outerGroup, innerGroup, innerGroup, innerGroup, outerGroup, outerGroup]);
+  assert.deepEqual(events.filter(event => event.name === 'compute').map(event => event.node), [first, inner, second]);
+  assert.equal(f.device.computePasses.length, 2);
+  assert.deepEqual(f.device.computePasses.map(pass => pass.dispatches), [[[2, 1, 1], [3, 1, 1]], [[4, 1, 1]]]);
+  assert.ok(f.device.computePasses.every(pass => pass.ended));
+  for (const event of events) {
+    assert.equal(event.compute.group, event.target);
+    assert.equal(event.compute.uid, f.renderer.backend.getTimestampUID(event.target));
+    assert.equal(event.frame, 5);
+  }
+  assert.equal(f.inspector.currentCompute, null);
+});
+
 test('queued compute reports the captured source dispatch and restores the surrounding Inspector context', async t => {
   const f = fixture(t), watched = observe(f), N = T.TSL;
   const values = new T.StorageBufferAttribute(new Uint32Array(8), 1), storage = N.storage(values, 'uint', 8);
@@ -197,7 +226,10 @@ test('queued compute reports the captured source dispatch and restores the surro
   f.renderer.compute(group, dispatch);
   const acceptedUid = f.renderer.backend.getTimestampUID(group);
   group.length = 0; dispatch[0] = 1; f.renderer.info.frame = 12;
-  assert.equal(f.device.computePasses.length, 0); assert.equal(f.inspector.currentCompute, null);
+  assert.equal(f.device.computePasses.length, 1);
+  assert.deepEqual(f.device.computePasses[0].dispatches, []);
+  assert.equal(f.device.computePasses[0].ended, false, 'source begins recording before deferred uploads');
+  assert.equal(f.inspector.currentCompute, null);
   gate.resolve(); await flush(f.renderer);
   const events = watched.events.filter(event => event.name.includes('Compute') || event.name === 'compute');
   assert.deepEqual(events.map(event => event.name), ['beginCompute', 'compute', 'finishCompute']);

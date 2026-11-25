@@ -206,6 +206,48 @@ test('write-to-sample dependency in separate kernels uses the same native alloca
   assert.equal(device.textures.length, 1); renderer.dispose();
 });
 
+
+test('a compute group resolves storage mips at its sampled binding before the parent submission', async t => {
+  const {renderer, device} = setup(), texture = new THREE.Texture(), submissions = [], boundaries = [];
+  t.after(() => renderer.dispose());
+  // Preserve the existing recording device and expose which finished encoder
+  // is submitted. No GPU commands or WGSL are executed by this fixture.
+  const createEncoder = device.createCommandEncoder.bind(device), submit = device.queue.submit.bind(device.queue);
+  device.createCommandEncoder = descriptor => {
+    const encoder = createEncoder(descriptor), finish = encoder.finish.bind(encoder);
+    encoder.finish = () => ({...finish(), label: descriptor.label});
+    return encoder;
+  };
+  device.queue.submit = commandBuffers => {
+    submissions.push(...commandBuffers.map(command => command.label));
+    return submit(commandBuffers);
+  };
+  const boundary = name => () => boundaries.push({name, submissions: submissions.slice(),
+    mips: device.calls.filter(call => call[0] === 'mip').length});
+  const writer = node([write(texture)], {after: [boundary('writer-after')]});
+  const reader = node([{texture, isSampler: true}, sample(texture)], {
+    before: [boundary('reader-before')], after: [boundary('reader-after')],
+  });
+  renderer.compute([writer, reader]);
+  assert.deepEqual(boundaries, [
+    {name: 'writer-after', submissions: [], mips: 0},
+    {name: 'reader-before', submissions: [], mips: 0},
+    {name: 'reader-after', submissions: ['f3d-storage-mips'], mips: 2},
+  ], 'binding updates refresh mips inside the unsubmitted group, after the writer callback');
+  assert.deepEqual(submissions, ['f3d-storage-mips', 'f3d-compute']);
+  assert.equal(device.calls.filter(call => call[0] === 'compute').length, 1);
+  assert.equal(device.calls.filter(call => call[0] === 'dispatch').length, 2);
+  const bound = groups(device);
+  assert.equal(bound[0].entries[0].resource.texture, bound[1].entries[1].resource.texture,
+    'both kernels keep the same storage allocation');
+  const sampled = await renderer.renderTexture(texture);
+  assert.equal(sampled.view.texture, bound[0].entries[0].resource.texture);
+  assert.deepEqual(submissions, ['f3d-storage-mips', 'f3d-compute'],
+    'completing the parent dispatch does not re-mark an already consumed source intent');
+  assert.equal(device.calls.filter(call => call[0] === 'mip').length, 2);
+  await renderer.waitForGPU();
+});
+
 test('texture precompilation creates reusable native layouts without dispatching or generating mips', async () => {
   const {renderer,device} = setup(), texture = new THREE.Texture(), kernel = node([write(texture)]);
   await renderer.compileComputeAsync(kernel);
@@ -214,7 +256,12 @@ test('texture precompilation creates reusable native layouts without dispatching
   renderer.compute(kernel);
   const descriptor = device.calls.find(c => c[0] === 'pipeline')[1].descriptor;
   assert.equal(descriptor.layout.bindGroupLayouts[0].entries[0].storageTexture.format,'rgba8unorm');
-  assert.equal(device.calls.filter(c => c[0] === 'layout').length, count + 1); // One mip-generation layout only.
+  assert.equal(device.calls.filter(c => c[0] === 'layout').length, count,
+    'a writer records source mip intent without generating mips at dispatch completion');
+  assert.equal(device.calls.some(c => c[0] === 'mip'), false);
+  await renderer.renderTexture(texture);
+  assert.equal(device.calls.filter(c => c[0] === 'layout').length, count + 1); // One sampled-consumer mip layout.
+  assert.equal(device.calls.filter(c => c[0] === 'mip').length, 2);
   await renderer.waitForGPU(); renderer.dispose();
 });
 
@@ -258,7 +305,12 @@ test('initialization ordering keeps compute, sampling and subsequent compute in 
 });
 
 test('texture validation failures propagate through renderer waitForGPU', async () => {
-  const {renderer,device}=setup(), texture=new THREE.Texture(); device.validationError('texture allocation failed');
+  const {renderer,device}=setup(), texture=new THREE.Texture(), createTexture=device.createTexture.bind(device);
+  device.createTexture = descriptor => {
+    const native = createTexture(descriptor);
+    device.validationError('texture allocation failed');
+    return native;
+  };
   renderer.compute(node([write(texture)])); await assert.rejects(renderer.waitForGPU(),/texture allocation failed/);
   assert.equal(renderer._storageTextures.allocatedBytes,0); renderer.dispose();
 });

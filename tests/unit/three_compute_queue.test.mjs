@@ -34,16 +34,19 @@ function setup({initialization = null, compilation = null, mapping = null} = {})
       return {
         beginComputePass() {
           let current; const groups = [];
-          const dispatch = counts => commands.push(() => {
-            const dims = counts();
-            events.push(['dispatch', current.code, ...dims]);
-            const entries = groups[0]?.entries ?? [];
-            if (current.code === 'add' && entries.length && dims.every(n => n > 0)) {
-              const array = new Float32Array(entries[0].resource.buffer.data.buffer);
-              const amount = entries[1] ? new Float32Array(entries[1].resource.buffer.data.buffer)[0] : 1;
-              for (let i = 0; i < array.length; i++) array[i] += amount;
-            }
-          });
+          const dispatch = counts => {
+            const selected = current, bindings = groups.slice();
+            commands.push(() => {
+              const dims = counts();
+              events.push(['dispatch', selected.code, ...dims]);
+              const entries = bindings[0]?.entries ?? [];
+              if (selected.code === 'add' && entries.length && dims.every(n => n > 0)) {
+                const array = new Float32Array(entries[0].resource.buffer.data.buffer);
+                const amount = entries[1] ? new Float32Array(entries[1].resource.buffer.data.buffer)[0] : 1;
+                for (let i = 0; i < array.length; i++) array[i] += amount;
+              }
+            });
+          };
           return {setPipeline: value => { current = value; }, setBindGroup: (i, value) => { groups[i] = value; },
             dispatchWorkgroups: (...counts) => dispatch(() => counts),
             dispatchWorkgroupsIndirect: (buffer, offset) => dispatch(() => [...new Uint32Array(buffer.data.buffer, offset, 3)]), end() {}};
@@ -68,7 +71,7 @@ function setup({initialization = null, compilation = null, mapping = null} = {})
       writeBuffer(buffer, offset, source, start = 0, size = source.byteLength - start) {
         events.push(['upload']); buffer.data.set(new Uint8Array(source.buffer, source.byteOffset + start, size), offset);
       },
-      submit(commands) { for (const batch of commands) for (const execute of batch) execute(); },
+      submit(commands) { events.push(['submit']); for (const batch of commands) for (const execute of batch) execute(); },
       onSubmittedWorkDone: async () => {},
     },
   };
@@ -118,7 +121,7 @@ function setup({initialization = null, compilation = null, mapping = null} = {})
       this._pending = [];
     }
   }
-  const Renderer = withThreeCompute(Base, {REVISION: '186', WGSLNodeBuilder, TSL: {context: () => ({isContextNode: true})}});
+  const Renderer = withThreeCompute(Base, {REVISION: '186', DynamicDrawUsage: 35048, WGSLNodeBuilder, TSL: {context: () => ({isContextNode: true})}});
   const renderer = new Renderer();
   function block() {
     const gate = deferred();
@@ -250,14 +253,14 @@ test('queued dispatch counts and shader generations are captured rather than rea
   renderer.dispose();
 });
 
-test('queued after-update readback follows its own dispatch and precedes the next kernel', async () => {
+test('queued after-update readbacks submit before the complete parent compute group', async () => {
   const {renderer, block, events} = setup(), data = attribute(new Float32Array([0]));
   const reads = [], kernel = node([storage(data)], {after: [() => reads.push(renderer.getArrayBufferAsync(data))]});
   const gate = block(), run = renderer.computeAsync([kernel, kernel]);
   assert.equal(reads.length, 2);
   gate.open(); await run;
-  assert.deepEqual(await Promise.all(reads.map(async p => [...new Float32Array(await p)])), [[1], [2]]);
-  assert.deepEqual(events.filter(e => ['dispatch', 'read'].includes(e[0])).map(e => e[0]), ['dispatch', 'read', 'dispatch', 'read']);
+  assert.deepEqual(await Promise.all(reads.map(async p => [...new Float32Array(await p)])), [[0], [0]]);
+  assert.deepEqual(events.filter(e => ['dispatch', 'read'].includes(e[0])).map(e => e[0]), ['read', 'read', 'dispatch', 'dispatch']);
   renderer.dispose();
 });
 
@@ -272,12 +275,12 @@ test('pre-initialization onInit kernels stay ahead of the already-queued readbac
   renderer.dispose();
 });
 
-test('an after-update exception does not drop its already-queued kernel', async () => {
+test('an after-update exception discards the group while preserving already-queued uploads', async () => {
   const {renderer, block} = setup(), data = attribute(new Float32Array([0]));
   const gate = block();
   assert.throws(() => renderer.compute(node([storage(data)], {after: [() => { throw new Error('source failed'); }]})), /source failed/);
   gate.open(); await gate.done; await renderer.waitForGPU();
-  assert.deepEqual(await read(renderer, data), [1]); renderer.dispose();
+  assert.deepEqual(await read(renderer, data), [0]); renderer.dispose();
 });
 
 test('disposing and reusing a node preserves both accepted queued shader generations', async t => {
@@ -617,4 +620,85 @@ test('public copies reject missing GPU storage and stale target generations', as
   entry.alive = false; gate.open();
   await assert.rejects(copy, /stale target/); assert.equal(entry.references, 0);
   assert.equal(events.some(e => e[0] === 'texture-copy'), false); renderer.dispose();
+});
+
+for (const queued of [false, true])
+test(`${queued ? 'queued' : 'immediate'} compute lists share final host uploads at one submission`, async t => {
+  const {renderer, block, events} = setup(), data = attribute(new Float32Array([0]));
+  t.after(() => renderer.dispose());
+  const first = node([storage(data)]);
+  const second = node([storage(data)], {updates: [() => { data.array[0] = 10; data.version++; }]});
+  const gate = queued ? block() : null, run = renderer.computeAsync([first, second]);
+  data.array[0] = 100; data.version++;
+  gate?.open(); await run;
+  assert.equal(events.filter(event => event[0] === 'submit').length, 1);
+  assert.equal(events.filter(event => event[0] === 'dispatch').length, 2);
+  assert.deepEqual(await read(renderer, data), [12], 'both kernels run after the final admitted host upload');
+  assert.deepEqual([...data.array], [100], 'GPU execution never rewrites the public host array');
+});
+
+for (const queued of [false, true]) for (const shared of [false, true])
+test(`${queued ? 'queued' : 'immediate'} compute preserves ${shared ? 'shared' : 'distinct'} source uniform allocations`, async t => {
+  const {renderer, block} = setup(), data = attribute(new Float32Array([0])), bytes = new Float32Array(4);
+  t.after(() => renderer.dispose());
+  let value = 2;
+  const firstUniform = {isUniformBuffer: true, buffer: bytes, update() { bytes[0] = value; }};
+  // Distinct binding identities may share a CPU array. Each source upload
+  // must retain its value; repeated uses of one GPU binding see its last write.
+  const secondUniform = shared ? firstUniform : {...firstUniform};
+  const first = node([storage(data), firstUniform], {after: [() => { value = 7; }]});
+  const second = node([storage(data), secondUniform]);
+  const gate = queued ? block() : null, run = renderer.computeAsync([first, second]);
+  bytes.fill(99); gate?.open(); await run;
+  assert.deepEqual(await read(renderer, data), [shared ? 14 : 9]);
+});
+
+for (const queued of [false, true])
+test(`${queued ? 'queued' : 'immediate'} nested compute and after-update readback precede parent dispatches`, async t => {
+  const {renderer, block, events} = setup(), data = attribute(new Float32Array([0])), frames = [];
+  t.after(() => renderer.dispose());
+  const ten = {isUniformBuffer: true, buffer: new Float32Array([10, 0, 0, 0])};
+  const child = node([storage(data), ten], {before: [frame => frames.push(['child', frame.renderId])]});
+  let observed;
+  const first = node([storage(data)], {before: [frame => frames.push(['first', frame.renderId])], after: [frame => {
+    renderer.compute(child, [3]); frames.push(['resumed', frame.renderId]);
+    observed = renderer.getArrayBufferAsync(data);
+  }]});
+  const second = node([storage(data)], {count: 8, before: [frame => frames.push(['second', frame.renderId])]});
+  const gate = queued ? block() : null, run = renderer.computeAsync([first, second]);
+  gate?.open(); await run;
+  assert.deepEqual(frames, [['first', 1], ['child', 2], ['resumed', 1], ['second', 1]]);
+  assert.equal(renderer._nodes.nodeFrame.renderId, 17, 'restore the caller frame after nested work');
+  assert.deepEqual([...new Float32Array(await observed)], [10]);
+  assert.deepEqual(events.filter(event => ['dispatch', 'read'].includes(event[0])).map(event =>
+    event[0] === 'dispatch' ? event[2] : 'read'), [3, 'read', 2, 4]);
+  assert.deepEqual(await read(renderer, data), [12]);
+});
+
+for (const queued of [false, true])
+test(`${queued ? 'queued' : 'immediate'} failed parent groups preserve nested compute submissions`, async t => {
+  const {renderer, block, events} = setup(), data = attribute(new Float32Array([0]));
+  t.after(() => renderer.dispose());
+  const ten = {isUniformBuffer: true, buffer: new Float32Array([10, 0, 0, 0])};
+  const child = node([storage(data), ten]);
+  const first = node([storage(data)], {after: [() => renderer.compute(child, [3])]});
+  const second = node([storage(data)], {after: [() => { throw new Error('source group failed'); }]});
+  const gate = queued ? block() : null;
+  assert.throws(() => renderer.compute([first, second]), /source group failed/);
+  gate?.open(); await renderer.waitForGPU();
+  assert.deepEqual(events.filter(event => event[0] === 'dispatch').map(event => event[2]), [3]);
+  assert.deepEqual(await read(renderer, data), [10]);
+});
+
+test('a queued upload failure cannot submit an earlier part of the compute group', async t => {
+  const {renderer, device, block, events} = setup(), failure = new Error('upload failed');
+  t.after(() => renderer.dispose());
+  const write = device.queue.writeBuffer.bind(device.queue); let uploads = 0;
+  device.queue.writeBuffer = (...args) => { write(...args); if (++uploads === 2) throw failure; };
+  const a = attribute(new Float32Array([0])), b = attribute(new Float32Array([10]));
+  const gate = block(), run = renderer.computeAsync([node([storage(a)]), node([storage(b)]), node([storage(a)])]);
+  const rejected = assert.rejects(run, error => error === failure);
+  gate.open(); await rejected;
+  assert.equal(events.some(event => event[0] === 'dispatch'), false);
+  assert.equal(events.some(event => event[0] === 'submit'), false);
 });

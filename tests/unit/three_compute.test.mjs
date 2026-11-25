@@ -32,21 +32,25 @@ function device({mapping = null, compilation = null} = {}) {
       return {
         beginComputePass() {
           let current, groups = [];
-          const dispatch = (...counts) => commands.push(() => {
-            calls.push(['dispatch', ...counts]);
-            const entries = groups[0]?.entries ?? [];
-            calls.push(['bound', entries.map(e => e.resource.buffer)]);
-            // Stand-in GPU write: lets tests prove that later host uploads do
-            // not erase producer results, without claiming WGSL execution.
-            if (current.code.startsWith('// add') && entries.length) {
-              const array = new Float32Array(entries[0].resource.buffer.data.buffer);
-              const amount = entries[1] ? new Float32Array(entries[1].resource.buffer.data.buffer)[0] : 1;
-              for (let i = 0; i < array.length; i++) array[i] += amount;
-            }
-          });
+          const dispatch = counts => {
+            const selected = current, bindings = groups.slice();
+            commands.push(() => {
+              calls.push(['dispatch', ...counts()]);
+              const entries = bindings[0]?.entries ?? [];
+              calls.push(['bound', entries.map(e => e.resource.buffer)]);
+              // Observe submitted GPU bytes with the state selected at encode.
+              if (selected.code.startsWith('// add') && entries.length) {
+                const array = new Float32Array(entries[0].resource.buffer.data.buffer);
+                const amount = entries[1] ? new Float32Array(entries[1].resource.buffer.data.buffer)[0] : 1;
+                for (let i = 0; i < array.length; i++) array[i] += amount;
+              }
+            });
+          };
           return {setPipeline: value => { current = value; }, setBindGroup: (i, value) => { groups[i] = value; },
-            dispatchWorkgroups: dispatch,
-            dispatchWorkgroupsIndirect: (buffer, offset) => { calls.push(['indirect', buffer, offset]); dispatch(...new Uint32Array(buffer.data.buffer, offset, 3)); }, end() {}};
+            dispatchWorkgroups: (...counts) => dispatch(() => counts),
+            dispatchWorkgroupsIndirect: (buffer, offset) => {
+              calls.push(['indirect', buffer, offset]); dispatch(() => [...new Uint32Array(buffer.data.buffer, offset, 3)]);
+            }, end() {}};
         },
         copyBufferToBuffer(source, from, target, to, size) {
           commands.push(() => { calls.push(['copy']); target.data.set(source.data.subarray(from, from + size), to); });
@@ -127,7 +131,7 @@ function setup(options = {}) {
       this._pending = [];
     }
   }
-  const THREE = {REVISION: '186', WGSLNodeBuilder, TSL: {context: () => ({isContextNode: true})}};
+  const THREE = {REVISION: '186', DynamicDrawUsage: 35048, WGSLNodeBuilder, TSL: {context: () => ({isContextNode: true})}};
   const Renderer = withThreeCompute(Base, THREE), renderer = new Renderer();
   return {renderer, gpu, updates, builders, THREE};
 }
@@ -139,19 +143,19 @@ test('ordinary compute nodes share GPU storage and do not re-upload stale CPU va
   const result = await renderer.getArrayBufferAsync(data);
   assert.deepEqual([...new Float32Array(result)], [3, 4, 5, 6]);
   assert.deepEqual([...data.array], [1, 2, 3, 4]);
-  assert.equal(data.uploads, 1);
+  assert.equal(data.uploads, 0, 'native storage uploads leave WebGL callbacks inert');
   const bound = gpu.calls.filter(c => c[0] === 'bound');
   assert.equal(bound[0][1][0], bound[1][1][0]);
   assert.equal(renderer.info.compute.calls, 1); renderer.dispose();
 });
 
-test('per-dispatch source updates produce distinct uniform versions in kernel order', async () => {
+test('source uniform bindings observe their final uploaded value within one compute group', async () => {
   const {renderer, updates} = setup(), data = attribute(new Float32Array([0]));
   let value = 2;
   const uniform = {isUniformBuffer: true, buffer: new Float32Array(4), update() { this.buffer[0] = value; }};
   const first = node([storage(data), uniform], {after: [() => { value = 7; }]}), second = node([storage(data), uniform]);
   renderer.compute([first, second]);
-  assert.deepEqual([...new Float32Array(await renderer.getArrayBufferAsync(data))], [9]);
+  assert.deepEqual([...new Float32Array(await renderer.getArrayBufferAsync(data))], [14]);
   assert.deepEqual(updates, ['begin', 'after', 'finish']); renderer.dispose();
 });
 
@@ -196,7 +200,9 @@ test('source frame callbacks see the compute renderer and previous frame context
   const {renderer, updates} = setup(), frame = renderer._nodes.nodeFrame;
   let kernel;
   const check = state => { assert.equal(state.renderer, renderer); assert.equal(state.compute, kernel); assert.equal(state.renderId, 1); };
-  kernel = node([], {before: [check], updates: [check], after: [check]});
+  kernel = node([], {before: [check], updates: [state => {
+    assert.equal(state.renderer, renderer); assert.equal(state.compute, null); assert.equal(state.renderId, 1);
+  }], after: [check]});
   renderer.compute(kernel);
   assert.deepEqual(updates, ['begin', 'before', 'current', 'after', 'finish']);
   assert.equal(frame.renderId, 17); assert.equal(frame.compute, null); assert.equal(frame.renderer, null); renderer.dispose();
@@ -211,10 +217,10 @@ test('source shader diagnostics preserve an existing debug object and disabled c
   renderer.dispose();
 });
 
-test('source frame and inspector are restored after a callback throws', () => {
+test('a failed callback restores the caller frame without finishing its abandoned compute group', () => {
   const {renderer, updates} = setup(), frame = renderer._nodes.nodeFrame;
   assert.throws(() => renderer.compute(node([], {updates: [() => { throw new Error('callback failed'); }]})), /callback failed/);
-  assert.equal(frame.renderId, 17); assert.equal(frame.compute, null); assert.equal(updates.at(-1), 'finish'); renderer.dispose();
+  assert.equal(frame.renderId, 17); assert.equal(frame.compute, null); assert.deepEqual(updates, ['begin', 'current']); renderer.dispose();
 });
 
 test('scalar counts, explicit grids, device-limit tiling and indirect GPU counts dispatch correctly', () => {
@@ -243,7 +249,7 @@ test('versioned partial CPU updates preserve producer values outside dirty range
   data.array[1] = 30; data.version++; data.updateRanges.push({start: 1, count: 1});
   renderer.compute(kernel);
   assert.deepEqual([...new Float32Array(await renderer.getArrayBufferAsync(data))], [2, 31]);
-  assert.equal(data.updateRanges.length, 0); assert.equal(data.uploads, 2); renderer.dispose();
+  assert.equal(data.updateRanges.length, 0); assert.equal(data.uploads, 0, 'native storage uploads leave WebGL callbacks inert'); renderer.dispose();
 });
 
 test('node disposal permits recompilation without destroying storage shared with other kernels', async () => {
@@ -276,7 +282,7 @@ test('unsupported bindings, invalid nodes and invalid workgroup sizes fail expli
 test('disposing during async compilation rejects rather than publishing a stale program', async () => {
   const compilation = deferred(), {renderer} = setup({compilation}), kernel = node();
   const compile = renderer.compileComputeAsync(kernel);
-  renderer.dispose(); await assert.rejects(compile, /DISPOSED/);
+  renderer.dispose(); await assert.rejects(compile, /renderer stopped/);
   compilation.resolve(); assert.equal(kernel.listenerCount, 0);
 });
 

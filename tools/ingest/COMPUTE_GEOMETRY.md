@@ -54,6 +54,50 @@ Compute-authored indices, integer vertex fetch and repeated instance divisors
 must not be inferred from Float32 vertex-buffer support. Shader storage reads
 through authored node-material slots use the separate profile below.
 
+## Grouped compute submission and callback ordering
+
+`renderer.compute([first, second])` records one compute pass and submits it once,
+after all kernels' update callbacks have run, matching pinned Three.js r186.
+Each dispatch retains the pipeline, binding identities and direct workgroup
+counts selected for that kernel. Shared GPU buffer contents remain live until
+execution. GPU writes from an earlier dispatch remain visible to later dispatches
+in the same group.
+
+Host uploads occur during binding updates, before the containing group submits.
+If a later kernel uploads a new version of a shared storage buffer, that upload
+becomes the group's starting state, before any of its dispatches execute. For
+example, starting at zero, encoding an increment, uploading ten in the second kernel's
+update callback and encoding another increment produces twelve. A uniform block
+reused by both kernels likewise exposes its final upload to both dispatches;
+distinct binding identities retain distinct uploads even if their CPU arrays
+alias. Queued calls still capture accepted host payloads, so later unrequested
+CPU edits cannot change those uploads.
+
+An after-update callback runs while the parent group is unsubmitted. A readback
+started there copies the resident values before the parent kernels execute.
+A nested `renderer.compute(...)` with a distinct node or group identity submits
+its own group before the parent; the outer frame's render ID is restored when
+that nested callback returns. A callback exception abandons all parent
+dispatches while preserving accepted
+queue writes, readbacks and nested submissions. A deferred upload or encoding
+failure also prevents partial parent submission. Captured buffers and texture
+leases remain retained until all accepted group operations settle.
+
+Storage-texture mipmaps follow the same source binding-update boundary.
+An auto-updating storage binding marks pending mip work; a later auto-updating
+sampled binding consumes that intent. Its mip generation submits independently
+before an unfinished compute group. A writer and sampler in the same group
+therefore do not imply a mip refresh between their dispatches. A writer-only
+group leaves its intent for a later sampled compute or graphics binding.
+Sampler-only bindings neither mark nor consume this state. Explicit texture
+copies and native write callbacks retain their separate completed-write path.
+
+The recording regressions exercise public compute calls, shared uniforms,
+callback failures, nested compute, readbacks and queued cancellation. Texture
+ordering tests also compare the actual pinned `Bindings._update` implementation.
+These checks establish command and upload ordering; they do not execute WGSL or
+establish browser pixel parity or a performance gain.
+
 ## Geometry-triggered compute with shared storage textures
 
 A `material.geometryNode` kernel can update a GPU-authored storage texture that

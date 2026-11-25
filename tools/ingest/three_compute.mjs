@@ -459,10 +459,10 @@ function createThreeCompute(renderer, three) {
       programs.set(node, entry); return entry;
     } finally { building.delete(node); }
   }
-  function withFrame(node, run) {
+  function withFrame(node, run, renderId = renderer.info.calls) {
     const previous = Object.fromEntries(['renderer', 'compute', 'renderId', 'scene', 'object', 'camera', 'material']
       .map(key => [key, frame[key]]));
-    Object.assign(frame, {renderer, compute: node, renderId: renderer.info.calls, scene: null, object: null, camera: null, material: null});
+    Object.assign(frame, {renderer, compute: node, renderId, scene: null, object: null, camera: null, material: null});
     try { return run(); } finally { Object.assign(frame, previous); }
   }
   function update(entry, stage) {
@@ -580,7 +580,7 @@ function createThreeCompute(renderer, three) {
       // upload in this call must survive the image-readiness boundary too.
       if (preparation && !deferred) for (const record of held) deferUpload(record);
       if (listeners.get(node) !== epoch) fail('STALE', 'Compute node was disposed while capturing its queued use');
-      const issue = (dispatch = true) => {
+      const issue = (dispatch = true, dispatchGroup = null) => {
         live();
         // Source compute submits before returning. A later node disposal only
         // retires its cache; an accepted dispatch keeps this program and its
@@ -592,12 +592,13 @@ function createThreeCompute(renderer, three) {
         issuing = true;
         try { textureOwner.withDispatch(textureUses, () => {
           const bindings = groups.map(group => ({index: group.index, entries: group.entries.map(({binding, record, texture}) =>
-            ({binding, resource: texture ? textureOwner.resolve(texture) : {buffer: upload(record)}}))}));
+            ({binding, resource: texture ? textureOwner.resolveForCompute(texture) : {buffer: upload(record)}}))}));
           const dimensions = indirect ? {buffer: upload(indirect), offset: 0} : direct;
           textureOwner.validateDispatch(textureUses);
           if (dispatch) {
-            gpu.dispatch(gpu.prepareSync(shader), bindings, dimensions, timestamp, operation);
-            textureOwner.written(textureUses);
+            const pipeline = gpu.prepareSync(shader);
+            if (dispatchGroup) dispatchGroup.dispatch(pipeline, bindings, dimensions, operation);
+            else gpu.dispatch(pipeline, bindings, dimensions, timestamp, operation);
           }
         }); } finally { issuing = false; }
       };
@@ -606,7 +607,9 @@ function createThreeCompute(renderer, three) {
         async validation() {
           await Promise.all([gpu.validationSnapshot(), textureOwner.validationSnapshot(textureUses)]);
         },
-        issue(dispatch = true) { return preparation ? preparation.then(() => issue(dispatch)) : issue(dispatch); }};
+        issue(dispatch = true, dispatchGroup = null) {
+          return preparation ? preparation.then(() => issue(dispatch, dispatchGroup)) : issue(dispatch, dispatchGroup);
+        }};
     } catch (error) { release(); throw error; }
   }
   function compute(group, list, override, schedule, deferred) {
@@ -614,36 +617,68 @@ function createThreeCompute(renderer, three) {
     assertThreeNativeComputeOutsideCapture(renderer);
     if (issuing || capturingReads) fail('REENTRY', 'Cannot compute from an upload callback or native storage capture');
     renderer.info.calls++; renderer.info.compute.calls++; renderer.info.compute.frameCalls++;
+    const renderId = renderer.info.calls;
     const uid = `compute:${renderer.info.compute.frameCalls}:f${renderer.info.frame}`;
-    // Execution owns the captured list, while Inspector/Timeline and timestamp
-    // lookups retain the caller's node or array identity, including named groups.
+    // The source owns one encoder/pass for the complete public list. Uploads
+    // still happen at each binding update, but every encoded kernel observes
+    // the final shared allocation when this group is submitted.
     const timestamp = renderer._timestamps?.begin('compute', uid, group);
     renderer.inspector?.beginCompute?.(uid, group);
     const operations = renderer.backend?._capture?.(group);
-    const pending = [];
+    const commands = gpu.createDispatchGroup(timestamp, operations);
+    const pending = [], requests = [];
+    const track = result => {
+      if (result?.then) {
+        const done = Promise.resolve(result);
+        done.catch(() => {}); pending.push(done);
+      }
+    };
+    const release = () => { for (const request of requests) request.release(); };
+    const encode = request => {
+      try {
+        const result = request.issue(true, commands);
+        return result?.then ? Promise.resolve(result).catch(error => {
+          commands.abort(error); throw error;
+        }) : result;
+      } catch (error) { commands.abort(error); throw error; }
+    };
     try {
+      // Beginning command recording has no queue effect. Keep the source
+      // backend/timestamp boundary before onInit and update callbacks even
+      // when earlier renderer work delays the captured uploads.
+      commands.begin();
       for (const node of list) {
         const entry = program(node);
         withFrame(node, () => {
           update(entry, 'before'); update(entry, 'current');
           textureOwner.captureDispatch(() => {
             const request = capture(node, entry, override, deferred(), timestamp, operations);
-            let result;
-            try { result = schedule(() => request.issue(), request.asynchronous); }
-            catch (error) { request.release(); throw error; }
-            if (result?.then) {
-              const done = Promise.resolve(result).finally(request.release);
-              // A later source callback may throw before we return this promise.
-              done.catch(() => {}); pending.push(done);
-            } else request.release();
+            requests.push(request);
+            track(schedule(() => encode(request), request.asynchronous));
           });
-          // Schedule first: a compute/readback started by an after-update node
-          // must follow this kernel, even while render preparation is pending.
+          // An after-update readback or nested compute submits before this
+          // group's still-unsubmitted commands, exactly as in r186.
           update(entry, 'after');
-        });
+        }, renderId);
       }
-    } finally { renderer.inspector?.finishCompute?.(uid); }
-    return pending.length ? Promise.all(pending).then(() => {}) : undefined;
+      track(schedule(() => commands.submit()));
+    } catch (error) {
+      // A failed source callback abandons the whole encoder, not earlier
+      // queue writes or nested submissions. Keep accepted payloads alive
+      // until their already-reserved upload positions have settled.
+      const abandon = () => { commands.abort(error); release(); };
+      if (pending.length) Promise.allSettled(pending).then(abandon).catch(() => {});
+      else abandon();
+      throw error;
+    }
+    const completion = pending.length ? Promise.allSettled(pending).then(results => {
+      const failed = results.find(result => result.status === 'rejected');
+      if (failed) throw failed.reason;
+    }).finally(() => { commands.abort(); release(); }) : undefined;
+    if (completion) completion.catch(() => {});
+    else release();
+    renderer.inspector?.finishCompute?.(uid);
+    return completion;
   }
   async function compile(list, onProgress) {
     for (let i = 0; i < list.length; i++) {
@@ -893,8 +928,8 @@ export function withThreeCompute(Base, THREE) {
           const value = run(); value?.catch(() => {});
           return turn.pending ? turn.pending.then(() => value) : value;
         } catch (error) {
-          // Earlier accepted kernels still own their submission position when
-          // a later source callback rejects this public call.
+          // Earlier queue writes and nested calls keep their reserved positions
+          // even though a source callback abandons its parent compute encoder.
           if (turn.pending) return turn.pending.then(() => { throw error; }, () => { throw error; });
           throw error;
         } finally { this._computeTurn = previous; }
