@@ -37,11 +37,12 @@ function packet(commands, payload = new Uint8Array()) {
   return bytes;
 }
 const ONE_F32 = 0x3f800000;
-function depthPass(vertexCount = 0, { newPass = true, readOnly = false } = {}) {
+function depthPass(vertexCount = 0, { newPass = true, readOnly = false, resolve = false } = {}) {
   // Color load/store; explicit depth pass opener, then continued direct draws.
-  return [13, [
+  return [resolve ? 27 : 13, [
     (newPass ? 1 << 24 : 0) | (1 << 8), 10, 0, 0, 0, ONE_F32,
     100, 2, vertexCount, 256, 1, 99, 1 | (readOnly ? 1 << 16 : 0), ONE_F32,
+    ...(resolve ? [11] : []),
   ]];
 }
 function recordBundle({ batch = false, drawCount = 2, offset = 0, stride = 256 } = {}) {
@@ -51,7 +52,7 @@ function recordBundle({ batch = false, drawCount = 2, offset = 0, stride = 256 }
 }
 const executeBundles = (ids = [42]) => [8, [ids.length, ...ids]];
 
-function fixture({ depthFormat = "depth24plus", depthWriteEnabled = true, scopeError = null } = {}) {
+function fixture({ depthFormat = "depth24plus", depthWriteEnabled = true, scopeError = null, sampleCount = 1 } = {}) {
   const events = [], descriptors = [], passes = [], scopes = [], validationResults = [];
   let nextPipeline = 100;
   const host = new WebGpuBridgeHost();
@@ -63,11 +64,13 @@ function fixture({ depthFormat = "depth24plus", depthWriteEnabled = true, scopeE
     hasDepth: true,
     depthFormat,
     depthWriteEnabled,
+    sampleCount,
   });
   host.buffers.set(1, { size: 1024 });
   host.buffers.set(2, { size: 36 });
-  for (const [id, format] of [[10, "rgba8unorm"], [99, depthFormat]]) {
-    host.textures.set(id, { format, sampleCount: 1, createView: () => ({ id, format }) });
+  for (const [id, format] of [[10, "rgba8unorm"], [11, "rgba8unorm"], [99, depthFormat]]) {
+    host.textures.set(id, { format, sampleCount: id === 11 ? 1 : sampleCount,
+      width: 64, height: 64, usage: 16, createView: () => ({ id, format }) });
   }
   function encoder(kind) {
     let pipeline = null, bound = false, vertex = false;
@@ -218,7 +221,7 @@ test("depth bundle decoding retains bounds, offset, multisample and opener check
     [[recordBundle({ batch: true, offset: 0xffffffff, stride: 1 })], /dynamic offset overflow/],
     [[recordBundle({ batch: true, stride: 1 })], /device alignment/],
     [[recordBundle({ batch: true, drawCount: 5 })], /buffer bounds/],
-    [[recordBundle()], /multisampled bundles/, (f) => { f.host.pipelines.get(100).sampleCount = 4; }],
+    [[recordBundle()], /unsupported sample count 2/, (f) => { f.host.pipelines.get(100).sampleCount = 2; }],
     [[executeBundles(), depthPass()], /explicit RenderPassDepth opener/],
   ]) {
     const f = fixture();
@@ -233,6 +236,66 @@ const SHADER = new TextEncoder().encode("@compute @workgroup_size(1) fn main() {
 const createPipeline = ({ depth = false, id = 100 } = {}) => [depth ? 12 : 3, [
   id, 0, SHADER.length, 2, 1, 1, 16, 20, ...(depth ? [3, 1, 2] : []),
 ]];
+
+for (const depthFormat of ["depth24plus", "depth32float"]) {
+  for (const readOnly of [false, true]) {
+    test(`4x ${depthFormat} resolve preserves bundles, direct rebind and readOnly=${readOnly}`, async () => {
+      const f = fixture({ depthFormat, depthWriteEnabled: !readOnly, sampleCount: 4 });
+      await f.host.executePacket(packet([recordBundle({ batch: true })]));
+      await f.host.executePacket(packet([
+        depthPass(0, { readOnly, resolve: true }), executeBundles(),
+        depthPass(3, { newPass: false, readOnly, resolve: true }),
+      ]));
+      assert.equal(f.descriptors[0].sampleCount, 4);
+      assert.equal(f.descriptors[0].depthStencilFormat, depthFormat);
+      assert.equal(f.descriptors[0].depthReadOnly, readOnly);
+      assert.equal(f.passes.length, 1, "resolve occurs after both the bundle and direct draw");
+      assert.equal(f.passes[0].colorAttachments[0].resolveTarget.id, 11);
+      assert.equal(f.passes[0].depthStencilAttachment.view.id, 99);
+      assert.equal("depthLoadOp" in f.passes[0].depthStencilAttachment, !readOnly);
+      assert.equal(f.host.lastRenderTargetId, 11);
+      assert.deepEqual(f.events.filter(([name]) => name === "pass:draw"), [["pass:draw", 3, 1, 0, 0]]);
+    });
+  }
+}
+
+test("depth multisample pipeline packet preserves culling, mask, comparison and bundle sample count", async () => {
+  const f = fixture({ sampleCount: 4 });
+  await f.host.executePacket(packet([
+    [26, [100, 0, SHADER.length, 2, 1, 1, 16, 20, 4, 1, 5, 2, 1, 7, 4]],
+    recordBundle(),
+  ], SHADER));
+  const record = f.host.pipelines.get(100), descriptor = record.pipeline.descriptor;
+  assert.equal(descriptor.multisample.count, 4);
+  assert.deepEqual(descriptor.depthStencil, {
+    format: "depth32float", depthWriteEnabled: true, depthCompare: "greater",
+  });
+  assert.equal(descriptor.primitive.cullMode, "back");
+  assert.equal(descriptor.primitive.frontFace, "cw");
+  assert.equal(descriptor.fragment.targets[0].writeMask, 7);
+  assert.equal(record.sampleCount, 4);
+  assert.equal(f.descriptors[0].sampleCount, 4);
+});
+
+test("depth resolve validates attachment samples, size, destination and packet bounds before submission", async () => {
+  for (const [commands, configure, expected] of [
+    [[depthPass(3, { resolve: true })], f => { f.host.textures.get(99).sampleCount = 1; }, /size\/sample count must match/],
+    [[depthPass(3, { resolve: true })], f => { f.host.textures.get(99).width = 32; }, /size\/sample count must match/],
+    [[depthPass(3, { resolve: true })], f => { f.host.textures.get(11).sampleCount = 4; }, /requires a 4x source/],
+    [[depthPass(3, { resolve: true })], f => { f.host.textures.get(11).format = "bgra8unorm"; }, /requires a 4x source/],
+    [[depthPass(3, { resolve: true })], f => { f.host.textures.get(11).height = 32; }, /requires a 4x source/],
+    [[depthPass(3, { resolve: true })], f => { f.host.textures.get(11).usage = 1; }, /requires a 4x source/],
+    [[depthPass(3, { resolve: true })], f => { f.host.pipelines.get(100).sampleCount = 1; }, /pipeline sample count does not match/],
+    [[[27, depthPass(0)[1]]], null, /Truncated RENDER_PASS_DEPTH/],
+    [[[26, [100, 0, SHADER.length, 2, 1, 1, 16, 20, 3, 1, 2, 0, 0, 15, 2]]], null, /unsupported sample count 2/],
+  ]) {
+    const f = fixture({ sampleCount: 4 });
+    configure?.(f);
+    await assert.rejects(f.host.executePacket(packet(commands, SHADER)), expected);
+    assert.equal(f.events.some(([name]) => name === "submit"), false);
+    assert.deepEqual(f.scopes, []);
+  }
+});
 function computeCommand(opcode, fields) {
   // Compute headers contain a two-byte pad before their u32 fields.
   const bytes = new Uint8Array(4 + fields.length * 4), view = new DataView(bytes.buffer);

@@ -1,5 +1,7 @@
 // Independent direct WebGPU reference; no F3D packet decoding or candidate pixels.
 async function directResolve(device, mode) {
+  const hasDepth = mode === 2 || mode === 3;
+  const hasBundle = mode === 3 || mode === 4;
   const source = device.createTexture({
     size: [64, 64],
     format: "rgba8unorm",
@@ -16,13 +18,32 @@ async function directResolve(device, mode) {
     size: 16384,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   });
+  const depth = hasDepth ? device.createTexture({
+    size: [64, 64], format: "depth24plus", sampleCount: 4,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  }) : null;
   device.pushErrorScope("validation");
   let scopeOpen = true;
   try {
     let pipeline;
-    if (mode === 1) {
+    if (mode !== 0) {
       const module = device.createShaderModule({
-        code: `
+        code: hasDepth ? `
+        struct Output { @builtin(position) p: vec4f, @location(0) color: vec4f, }
+        @vertex fn vertex(@builtin(vertex_index) i: u32) -> Output {
+          let p = array<vec2f, 3>(vec2f(-0.5, -0.5), vec2f(0.5, -0.5), vec2f(0.0, 0.5));
+          var output: Output;
+          if (i < 3u) {
+            output.p = vec4f(p[i], 0.25, 1.0);
+            output.color = vec4f(1.0, 0.0, 0.0, 1.0);
+          } else {
+            output.p = vec4f(p[i - 3u], 0.75, 1.0);
+            output.color = vec4f(0.0, 0.0, 1.0, 1.0);
+          }
+          return output;
+        }
+        @fragment fn fragment(input: Output) -> @location(0) vec4f { return input.color; }
+        ` : `
         @vertex fn vertex(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
           let p = array<vec2f, 3>(vec2f(-0.5, -0.5), vec2f(0.5, -0.5), vec2f(0.0, 0.5));
           return vec4f(p[i], 0.0, 1.0);
@@ -36,6 +57,9 @@ async function directResolve(device, mode) {
         fragment: { module, entryPoint: "fragment", targets: [{ format: "rgba8unorm" }] },
         primitive: { topology: "triangle-list" },
         multisample: { count: 4 },
+        ...(hasDepth ? { depthStencil: {
+          format: "depth24plus", depthWriteEnabled: true, depthCompare: "less",
+        } } : {}),
       });
     }
     const encoder = device.createCommandEncoder();
@@ -49,10 +73,23 @@ async function directResolve(device, mode) {
           clearValue: mode === 0 ? [1, 0, 0, 1] : [0, 0, 0, 1],
         },
       ],
+      ...(hasDepth ? { depthStencilAttachment: {
+        view: depth.createView(), depthLoadOp: "clear", depthStoreOp: "store", depthClearValue: 1,
+      } } : {}),
     });
+    if (hasBundle) {
+      const bundle = device.createRenderBundleEncoder({
+        colorFormats: ["rgba8unorm"], sampleCount: 4,
+        ...(hasDepth ? { depthStencilFormat: "depth24plus", depthReadOnly: false, stencilReadOnly: true } : {}),
+      });
+      bundle.setPipeline(pipeline);
+      bundle.draw(3);
+      pass.executeBundles([bundle.finish()]);
+    }
     if (pipeline) {
       pass.setPipeline(pipeline);
-      pass.draw(3);
+      if (mode === 2) pass.draw(6);
+      else pass.draw(3, 1, mode === 3 ? 3 : 0);
     }
     pass.end();
     encoder.copyTextureToBuffer(
@@ -74,6 +111,7 @@ async function directResolve(device, mode) {
     source.destroy();
     resolved.destroy();
     readback.destroy();
+    depth?.destroy();
   }
 }
 
@@ -86,7 +124,7 @@ function assertPixel(pixels, x, y, expected, label) {
 }
 
 function releaseProbe(host, previousTarget) {
-  for (const id of [810, 811]) {
+  for (const id of [810, 811, 814]) {
     host.textures.get(id)?.destroy();
     host.textures.delete(id);
   }
@@ -94,13 +132,14 @@ function releaseProbe(host, previousTarget) {
   host.buffers.delete(812);
   host.bufferEpochs.delete(812);
   host.pipelines.delete(813);
+  host.bundles.delete(815);
   host.lastRenderTargetId = host.textures.has(previousTarget) ? previousTarget : null;
 }
 
 export async function testMultisampleResolve(host, buildPacket) {
   if (typeof buildPacket !== "function") throw new Error("Missing Rust multisample packet export");
   const previousTarget = host.lastRenderTargetId;
-  for (const mode of [0, 1]) {
+  for (const mode of [0, 1, 2, 3, 4]) {
     const reference = await directResolve(host.device, mode);
     try {
       await host.executePacket(buildPacket(mode));
@@ -125,7 +164,7 @@ export async function testMultisampleResolve(host, buildPacket) {
         mode === 0 ? [255, 0, 0, 255] : [0, 0, 0, 255],
         "Resolve background",
       );
-      if (mode === 1 && !pixels.some((value, i) => i % 4 === 0 && value > 0 && value < 255)) {
+      if (mode !== 0 && !pixels.some((value, i) => i % 4 === 0 && value > 0 && value < 255)) {
         throw new Error("4x triangle resolve has no partially covered edge pixels");
       }
     } finally {
@@ -172,5 +211,5 @@ export async function testMultisampleResolve(host, buildPacket) {
       releaseProbe(host, previousTarget);
     }
   }
-  return "Rust clear-only and triangle packets match all 16384 direct WebGPU bytes each; actual 4x-to-1x textures, source discard, red/black probes, partial edge coverage and four malformed-packet rejections";
+  return "Five Rust clear/triangle/depth/bundle packets match all 16384 direct WebGPU bytes each; actual 4x-to-1x textures, source discard, depth occlusion after bundle-to-direct rebind, partial edge coverage and four malformed-packet rejections";
 }

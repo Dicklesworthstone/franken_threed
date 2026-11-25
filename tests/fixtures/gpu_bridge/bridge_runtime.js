@@ -37,6 +37,8 @@ export const OPCODE_DISPATCH_COMPUTE = 22;
 export const OPCODE_CREATE_TEXTURE_MULTISAMPLED = 23;
 export const OPCODE_CREATE_PIPELINE_MULTISAMPLED = 24;
 export const OPCODE_RENDER_PASS_RESOLVE = 25;
+export const OPCODE_CREATE_PIPELINE_DEPTH_MULTISAMPLED = 26;
+export const OPCODE_RENDER_PASS_DEPTH_RESOLVE = 27;
 
 export const BINDING_TYPE_UNIFORM = 0;
 export const BINDING_TYPE_STORAGE_READ = 1;
@@ -109,6 +111,20 @@ export const TEXTURE_USAGE_STORAGE_BINDING = 8;
 export const TEXTURE_USAGE_RENDER_ATTACHMENT = 16;
 
 import { ensureSafePacketBytes, isDetached } from "./memory_transport.js";
+
+function colorResolveView(source, destination) {
+  if (!source || !destination || source === destination ||
+      source.sampleCount !== 4 || destination.sampleCount !== 1 ||
+      source.width !== destination.width || source.height !== destination.height ||
+      source.format !== destination.format ||
+      !(source.usage & TEXTURE_USAGE_RENDER_ATTACHMENT) ||
+      !(destination.usage & TEXTURE_USAGE_RENDER_ATTACHMENT)) {
+    throw new Error(
+      "RenderPassResolve: requires a 4x source and matching single-sample render-attachment destination",
+    );
+  }
+  return destination.createView();
+}
 
 export class WebGpuBridgeHost {
   /**
@@ -544,7 +560,8 @@ export class WebGpuBridgeHost {
             pendingDrawParameters &&
             opcode !== OPCODE_RENDER_PASS &&
             opcode !== OPCODE_RENDER_PASS_DEPTH &&
-            opcode !== OPCODE_RENDER_PASS_RESOLVE
+            opcode !== OPCODE_RENDER_PASS_RESOLVE &&
+            opcode !== OPCODE_RENDER_PASS_DEPTH_RESOLVE
           ) {
             throw new Error(
               "SetDrawParameters must immediately precede a render-pass draw command",
@@ -877,11 +894,13 @@ export class WebGpuBridgeHost {
 
             case OPCODE_CREATE_PIPELINE_DEPTH:
             case OPCODE_CREATE_PIPELINE_DEPTH_CULL:
-            case OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR: {
+            case OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR:
+            case OPCODE_CREATE_PIPELINE_DEPTH_MULTISAMPLED: {
               closeActivePass();
-              const hasColorFields = opcode === OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR;
+              const hasSampleCount = opcode === OPCODE_CREATE_PIPELINE_DEPTH_MULTISAMPLED;
+              const hasColorFields = opcode === OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR || hasSampleCount;
               const hasCullFields = opcode === OPCODE_CREATE_PIPELINE_DEPTH_CULL || hasColorFields;
-              const expectedHeaderSize = hasColorFields ? 56 : hasCullFields ? 52 : 44;
+              const expectedHeaderSize = hasSampleCount ? 60 : hasColorFields ? 56 : hasCullFields ? 52 : 44;
               if (cursor + expectedHeaderSize > dataBlockStart) {
                 throw new Error(`Truncated CREATE_PIPELINE_DEPTH fields at command ${i}`);
               }
@@ -905,6 +924,10 @@ export class WebGpuBridgeHost {
               }
               if (hasColorFields) {
                 writeMask = dataView.getUint32(cursor + 52, true);
+              }
+              const sampleCount = hasSampleCount ? dataView.getUint32(cursor + 56, true) : 1;
+              if (sampleCount !== 1 && sampleCount !== 4) {
+                throw new Error(`CreatePipelineDepth: unsupported sample count ${sampleCount}`);
               }
               cursor += expectedHeaderSize;
 
@@ -1026,6 +1049,7 @@ export class WebGpuBridgeHost {
                   depthWriteEnabled: depthWriteEnabled,
                   depthCompare: depthCompare,
                 },
+                multisample: { count: sampleCount },
               });
 
               publishPrepared(this.pipelines, pipelineId, {
@@ -1040,6 +1064,7 @@ export class WebGpuBridgeHost {
                 cullMode,
                 frontFace,
                 writeMask,
+                sampleCount,
               });
               break;
             }
@@ -1297,22 +1322,7 @@ export class WebGpuBridgeHost {
                   colorAttachmentDesc.clearValue = { r: cr, g: cg, b: cb, a: ca };
                 }
                 if (hasResolve) {
-                  const resolveTexture = this.textures.get(resolveTargetId);
-                  if (
-                    !resolveTexture ||
-                    sourceTexture.sampleCount !== 4 ||
-                    resolveTexture.sampleCount !== 1 ||
-                    sourceTexture.width !== resolveTexture.width ||
-                    sourceTexture.height !== resolveTexture.height ||
-                    sourceTexture.format !== resolveTexture.format ||
-                    !(sourceTexture.usage & GPUTextureUsage.RENDER_ATTACHMENT) ||
-                    !(resolveTexture.usage & GPUTextureUsage.RENDER_ATTACHMENT)
-                  ) {
-                    throw new Error(
-                      "RenderPassResolve: requires a 4x source and matching single-sample render-attachment destination",
-                    );
-                  }
-                  colorAttachmentDesc.resolveTarget = resolveTexture.createView();
+                  colorAttachmentDesc.resolveTarget = colorResolveView(sourceTexture, this.textures.get(resolveTargetId));
                 }
 
                 currentPassEncoder = commandEncoder.beginRenderPass({
@@ -1437,11 +1447,14 @@ export class WebGpuBridgeHost {
               break;
             }
 
-            case OPCODE_RENDER_PASS_DEPTH: {
+            case OPCODE_RENDER_PASS_DEPTH:
+            case OPCODE_RENDER_PASS_DEPTH_RESOLVE: {
+              const hasResolve = opcode === OPCODE_RENDER_PASS_DEPTH_RESOLVE;
+              const fieldBytes = hasResolve ? 60 : 56;
               const hasDrawParameters = pendingDrawParameters !== null;
               const drawParameters = pendingDrawParameters || [1, 0, 0];
               pendingDrawParameters = null;
-              if (cursor + 56 > dataBlockStart) {
+              if (cursor + fieldBytes > dataBlockStart) {
                 throw new Error(`Truncated RENDER_PASS_DEPTH fields at command ${i}`);
               }
               const rawTargetType = dataView.getUint32(cursor, true);
@@ -1477,7 +1490,11 @@ export class WebGpuBridgeHost {
               const depthTargetId = dataView.getUint32(cursor + 44, true);
               const packedDepthOps = dataView.getUint32(cursor + 48, true);
               const depthClearValue = dataView.getFloat32(cursor + 52, true);
-              cursor += 56;
+              const resolveTargetId = hasResolve ? dataView.getUint32(cursor + 56, true) : null;
+              cursor += fieldBytes;
+              if (hasResolve && targetKind !== TARGET_OFFSCREEN) {
+                throw new Error("RenderPassDepthResolve: multisampled color source must be offscreen");
+              }
 
               const depthLoadOpCode = packedDepthOps & 0xff;
               const depthStoreOpCode = (packedDepthOps >> 8) & 0xff;
@@ -1502,11 +1519,11 @@ export class WebGpuBridgeHost {
               }
 
               if (targetKind === TARGET_OFFSCREEN) {
-                this.lastRenderTargetId = targetId;
+                this.lastRenderTargetId = hasResolve ? resolveTargetId : targetId;
               }
 
               const isNewPass = (passFlags & 1) !== 0;
-              const targetKey = `${targetKind}:${targetId}:depth:${depthTargetId}`;
+              const targetKey = `${targetKind}:${targetId}:depth:${depthTargetId}${hasResolve ? `:resolve:${resolveTargetId}` : ""}`;
               if (hasDrawParameters && (isNewPass || currentPassTargetKey !== targetKey)) {
                 throw new Error("SetDrawParameters cannot cross a render-pass boundary");
               }
@@ -1514,7 +1531,7 @@ export class WebGpuBridgeHost {
               if (!currentPassEncoder || currentPassTargetKey !== targetKey || isNewPass) {
                 closeActivePass();
 
-                let targetView;
+                let targetView, sourceTexture = null;
                 if (targetKind === TARGET_CANVAS) {
                   if (!canvasContext) {
                     throw new Error("RenderPassDepth: canvas target requires a canvas context");
@@ -1526,11 +1543,7 @@ export class WebGpuBridgeHost {
                   if (!texture) {
                     throw new Error(`RenderPassDepth: unknown offscreen targetId ${targetId}`);
                   }
-                  if (texture.sampleCount !== 1) {
-                    throw new Error(
-                      "RenderPassDepth: multisampled depth rendering is not implemented",
-                    );
-                  }
+                  sourceTexture = texture;
                   targetView = texture.createView();
                 } else {
                   throw new Error(`Invalid render pass targetKind: ${targetKind}`);
@@ -1539,6 +1552,12 @@ export class WebGpuBridgeHost {
                 const depthTexture = this.textures.get(depthTargetId);
                 if (!depthTexture) {
                   throw new Error(`RenderPassDepth: unknown depthTargetId ${depthTargetId}`);
+                }
+                const sampleCount = sourceTexture?.sampleCount ?? 1;
+                if (depthTexture.sampleCount !== sampleCount ||
+                    (sourceTexture && (sourceTexture.width !== depthTexture.width ||
+                      sourceTexture.height !== depthTexture.height))) {
+                  throw new Error("RenderPassDepth: depth and color attachment size/sample count must match");
                 }
                 const depthView = depthTexture.createView();
 
@@ -1551,6 +1570,9 @@ export class WebGpuBridgeHost {
                 };
                 if (loadOp === "clear") {
                   colorAttachmentDesc.clearValue = { r: cr, g: cg, b: cb, a: ca };
+                }
+                if (hasResolve) {
+                  colorAttachmentDesc.resolveTarget = colorResolveView(sourceTexture, this.textures.get(resolveTargetId));
                 }
 
                 const depthReadOnly = depthReadOnlyCode === 1;
@@ -1574,6 +1596,7 @@ export class WebGpuBridgeHost {
                   depthStencilAttachment: depthAttachmentDesc,
                 });
                 currentPassTargetKey = targetKey;
+                currentPassSampleCount = sampleCount;
                 passState = {
                   pipelineId: null,
                   uniformBufferId: null,
@@ -1587,6 +1610,9 @@ export class WebGpuBridgeHost {
                 const pipelineRecord = usePrepared(this.pipelines.get(pipelineId));
                 if (!pipelineRecord) {
                   throw new Error(`RenderPassDepth: unknown pipelineId ${pipelineId}`);
+                }
+                if ((pipelineRecord.sampleCount ?? 1) !== currentPassSampleCount) {
+                  throw new Error("RenderPassDepth: pipeline sample count does not match the color attachment");
                 }
 
                 if (passState.pipelineId !== pipelineId) {
@@ -1868,8 +1894,9 @@ export class WebGpuBridgeHost {
               if (!pipelineRecord) {
                 throw new Error(`RecordBundle: unknown pipelineId ${pipelineId}`);
               }
-              if ((pipelineRecord.sampleCount ?? 1) !== 1) {
-                throw new Error("RecordBundle: multisampled bundles are not implemented");
+              const sampleCount = pipelineRecord.sampleCount ?? 1;
+              if (sampleCount !== 1 && sampleCount !== 4) {
+                throw new Error(`RecordBundle: unsupported sample count ${sampleCount}`);
               }
               const uniformBuf = pipelineRecord.hasUniformBuffer
                 ? this.buffers.get(uniformBufferId)
@@ -1893,6 +1920,7 @@ export class WebGpuBridgeHost {
               }
 
               const bundleDescriptor = { colorFormats: [format] };
+              if (sampleCount !== 1) bundleDescriptor.sampleCount = sampleCount;
               if (pipelineRecord.hasDepth) {
                 // Bundle layout must match the depth attachment. A bundle whose
                 // pipeline never writes depth may execute in either a read-only
@@ -1966,9 +1994,6 @@ export class WebGpuBridgeHost {
             }
 
             case OPCODE_EXECUTE_BUNDLES: {
-              if (currentPassSampleCount !== 1) {
-                throw new Error("ExecuteBundles: multisampled bundles are not implemented");
-              }
               if (cursor + 4 > dataBlockStart) {
                 throw new Error(`Truncated EXECUTE_BUNDLES fields at command ${i}`);
               }
@@ -2007,13 +2032,13 @@ export class WebGpuBridgeHost {
                       foundTarget = true;
                     }
                     break;
-                  } else if (nextOp === OPCODE_RENDER_PASS_DEPTH) {
+                  } else if (nextOp === OPCODE_RENDER_PASS_DEPTH || nextOp === OPCODE_RENDER_PASS_DEPTH_RESOLVE) {
                     throw new Error(
                       "ExecuteBundles: depth bundles require an explicit RenderPassDepth opener",
                     );
                   } else if (nextOp === OPCODE_RENDER_PASS_RESOLVE) {
                     throw new Error(
-                      "ExecuteBundles: multisampled resolve passes are not implemented for bundles",
+                      "ExecuteBundles: resolve passes require an explicit RenderPassResolve opener",
                     );
                   } else if (nextOp === OPCODE_CREATE_BUFFER) {
                     scanCursor += 12;
@@ -2037,6 +2062,8 @@ export class WebGpuBridgeHost {
                     scanCursor += 52;
                   } else if (nextOp === OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR) {
                     scanCursor += 56;
+                  } else if (nextOp === OPCODE_CREATE_PIPELINE_DEPTH_MULTISAMPLED) {
+                    scanCursor += 60;
                   } else if (nextOp === OPCODE_CREATE_PIPELINE_TEXTURED) {
                     scanCursor += 44;
                   } else if (nextOp === OPCODE_COPY_TEXTURE_TO_BUFFER) {
@@ -2101,7 +2128,7 @@ export class WebGpuBridgeHost {
                     throw new Error(`ExecuteBundles: unknown offscreen targetId ${targetId}`);
                   }
                   if (texture.sampleCount !== 1) {
-                    throw new Error("ExecuteBundles: multisampled bundles are not implemented");
+                    throw new Error("ExecuteBundles: multisampled attachments require an explicit render-pass opener");
                   }
                   targetView = texture.createView();
                 }

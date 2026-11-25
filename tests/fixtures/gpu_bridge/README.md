@@ -38,6 +38,25 @@ This fixture verifies the first real Rust/Wasm to WebGPU execution slice and ren
    - **Detachment Detection (`isDetached`)**: Immediately detects and rejects detached or zero-length `ArrayBuffer` instances resulting from Wasm linear memory growth (`memory.grow()`).
    - **Copy Accounting (`TransportCopyLedger`) & Bounded Helper (`copyFromWasmMemory`)**: Validates finite, non-negative integer ranges for Wasm memory slices and tracks actual transport copies without synthetic inference.
 
+## Multisample depth and bundle packets
+
+The Rust packet route supports matching 4x color/depth attachments, color resolve
+at pass end, and multisample render bundles followed by direct draws. Packet
+opcode 26 extends the depth/cull/color pipeline payload with a sample-count word;
+opcode 27 extends the depth-pass payload with a resolve-destination word. Existing
+opcodes retain their wire layouts. Resolve publication is independent of source
+color discard, including passes that only load and resolve existing samples.
+
+`depth_bundles.test.mjs` exercises production decoding with a recording device:
+both depth formats, read-only depth, pipeline state, mismatched attachments and
+resolve destinations, and state rebinding after bundle execution. Those checks
+do not establish GPU execution. The existing `testMultisampleResolve` browser
+fixture additionally compares five Rust-generated packets with an independent
+direct WebGPU reference, including a near red triangle occluding a later blue
+triangle and a bundle followed by a direct draw. Its pixel checks require an
+actual Wasm build and a capable browser run; the fixture's presence is not a
+passed browser result or a speedup measurement.
+
 ## No-Claim Boundary
 
 - **Unbenchmarked Slice**: This is an unbenchmarked first bridge slice establishing structural correctness and execution invariants, not a production-selected fastest variant, full renderer, or passed M5/iPhone hardware gate.
