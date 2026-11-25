@@ -167,10 +167,11 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     const sampled2D = texture => copied?.(texture) || texture?.isTexture === true &&
       !texture.isRenderTargetTexture && !texture.isStorageTexture && !texture.isDepthTexture &&
       !texture.isFramebufferTexture && !texture.isExternalTexture && !texture.isVideoTexture &&
-      !texture.isCubeTexture && !texture.isDataArrayTexture && !texture.isData3DTexture && !texture.isCompressedTexture;
+      !texture.isCubeTexture && !texture.isDataArrayTexture && !texture.isData3DTexture && !texture.isCompressedArrayTexture;
     if (!hasThreeNativeTexture(material, sampled2D)) return false;
-    // Keep ordinary 2D maps on the native sampled owner from their first draw.
-    // Loading is an allocation state, not a different material program: the
+    // Keep ordinary 2D maps, including authored compressed mip chains, on the
+    // native sampled owner from their first draw. Uncompressed loading is an
+    // allocation state, not a different material program: the
     // source owner supplies version-zero defaults and dataReady:false storage.
     // Waiting for pixels here would send loader startup through fixed shaders
     // with different map features, callback rules and upload history.

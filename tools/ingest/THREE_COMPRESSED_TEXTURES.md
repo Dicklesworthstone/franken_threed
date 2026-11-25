@@ -6,7 +6,9 @@ owner for `CompressedTexture`, `CompressedArrayTexture`, and
 path too. Ordinary material maps and `sampler2DArray` programs consume these
 bindings; applications do not need to supply a second allocator or borrowed map.
 
-The native renderer's node-material path also consumes these sources through
+Ordinary native 2D material maps, including alpha maps, automatically select the
+source shader and shared sampled owner. The native renderer's authored node path
+also consumes these sources through
 the pinned `TextureNode`/`CubeTextureNode` builder. Compressed array textures
 retain their layer coordinates. The shared owner supplies the native sample
 layout, including filterable compressed HDR formats independently of the
@@ -52,8 +54,13 @@ the actual device features automatically. The code never assumes that an adapter
 feature was enabled on the supplied device.
 
 NoColorSpace and LinearSRGBColorSpace use the native linear format. SRGBColorSpace
-uses the corresponding sRGB sampling view without rewriting blocks. RGTC, BC6H
-and EAC have no sRGB variant and reject that request. Base widths/heights must be
+uses the corresponding sRGB sampling view without rewriting blocks. Native
+WebGPU also admits registered linear/sRGB-transfer spaces, including Display-P3,
+linear Display-P3, linear Rec.2020 and extended-sRGB. RGTC, BC6H and EAC have no
+sRGB variant: native WebGPU retains their raw format, matching the pinned source
+helper, while the WebGL-compatible profile still rejects that transfer request.
+The native shader graph receives no additional primaries conversion.
+Base widths/heights must be
 block aligned unless the device explicitly enabled
 `texture-compression-unaligned`. The texture is never resized to make it legal.
 

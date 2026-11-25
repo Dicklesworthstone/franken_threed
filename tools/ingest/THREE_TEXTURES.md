@@ -176,6 +176,25 @@ Invalid inputs/budgets are recoverable. whenIdle observes cumulative native
 validation and completion. Disposal ends a pending owner wait without claiming
 to cancel work already submitted to the device.
 
+## Native texture color spaces
+
+The native sampled profile (`nativeMedia: true`) accepts color spaces registered
+with the supplied module's `ColorManagement`, including Display-P3, linear
+Display-P3, linear Rec.2020 and extended-sRGB with their source addon definitions.
+It uses the pinned `WebGPUTextureUtils.getFormat` transfer rule: registered
+sRGB transfers select sRGB views for RGBA8 and compressed formats that have one;
+linear transfers select linear views. HDR, R/RG, normalized integer and compressed
+formats without an sRGB variant retain their source raw format. Source bytes and
+the public `colorSpace` remain unchanged, including when color management is
+disabled. The retained native shader graph is unchanged; this adds no implicit
+conversion between color primaries. The external-image copy profile above and
+the WebGL-compatible texture admission remain separate.
+
+`three_texture_color_spaces.test.mjs` compares these formats with the pinned
+source helper and checks exact bytes, shared residency and loading defaults for
+2D, array, volume and cube textures. These recording checks do not establish
+browser pixel parity.
+
 ## Native sampled texture copies
 
 Native `renderer.copyTextureToTexture()` accepts ordinary sampled textures as

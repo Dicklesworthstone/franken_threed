@@ -98,6 +98,22 @@ function textureInspector(T,{
   const filters=new Map([[T.NearestFilter,['nearest','nearest',false]],[T.LinearFilter,['linear','nearest',false]],
     [T.NearestMipmapNearestFilter,['nearest','nearest',true]],[T.NearestMipmapLinearFilter,['nearest','linear',true]],
     [T.LinearMipmapNearestFilter,['linear','nearest',true]],[T.LinearMipmapLinearFilter,['linear','linear',true]]]);
+  function srgbTransfer(colorSpace) {
+    if(!nativeMedia||!T.ColorManagement){
+      if(![T.NoColorSpace,T.LinearSRGBColorSpace,T.SRGBColorSpace].includes(colorSpace))
+        fail('COLOR','Unsupported texture color space');
+      return colorSpace===T.SRGBColorSpace;
+    }
+    const management=T.ColorManagement;
+    if(colorSpace!==T.NoColorSpace&&(typeof colorSpace!=='string'||!management?.spaces?.[colorSpace]))
+      fail('COLOR','Native texture color space is not registered');
+    const transfer=management?.getTransfer(colorSpace);
+    if(transfer===undefined||transfer!==T.LinearTransfer&&transfer!==T.SRGBTransfer)
+      fail('COLOR','Native texture color spaces require the source linear or sRGB transfer');
+    // Native r186 selects a hardware transfer by registered metadata, even
+    // when ColorManagement.enabled is false. No extra primaries transform is added.
+    return transfer===T.SRGBTransfer;
+  }
   // Ignore absent constants in descriptor-only clients. Never let an undefined
   // format/type accidentally select an integer profile.
   const integerChannels=new Map([['RedIntegerFormat',1],['RGIntegerFormat',2],['RGBAIntegerFormat',4]]
@@ -163,8 +179,8 @@ function textureInspector(T,{
     if(family&&(width%blockWidth||height%blockHeight)&&!features.has('texture-compression-unaligned'))
       fail('FEATURE','Unaligned compressed base extents require texture-compression-unaligned; pixels are never resized');
     if(!family&&t.type!==T.UnsignedByteType)fail('FORMAT','Uncompressed CompressedTexture mips require RGBA8 bytes');
-    if(![T.NoColorSpace,T.LinearSRGBColorSpace,T.SRGBColorSpace].includes(t.colorSpace)||t.colorSpace===T.SRGBColorSpace&&!srgb)
-      fail('COLOR','Compressed format has no matching color-space view');
+    const srgbColor=srgbTransfer(t.colorSpace);
+    if(!nativeMedia&&srgbColor&&!srgb)fail('COLOR','Compressed format has no matching color-space view');
     if(t.internalFormat!==null||t.compareFunction!=null||t.flipY!==false||t.premultiplyAlpha!==false||t.generateMipmaps!==false)
       fail('FORMAT','Compressed uploads require authored mips, unchanged block orientation/alpha and no internal override');
     if(t.onUpdate!==null&&typeof t.onUpdate!=='function')fail('SOURCE','Invalid upload callback');
@@ -209,7 +225,7 @@ function textureInspector(T,{
         fail('RANGE','Expected a bounded compressed layerUpdates Set');
       layerUpdates=[...t.layerUpdates];for(const layer of layerUpdates)integer(layer,0,layers-1,'updated layer');
     }
-    const viewFormat=t.colorSpace===T.SRGBColorSpace?format+'-srgb':format,viewDimension=cube?'cube':array?'2d-array':'2d';
+    const viewFormat=srgbColor&&srgb?format+'-srgb':format,viewDimension=cube?'cube':array?'2d-array':'2d';
     const key=JSON.stringify(['compressed',t.format,width,height,layers,levels,format,viewFormat,viewDimension,sampler,family?null:nativeMedia?1:t.unpackAlignment]);
     return {source:t.source,width,height,layers,levels,cube,array,layered:array,volume:false,blockUploads:true,
       compressed:family!==null,bytes,format,viewFormat,viewDimension,sampler,key,data:true,manual:true,
@@ -287,8 +303,8 @@ function textureInspector(T,{
     const channels=packed?1:integral?integerChannels.get(t.format):new Map([[T.RedFormat,1],[T.RGFormat,2],[T.RGBAFormat,4]]).get(t.format);
     if(!channels)fail('FORMAT','Expected R, RG or RGBA storage, or packed RGB9E5/RGB11F data');
     if(integral&&t.colorSpace!==T.NoColorSpace)fail('COLOR','Integer textures carry data, not color-space transfers');
-    if(![T.NoColorSpace,T.LinearSRGBColorSpace,T.SRGBColorSpace].includes(t.colorSpace)||
-        (t.colorSpace===T.SRGBColorSpace&&(channels!==4||bpc!==1||norm)))fail('COLOR','Unsupported transfer function or channel format');
+    const srgbColor=srgbTransfer(t.colorSpace),srgbView=channels===4&&bpc===1&&!norm&&!integral;
+    if(!nativeMedia&&srgbColor&&!srgbView)fail('COLOR','Unsupported transfer function or channel format');
     if(!Number.isSafeInteger(t.version)||t.version<(video||initialize||nativeAllocation?0:1)||!Number.isSafeInteger(t.source?.version)||t.source.version<0||
         !nativeAllocation&&t.source.dataReady!==true)
       fail('NOT_READY','Set needsUpdate after providing ready source data');
@@ -439,7 +455,7 @@ function textureInspector(T,{
     // r186's cube default helper constructs an ordinary byte CubeTexture; its
     // format argument keys the cache but is not forwarded to createTexture.
     const cubeDefault=cube&&nativeAllocation==='default';
-    const viewFormat=cubeDefault?'rgba8unorm':t.colorSpace===T.SRGBColorSpace?'rgba8unorm-srgb':baseFormat,
+    const viewFormat=cubeDefault?'rgba8unorm':srgbColor&&srgbView?'rgba8unorm-srgb':baseFormat,
       format=nativeAllocation==='default'?viewFormat:baseFormat;
     const sampler={addressModeU:wraps.get(t.wrapS),addressModeV:wraps.get(t.wrapT),magFilter:mag[0],minFilter:filter[0],
       mipmapFilter:filter[1],lodMinClamp:0,lodMaxClamp:nativeMedia?32:filter[2]?levels-1:0,maxAnisotropy,...(layered?{addressModeW:wraps.get(t.wrapR)}:{})};

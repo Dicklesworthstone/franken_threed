@@ -6,6 +6,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import {KTX2Loader} from '../../upstream/three.js/examples/jsm/loaders/KTX2Loader.js';
+import {DisplayP3ColorSpace, DisplayP3ColorSpaceImpl, LinearDisplayP3ColorSpace,
+  LinearDisplayP3ColorSpaceImpl, LinearRec2020ColorSpace, LinearRec2020ColorSpaceImpl,
+  ExtendedSRGBColorSpace, ExtendedSRGBColorSpaceImpl} from '../../upstream/three.js/examples/jsm/math/ColorSpaces.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
@@ -139,6 +142,27 @@ test('compressed material maps with authored opacity retain source UV and color 
   const draw = draws(f)[0]; assertSource(f, f.captures[0].draws[0].binding.nodeProgram);
   assert.equal(sampledView(draw).format, 'bc1-rgba-unorm-srgb');
   assert.match(draw.pipeline.fragment.module.code, /textureSample/);
+});
+
+test('registered compressed map spaces retain the source material graph without extra gamut conversion', async t => {
+  const definitions = {[DisplayP3ColorSpace]: DisplayP3ColorSpaceImpl,
+    [LinearDisplayP3ColorSpace]: LinearDisplayP3ColorSpaceImpl,
+    [LinearRec2020ColorSpace]: LinearRec2020ColorSpaceImpl, [ExtendedSRGBColorSpace]: ExtendedSRGBColorSpaceImpl};
+  const old = new Map(Object.keys(definitions).map(space => [space, T.ColorManagement.spaces[space]]));
+  T.ColorManagement.define(definitions);
+  t.after(() => { for (const [space, value] of old) {
+    if (value === undefined) delete T.ColorManagement.spaces[space]; else T.ColorManagement.spaces[space] = value;
+  } });
+  const f = fixture(t); await f.renderer.init();
+  for (const space of Object.keys(definitions)) for (const slot of ['map', 'alphaMap']) {
+    const texture = compressed(t, {colorSpace: space}), material = new T.MeshBasicMaterial({[slot]: texture});
+    t.after(() => material.dispose()); f.object.material = material;
+    await f.renderer.renderAsync(f.scene, f.camera);
+    assertSource(f, f.captures.at(-1).draws[0].binding.nodeProgram);
+    assert.equal(sampledView(draws(f).at(-1)).format,
+      'bc1-rgba-unorm' + (T.ColorManagement.getTransfer(space) === T.SRGBTransfer ? '-srgb' : ''));
+    assert.equal(texture.colorSpace, space);
+  }
 });
 
 test('queued compressed mip and sampler captures preserve acknowledged bytes and source identity', async t => {
@@ -279,7 +303,7 @@ test('compatible compressed replacements share programs while array family chang
 for (const [name, change, code] of [
   ['missing compression feature', () => {}, 'THREE_TEXTURE_FEATURE'],
   ['invalid mip block bytes', texture => { texture.mipmaps[1].data = new Uint8Array(1); }, 'THREE_TEXTURE_STORAGE'],
-  ['unsupported HDR color space', texture => { texture.format = T.RGB_BPTC_UNSIGNED_Format; texture.colorSpace = T.SRGBColorSpace; }, 'THREE_TEXTURE_COLOR'],
+  ['unregistered color space', texture => { texture.colorSpace = 'unregistered-texture-space'; }, 'THREE_TEXTURE_COLOR'],
   ['forged compressed array class', texture => { texture.isCompressedArrayTexture = true; }, 'THREE_NODE_PROGRAM_TEXTURE'],
 ]) test(`native compressed admission refuses ${name} before texture allocation`, async t => {
   const f = fixture(t, name === 'missing compression feature' ? [] : ['texture-compression-bc']), texture = compressed(t);
