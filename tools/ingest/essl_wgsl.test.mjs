@@ -58,6 +58,36 @@ test('preprocessor: function-like macros, nested conditionals, defined() and #er
   assert.throws(() => preprocess('#if 1\n'), EsslError);
 });
 
+test('material macro aliases consume invocation arguments from the surrounding shader', () => {
+  const fragment = F('WRITE(TINT(.25));', `
+#define CHOOSE(n) ((n) == 2)
+#define ENABLE CHOOSE
+#if ENABLE(2)
+uniform vec4 brush;
+#else
+#error material variant lost
+#endif
+#define APPLY_TINT(v) (brush * (v))
+#define PROVIDE() APPLY_TINT
+#define PASS(x) x
+#define TINT PASS(PROVIDE)()
+#define STORE(v) color = v
+#define WRITE STORE
+`);
+  const compiled = program(minimalVS, fragment);
+  assert.deepEqual(compiled.reflection.uniforms.map(value => value.name).sort(), ['brush', 'mvp']);
+  assert.match(compiled.fragment, /color = .*brush.*0\.25/);
+});
+
+test('macro rescan boundaries preserve independent and nested invocations', () => {
+  const expand = source => preprocess(source).tokens.map(token => token.v).join(' ');
+  assert.equal(expand('#define CALL F\n#define F(x) x\nCALL(CALL(1)) CALL(2)'), '1 2');
+  assert.equal(expand('#define ID(x) x\nID(ID)(3) ID(4)'), 'ID ( 3 ) 4');
+  assert.equal(expand('#define A B\n#define B A\nA B'), 'A B');
+  assert.equal(expand('#define PICK() KEEP\n#define KEEP(v) v\nPICK()\n(7)'), '7');
+  assert.throws(() => preprocess('#define ALIAS F\n#define F(a,b) a+b\nALIAS(1)'), /expects 2 arguments/);
+});
+
 test('version-adaptive shaders select the declared ESSL surface before expansion', () => {
   for (const [prefix, version] of [['', 100], ['#version 100\n', 100], ['#version 300 es\n', 300]]) {
     const definitions = '#define VERSION_ALIAS __VERSION__\n#define MODERN(v) ((v) >= 300)\n';

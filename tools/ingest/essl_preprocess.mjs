@@ -67,42 +67,63 @@ function stripComments(source) {
   return out;
 }
 
-function expand(tokens, macros, disabled = new Set()) {
-  const out = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const tok = tokens[i];
-    const macro = tok.t === 'id' && !disabled.has(tok.v) ? macros.get(tok.v) : undefined;
-    if (!macro) { out.push(tok); continue; }
-    if (macro.params === null) {
-      const inner = new Set(disabled); inner.add(tok.v);
-      for (const b of expand(macro.body.map(x => ({...x, line: tok.line})), macros, inner)) out.push(b);
-      continue;
+// Rescan replacement tokens together with the unconsumed input: an alias can
+// supply the function name while the caller supplies "(" and the arguments.
+// Each replacement token remembers which macros were disabled on its path.
+function expand(tokens, macros) {
+  const hidden = new WeakMap();
+  function rescan(input) {
+    const pending = input.slice().reverse(), out = [];
+    while (pending.length) {
+      const tok = pending.pop();
+      const disabled = hidden.get(tok);
+      const macro = tok.t === 'id' && !disabled?.has(tok.v) ? macros.get(tok.v) : undefined;
+      if (!macro || macro.params !== null && pending.at(-1)?.v !== '(') {
+        out.push(tok);
+        continue;
+      }
+
+      let suppressed = new Set(disabled), args;
+      if (macro.params !== null) {
+        pending.pop();
+        args = [];
+        let depth = 0, current = [], end;
+        while (pending.length) {
+          const next = pending.pop();
+          if (next.v === ')' && depth === 0) { end = next; break; }
+          if (next.v === ',' && depth === 0) { args.push(current); current = []; continue; }
+          if (next.v === '(') depth++;
+          if (next.v === ')') depth--;
+          current.push(next);
+        }
+        if (!end) essError(`Unterminated invocation of macro ${tok.v}`, tok.line);
+        if (current.length || args.length || macro.params.length) args.push(current);
+        if (args.length !== macro.params.length) essError(`Macro ${tok.v} expects ${macro.params.length} arguments`, tok.line);
+        // Only enclosing replacements spanning both ends of this invocation
+        // are still disabled when its result is rescanned.
+        const closing = hidden.get(end);
+        for (const name of suppressed) if (!closing?.has(name)) suppressed.delete(name);
+      }
+      suppressed.add(tok.v);
+      const expandedArgs = new Map();
+      function push(token, line) {
+        const copy = {...token, line};
+        const prior = hidden.get(token);
+        hidden.set(copy, prior ? new Set([...suppressed, ...prior]) : suppressed);
+        pending.push(copy);
+      }
+      for (let i = macro.body.length - 1; i >= 0; i--) {
+        const part = macro.body[i];
+        const k = args && part.t === 'id' ? macro.params.indexOf(part.v) : -1;
+        if (k < 0) { push(part, tok.line); continue; }
+        if (!expandedArgs.has(k)) expandedArgs.set(k, rescan(args[k]));
+        const values = expandedArgs.get(k);
+        for (let j = values.length - 1; j >= 0; j--) push(values[j], values[j].line);
+      }
     }
-    // Function-like: only an invocation when followed by '('.
-    if (tokens[i + 1]?.v !== '(') { out.push(tok); continue; }
-    const args = []; let depth = 0, j = i + 2, current = [];
-    for (; j < tokens.length; j++) {
-      const v = tokens[j].v;
-      if (tokens[j].t === 'op' && (v === '(' || v === '[')) depth++;
-      if (tokens[j].t === 'op' && (v === ')' || v === ']')) { if (depth === 0 && v === ')') break; depth--; }
-      if (tokens[j].t === 'op' && v === ',' && depth === 0) { args.push(current); current = []; continue; }
-      current.push(tokens[j]);
-    }
-    if (j >= tokens.length) essError(`Unterminated invocation of macro ${tok.v}`, tok.line);
-    if (current.length || args.length || macro.params.length) args.push(current);
-    if (args.length === 1 && args[0].length === 0 && macro.params.length === 0) args.length = 0;
-    if (args.length !== macro.params.length) essError(`Macro ${tok.v} expects ${macro.params.length} arguments`, tok.line);
-    const expanded = args.map(a => expand(a, macros, disabled));
-    const body = [];
-    for (const b of macro.body) {
-      const k = b.t === 'id' ? macro.params.indexOf(b.v) : -1;
-      if (k >= 0) body.push(...expanded[k]); else body.push({...b, line: tok.line});
-    }
-    const inner = new Set(disabled); inner.add(tok.v);
-    out.push(...expand(body, macros, inner));
-    i = j;
+    return out;
   }
-  return out;
+  return rescan(tokens);
 }
 
 /** Integer #if expression evaluation (ESSL 3.4). */
