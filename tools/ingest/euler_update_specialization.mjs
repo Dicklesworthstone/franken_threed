@@ -50,7 +50,7 @@ export function specializeEulerUpdateBase(source,{runtimeModule,eulerSource,quat
   const branches=method.body.body.find(node=>node.type==='SwitchStatement').cases.filter(node=>node.test);
   const orders=branches.map(node=>node.test.value),base='offset';
   const component=axis=>{
-    const p=axis*3,left='state['+base+'+plan['+p+']]',right='state['+base+'+3+plan['+(p+1)+']]';
+    const p=axis*3,left='state['+base+'+plan['+p+']]',right='state['+base+'+'+(3+axis)+']';
     return '(plan['+(p+2)+']===0?'+left+'+'+right+':plan['+(p+2)+']===1?'+left+'-'+right+
       ':plan['+(p+2)+']===2?'+left+'*'+right+':'+left+'/'+right+')';
   };
@@ -119,21 +119,38 @@ function shape(loop) {
   const call=callStatement.type==='ExpressionStatement'?callStatement.expression:null;
   if(call?.type!=='CallExpression' || call.optional || call.arguments.length!==3 || property(call.callee)!=='set' ||
     property(call.callee.object)!=='rotation' || !identifier(call.callee.object.object,child.id.name))return null;
-  const operations=[];
+  const operations=[],scales=[];
+  let scale=null;
   for(const argument of call.arguments){
     if(argument.type!=='BinaryExpression' || !OPERATORS.includes(argument.operator))return null;
-    const left=argument.left,right=argument.right;
+    const left=argument.left;
+    let velocity=argument.right,mode='none';
+    // A declarative frame step may be read once while every row stays pure.
+    // Preserve the operand order for each component, including division.
+    if(velocity.type==='BinaryExpression'){
+      const {left,right,operator}=velocity;
+      const leading=operator==='*' && identifier(left);
+      const trailing=['*','/'].includes(operator) && identifier(right);
+      if(!leading && !trailing)return null;
+      const name=leading?left.name:right.name;
+      if([index.id.name,child.id.name,speed.id.name].includes(name) || (scale!==null && scale!==name))return null;
+      scale=name;velocity=leading?right:left;
+      mode=leading?'premultiply':operator==='*'?'multiply':'divide';
+    }
     if(!XYZ.includes(property(left)) || property(left.object)!=='rotation' || !identifier(left.object.object,child.id.name) ||
-      !XYZ.includes(property(right)) || !identifier(right.object,speed.id.name))return null;
-    operations.push(XYZ.indexOf(property(left)),XYZ.indexOf(property(right)),OPERATORS.indexOf(argument.operator));
+      !XYZ.includes(property(velocity)) || !identifier(velocity.object,speed.id.name))return null;
+    operations.push(XYZ.indexOf(property(left)),XYZ.indexOf(property(velocity)),OPERATORS.indexOf(argument.operator));
+    scales.push(mode);
   }
   const bound=loop.test.right;
-  if(identifier(bound))return bound.name===index.id.name?null:{group,bound:bound.name,boundField:null,path,operations,captures:[group,bound.name]};
-  if(bound.type==='Literal' && typeof bound.value==='number')return {group,bound:bound.raw,boundField:null,path,operations,captures:[group]};
+  const shared={group,path,operations,scales,scale,captures:scale===null?[group]:[group,scale]};
+  if(identifier(bound))return bound.name===index.id.name?null:
+    {...shared,bound:bound.name,boundField:null,captures:[...shared.captures,bound.name]};
+  if(bound.type==='Literal' && typeof bound.value==='number')return {...shared,bound:bound.raw,boundField:null};
   if(property(bound)==='length' && property(bound.object)==='children' && identifier(bound.object.object,group))
-    return {group,bound:'null',boundField:null,childrenBound:true,path,operations,captures:[group]};
+    return {...shared,bound:'null',boundField:null,childrenBound:true};
   if(property(bound)!==null && identifier(bound.object) && bound.object.name!==index.id.name)
-    return {group,bound:bound.object.name,boundField:property(bound),path,operations,captures:[group,bound.object.name]};
+    return {...shared,bound:bound.object.name,boundField:property(bound),captures:[...shared.captures,bound.object.name]};
   return null;
 }
 
@@ -169,13 +186,13 @@ export function specializeEulerUpdateLoops(source,{runtimeModule,maxLoops=32}={}
         }
       }
     }
-    const metadata={boundField:candidate.boundField,childrenBound:candidate.childrenBound===true,path:candidate.path,operations:candidate.operations};
+    const metadata={boundField:candidate.boundField,childrenBound:candidate.childrenBound===true,path:candidate.path,operations:candidate.operations,scales:candidate.scales,scaleBinding:candidate.scale};
     plans.push({token,metadata,sourceSpan:{start:node.start,end:node.end,line:node.loc.start.line,column:node.loc.start.column}});
     // Capture failures (e.g. a zero-trip loop with a TDZ body binding) merely
     // retain the original. Dispatch/publication is outside this catch so a
     // post-publication exception can never replay source effects.
-    edits.push({start:node.start,end:node.end,text:'{let '+args+';try{'+args+'=['+candidate.group+','+candidate.bound+'];}catch{}\n'+
-      'if(!'+args+'||!'+attempt+'('+args+'[0],'+args+'[1],'+token+')){'+source.slice(node.start,node.end)+'}}'});
+    edits.push({start:node.start,end:node.end,text:'{let '+args+';try{'+args+'=['+candidate.group+','+candidate.bound+','+(candidate.scale??'1')+'];}catch{}\n'+
+      'if(!'+args+'||!'+attempt+'('+args+'[0],'+args+'[1],'+token+','+args+'[2])){'+source.slice(node.start,node.end)+'}}'});
   });
   if(!plans.length)return unchanged;
   return {changed:true,edits,header:'import {createEulerUpdatePlan as '+create+',tryEulerUpdateLoop as '+attempt+

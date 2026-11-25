@@ -52,7 +52,7 @@ export function createEulerUpdatePlan(metadata){
   const token=freeze({}),operations=new F64(9);
   for(let i=0;i<9;i++)operations[i]=metadata.operations[i];
   apply(set,plans,[token,{boundField:metadata.boundField,childrenBound:metadata.childrenBound===true,
-    path:freeze(metadata.path),operations}]);
+    path:freeze(metadata.path),scales:freeze(metadata.scales),operations}]);
   return token;
 }
 function platform(){return nativeTrig && nativeWasm && matrixNumericPlatformIntact() &&
@@ -83,7 +83,8 @@ function method(object,key,cls){
   return !!value && hasOwn(value,'value') && value.value===expected?.value && typeof value.value==='function';
 }
 function term(a,b,operation){return operation===0?a+b:operation===1?a-b:operation===2?a*b:a/b;}
-function input(group,bound,plan){
+function input(group,bound,plan,scale){
+  if(typeof scale!=='number')return null;
   const root=lookup(owners,group),children=data(group,'children');
   if(!root || !isTransformChildren(children))return null;
   let count;
@@ -119,8 +120,11 @@ function input(group,bound,plan){
     speeds[i]=speed;
     const offset=i*17,ops=plan.operations,angles=[];
     for(let j=0;j<3;j++){
-      state[offset+j]=euler.values[j];state[offset+j+3]=velocity.values[j];
-      angles[j]=term(euler.values[ops[j*3]],velocity.values[ops[j*3+1]],ops[j*3+2]);
+      state[offset+j]=euler.values[j];
+      const delta=velocity.values[ops[j*3+1]],mode=plan.scales[j];
+      const step=mode==='none'?delta:mode==='multiply'?delta*scale:mode==='divide'?delta/scale:scale*delta;
+      state[offset+j+3]=step;
+      angles[j]=term(euler.values[ops[j*3]],step,ops[j*3+2]);
     }
     // Pinned Quaternion.setFromEuler takes cos(x/2),cos(y/2),cos(z/2),
     // then the corresponding sin calls. Native Number inputs cannot call user
@@ -147,7 +151,7 @@ function kernel(record){
   }
   return record.kernel;
 }
-export function tryEulerUpdateLoop(group,bound,token){
+export function tryEulerUpdateLoop(group,bound,token,scale){
   if(!lookup(owners,group))return false;
   let stats=lookup(statistics,group);
   if(!stats){stats={wasmCalls:0,objects:0,fallbackCalls:0,lastFailure:null};apply(set,statistics,[group,stats]);}
@@ -156,12 +160,12 @@ export function tryEulerUpdateLoop(group,bound,token){
   if(!plan || !platform())return fallback('EULER_UPDATE_PLATFORM');
   let prepared,runtime;
   try{
-    prepared=input(group,bound,plan);if(!prepared)return fallback('EULER_UPDATE_GUARD');
+    prepared=input(group,bound,plan,scale);if(!prepared)return fallback('EULER_UPDATE_GUARD');
     if(prepared.count===0)return true;
     const initialized=prepared.record.attempted;
     runtime=kernel(prepared.record);if(!runtime)return fallback(prepared.record.failure);
     if(!platform())return fallback('EULER_UPDATE_PLATFORM');
-    if(!initialized && !(prepared=input(group,bound,plan)))return fallback('EULER_UPDATE_GUARD');
+    if(!initialized && !(prepared=input(group,bound,plan,scale)))return fallback('EULER_UPDATE_GUARD');
     runtime.run(prepared.state,plan.operations,prepared.count);
   }catch{return fallback(runtime?.diagnostics.lastGuardFailure??'EULER_UPDATE_EXECUTION');}
   // Publication is outside the fallback catch. Each destination is a witnessed

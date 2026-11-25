@@ -171,7 +171,7 @@ test('production source-import builds keep Euler updates after relocation with a
     for(let i=0;i<12;i++){const child=new Object3D();child.rotation.set(i/19,.2,-.3);
       child.userData.speed=new Euler(.01,i/37,-.2);group.add(child);}
     ${loop}
-    group.children.reverse();${loop}
+    const dt=.03125;group.children.reverse();${loop.replace('speed.x','speed.x*dt').replace('speed.y','dt*speed.y').replace('speed.z','speed.z/dt')}
     return group.children.map(child=>[child.rotation.toArray(),child.quaternion.toArray()]);}`;
   fs.writeFileSync(entry,`import {Group} from 'three/src/objects/Group.js';
     import {Object3D} from 'three/src/core/Object3D.js';import {Euler} from 'three/src/math/Euler.js';${body}`);

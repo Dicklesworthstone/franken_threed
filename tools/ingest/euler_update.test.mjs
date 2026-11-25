@@ -32,6 +32,12 @@ const childrenLoop=`for(let i=0;i<group.children.length;i++){
   const node=group.children[i];const delta=node.userData.rotationSpeed;
   node.rotation.set(node.rotation.x+delta.x,node.rotation.y+delta.y,node.rotation.z+delta.z);
 }`;
+const scaledLoop=`for(let i=0;i<group.children.length;i++){
+  const child=group.children[i];
+  const speed=child.userData.rotationSpeed;
+  child.rotation.set(child.rotation.z+speed.x*dt,child.rotation.y-dt*speed.x,child.rotation.x+speed.z/dt);
+}`;
+const sourceScaled=new Function('group','dt',scaledLoop);
 async function fixture(options={}){
   const entry='\0euler-update-fixture',plugin=marchingCubesRollupPlugin(options);
   const text='export {Object3D,Group,Mesh,Euler,Quaternion,BufferGeometry,MeshBasicMaterial} from '+
@@ -40,6 +46,7 @@ async function fixture(options={}){
     'let group;const api={count:0};export function update(next,count){group=next;api.count=count;'+originalLoop+'}\n'+
     'export function mixed(assembly,bound){'+mixedLoop+'}\n'+
     'export function all(group){'+childrenLoop+'}\n'+
+    'export function scaled(group,dt){'+scaledLoop+'}\n'+
     'export function controls(){return api;}';
   const bundle=await rollup({input:entry,plugins:[{name:'euler-update-fixture',resolveId(id){return id===entry?id:null;},
     load(id){return id===entry?text:null;}},plugin],onwarn(warning,warn){if(warning.code!=='CIRCULAR_DEPENDENCY')warn(warning);}});
@@ -78,7 +85,7 @@ test('only pinned core arithmetic registers the Euler kernel and the unchanged H
   const source=fs.readFileSync(path.join(upstream,'build/three.core.js'),'utf8');
   assert.equal(specializeEulerUpdateBase(source+'\n// application edit').changed,false);
   assert.equal(specializeEulerUpdateBase(fs.readFileSync(path.join(upstream,'src/core/Object3D.js'),'utf8')).changed,false);
-  assert.equal(compiled.report.compiledModules,1);assert.equal(compiled.report.compiledLoops,3);
+  assert.equal(compiled.report.compiledModules,1);assert.equal(compiled.report.compiledLoops,4);
   assert.equal(compiled.report.accelerationClaim,false);
   const kernel=compiled.report.modules.find(record=>record.kind==='pinned-euler-kernel');
   assert.ok(kernel.wasmBytes>0);assert.deepEqual(kernel.retainedMath,['cos','sin']);
@@ -105,6 +112,29 @@ test('renamed source loops, cross-axis arithmetic and all six Euler orders retai
     root.children[1].userData.rotationSpeed._y=NaN;root.children[2].userData.rotationSpeed._z=Infinity;
   }
   advance(f);
+});
+
+test('frame-scaled updates reread the step each call and preserve operand order across axes',()=>{
+  const f=pair(compiled.api,30);
+  for(const dt of [.25,-2,-0,Infinity,NaN]){
+    f.api.scaled(f.actual,dt);sourceScaled(f.expected,dt);same(f.actual,f.expected);
+  }
+  assert.equal(f.api.diagnostics(f.actual).wasmCalls,5);
+  assert.equal(f.api.diagnostics(f.actual).objects,150);
+});
+
+test('a coercing frame step keeps the original per-axis reads and effects',()=>{
+  const f=pair(),calls=[0,0];
+  const scale=index=>({valueOf(){return ++calls[index]/10;}});
+  f.api.scaled(f.actual,scale(0));sourceScaled(f.expected,scale(1));same(f.actual,f.expected);
+  assert.deepEqual(calls,[12,12]);assert.equal(f.api.diagnostics(f.actual).wasmCalls,0);
+});
+
+test('loop-local and observable frame step expressions stay in the original loop',()=>{
+  for(const step of ['i','child','speed','clock.delta','now()','unknownGlobal']){
+    const source='function frame(group,clock,now){'+scaledLoop.replaceAll('dt',step)+'}';
+    assert.equal(specializeEulerUpdateLoops(source,{runtimeModule:'./runtime.mjs'}).changed,false,step);
+  }
 });
 
 test('current membership, count and shared read-only speed inputs are guarded afresh',()=>{
