@@ -162,7 +162,7 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     if (entry && entry.shape.key !== shape.key) { retire(entry); entry = null; }
     if (!entry) {
       if (entries.size >= maxTextures) fail('BUDGET', 'Storage texture count exceeds maxTextures');
-      entry = {texture, shape, alive: true, native: null, view: null, charged: 0, mipsDirty: false, views: new Map(), samplers: new Map(),
+      entry = {texture, shape, alive: true, native: null, view: null, charged: 0, mipsDirty: false, computeMipsDirty: false, views: new Map(), samplers: new Map(),
         source: texture.source, version: texture.version};
       entry.proof = Object.freeze({texture, identity: Object.freeze({})});
       entry.onDispose = () => retire(entry);
@@ -264,7 +264,8 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     // r186 SampledTexture extends Sampler, so both flags are true.
     if (binding.isSampler && !binding.isSampledTexture) return {entry, kind: 'sampler', sampler: samplerOf(binding.texture, three, entry.shape, d)};
     if (!binding.isSampledTexture) fail('BINDING', 'Expected a sampled or storage texture binding');
-    if (!binding.store) return {entry, kind: 'sampled'};
+    if (!binding.store) return {entry, kind: 'sampled', autoMips: binding.texture.mipmapsAutoUpdate,
+      generateMips: binding.texture.generateMipmaps};
     const access = accessNames.get(binding.access), mipLevel = binding.mipLevel ?? 0;
     if (!access || !Number.isSafeInteger(mipLevel) || mipLevel < 0 || mipLevel >= entry.shape.mipLevelCount)
       fail('BINDING', 'Expected source storage access and an allocated mip level');
@@ -361,11 +362,30 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
       }
       return entry.samplers.get(key);
     }
-    if (snapshot.kind === 'sampled') { refreshMips(entry); return entry.view; }
+    if (snapshot.kind === 'sampled') {
+      // Bindings._update consumes this flag only for an auto-updating sampled
+      // binding. A disabled consumer leaves the earlier storage intent pending.
+      if (snapshot.autoMips === true && snapshot.generateMips === true && entry.computeMipsDirty) {
+        entry.mipsDirty = true;
+        refreshMips(entry);
+        entry.computeMipsDirty = false;
+      } else refreshMips(entry);
+      return entry.view;
+    }
     if (!entry.views.has(snapshot.mipLevel)) entry.views.set(snapshot.mipLevel,
       checked(() => entry.native.createView({baseMipLevel: snapshot.mipLevel, mipLevelCount: 1,
         ...(entry.shape.viewDimension === '2d' ? {} : {dimension: entry.shape.viewDimension})})));
     return entry.views.get(snapshot.mipLevel);
+  }
+  function resolveForCompute(snapshot) {
+    const resource = resolve(snapshot);
+    // r186 marks every storage binding, including read-only and nonzero-mip
+    // views, during Bindings._update. This is an upload intent, not a completed
+    // shader write: a later sampled binding may submit its mip pass while the
+    // containing compute group's encoder is still unsubmitted.
+    if (snapshot.kind === 'storage' && snapshot.autoMips === true)
+      snapshot.entry.computeMipsDirty = true;
+    return resource;
   }
   function validateDispatch(snapshots) {
     const uses = new Map();
@@ -389,8 +409,9 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     for (const s of snapshots) if (s.kind === 'storage' && s.access !== 'read-only' && s.mipLevel === 0 && s.autoMips) {
       s.entry.mipsDirty = true; dirty.add(s.entry);
     }
-    // Source auto-update occurs after each dispatch, before a later kernel can
-    // load a generated level or manually overwrite one of its mips.
+    // Explicit native callbacks and texture copies publish completed writes
+    // through this eager seam. Source compute bindings use the separate intent
+    // in resolveForCompute before their grouped encoder is submitted.
     for (const entry of dirty) refreshMips(entry);
   }
   function bindingsFor(retained = new Map()) {
@@ -425,7 +446,7 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     try { await Promise.race([Promise.all([...pending, watchedDevice.queue.onSubmittedWorkDone()]), cancelled]); live(); }
     finally { stopped.signal.removeEventListener('abort', abort); }
   }
-  return {capture, assertCurrent, identityOf, capturedIdentity, ensure, validateAllocations, withTexture, captureBinding, captureCopy, copy, layoutOf, layout, resolve, validateDispatch, written, bindingsFor, whenIdle,
+  return {capture, assertCurrent, identityOf, capturedIdentity, ensure, validateAllocations, withTexture, captureBinding, captureCopy, copy, layoutOf, layout, resolve, resolveForCompute, validateDispatch, written, bindingsFor, whenIdle,
     // A queue-free snapshot for cross-owner consumers. Capture synchronously:
     // awaiting whenIdle here would insert a fence into every GPU-only copy.
     get validation() { return validationSnapshot(); },

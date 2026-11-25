@@ -1032,6 +1032,12 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       return snapshot.sampler ? snapshot.samplerDescriptor ? sourcePool().sampler(snapshot.samplerDescriptor)
         : record.binding.sampler : record.binding.view;
     },
+    resolveForCompute(snapshot) {
+      live();
+      if (leases.has(snapshot) || targetInputs?.owns(snapshot) || framebufferInputs?.owns(snapshot) || depthInputs?.owns(snapshot))
+        return this.resolve(snapshot);
+      return storage.resolveForCompute(snapshot);
+    },
     written(snapshots) { live(); storage.written(snapshots.filter(snapshot => !leases.has(snapshot) && !targetInputs?.owns(snapshot) && !framebufferInputs?.owns(snapshot) && !depthInputs?.owns(snapshot))); },
     release(snapshot) {
       if (targetInputs?.owns(snapshot)) { targetInputs.release(snapshot); return; }
