@@ -13,8 +13,8 @@
  * mips. VideoTextures copy ready HTMLVideoElement frames into stable 2D residency,
  * using the source's frame versions and built-in update() fallback. No frame
  * callbacks, playback controls or frame loop are installed here.
- * ImageBitmaps are admitted with flipY=false/premultiplyAlpha=false (the decode-time
- * profile both r186 renderers agree on, e.g. GLTFLoader's ImageBitmapLoader path).
+ * Native ImageBitmap copies preserve source flipY/premultiplyAlpha flags. The
+ * WebGL-compatible profile keeps those flags false (decode-time orientation).
  * DataArrayTexture/Data3DTexture share this owner, its budgets and source versions.
  * Byte/half/float volumes support padded full uploads and GPU-generated mipmaps;
  * arrays also support source layerUpdates. See THREE_VOLUME_TEXTURES.md.
@@ -23,8 +23,9 @@
  * Compressed 2D/array/cube sources upload authored BC, ETC/EAC and ASTC blocks
  * through this same owner; optional device features are checked before allocation.
  * See THREE_COMPRESSED_TEXTURES.md for block layout and format boundaries.
- * Other ImageBitmap flags and depth textures remain explicit
- * errors; applications can keep borrowing bindings for those sources.
+ * Native typed data uses tightly packed rows and ignores premultiplyAlpha;
+ * the WebGL-compatible profile retains unpack alignment. Depth textures use
+ * their separate owner.
  * See THREE_TEXTURES.md for source-state, color, bounds and completion contracts.
  */
 import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
@@ -175,10 +176,10 @@ function textureInspector(T,{
     if(!filter||!mag||mag[2]||!wraps.has(t.wrapS)||!wraps.has(t.wrapT)||array&&!wraps.has(t.wrapR))
       fail('SAMPLER','Unsupported compressed texture sampling');
     const anisotropy=integer(t.anisotropy,1,16,'anisotropy');
-    if(anisotropy>1&&mag[0]==='linear'&&t.minFilter===T.NearestMipmapLinearFilter)
+    if(!nativeMedia&&anisotropy>1&&mag[0]==='linear'&&t.minFilter===T.NearestMipmapLinearFilter)
       fail('SAMPLER','Anisotropic nearest minification requires an explicit sampler profile');
     const sampler={addressModeU:wraps.get(t.wrapS),addressModeV:wraps.get(t.wrapT),magFilter:mag[0],minFilter:filter[0],
-      mipmapFilter:filter[1],lodMinClamp:0,lodMaxClamp:filter[2]?levels-1:0,
+      mipmapFilter:filter[1],lodMinClamp:0,lodMaxClamp:nativeMedia?32:filter[2]?levels-1:0,
       maxAnisotropy:mag[0]==='linear'&&t.minFilter===T.LinearMipmapLinearFilter?anisotropy:1,
       ...(array?{addressModeW:wraps.get(t.wrapR)}:{})};
     let bytes=0;const uploads=[];
@@ -193,7 +194,7 @@ function textureInspector(T,{
         fail('STORAGE','Expected fixed unshared compressed buffer views');
       try{new Uint8Array(data.buffer,0,0);}catch{fail('STORAGE','Compressed source blocks are detached');}
       const row=Math.ceil(w/blockWidth)*blockBytes,rowsPerImage=Math.ceil(h/blockHeight);
-      const bytesPerRow=family?row:Math.ceil(row/t.unpackAlignment)*t.unpackAlignment;
+      const bytesPerRow=family||nativeMedia?row:Math.ceil(row/t.unpackAlignment)*t.unpackAlignment;
       const sliceBytes=bytesPerRow*rowsPerImage,depth=array?layers:1,size=row*rowsPerImage*depth;
       const required=(rowsPerImage*depth-1)*bytesPerRow+row;
       if(family?data.byteLength!==size:data.byteLength<required||data.byteLength>sliceBytes*depth)
@@ -209,7 +210,7 @@ function textureInspector(T,{
       layerUpdates=[...t.layerUpdates];for(const layer of layerUpdates)integer(layer,0,layers-1,'updated layer');
     }
     const viewFormat=t.colorSpace===T.SRGBColorSpace?format+'-srgb':format,viewDimension=cube?'cube':array?'2d-array':'2d';
-    const key=JSON.stringify(['compressed',t.format,width,height,layers,levels,format,viewFormat,viewDimension,sampler,family?null:t.unpackAlignment]);
+    const key=JSON.stringify(['compressed',t.format,width,height,layers,levels,format,viewFormat,viewDimension,sampler,family?null:nativeMedia?1:t.unpackAlignment]);
     return {source:t.source,width,height,layers,levels,cube,array,layered:array,volume:false,blockUploads:true,
       compressed:family!==null,bytes,format,viewFormat,viewDimension,sampler,key,data:true,manual:true,
       uploads,images:uploads.map(u=>u.image),layerUpdates,sampleType:'float',blockWidth,blockHeight,blockBytes};
@@ -296,12 +297,16 @@ function textureInspector(T,{
     if(!filter||!mag||mag[2]||!wraps.has(t.wrapS)||!wraps.has(t.wrapT))fail('SAMPLER','Unsupported texture sampling');
     if(layered&&!wraps.has(t.wrapR))fail('SAMPLER','Unsupported depth-axis wrapping');
     for(const name of ['flipY','premultiplyAlpha','generateMipmaps'])if(typeof t[name]!=='boolean')fail('SOURCE',`Expected boolean ${name}`);
-    if(layered&&(t.flipY||t.premultiplyAlpha))fail('FORMAT','Array and 3D data require flipY=false and premultiplyAlpha=false');
+    if(layered&&((t.flipY&&(!nativeMedia||volume))||t.premultiplyAlpha&&!nativeMedia))
+      fail('FORMAT','Layered transforms require native array uploads; the source cannot flip volume data');
     if(![1,2,4,8].includes(t.unpackAlignment))fail('SOURCE','Invalid unpack alignment');
+    // WebGPUTextureUtils uses width * bytesPerTexel, independently of the
+    // WebGL UNPACK_ALIGNMENT setting, including selected array layers.
+    const alignment=nativeMedia?1:t.unpackAlignment;
     const anisotropy=integer(t.anisotropy,1,16,'anisotropy');
-    // WebGL also allows anisotropic nearest-mipmap-linear, but WebGPU requires
-    // linear minification too. Refuse that combination instead of changing it.
-    if(anisotropy>1&&mag[0]==='linear'&&t.minFilter===T.NearestMipmapLinearFilter)
+    // Native WebGPU enables anisotropy only when all filters are linear.
+    // The WebGL profile cannot change anisotropic nearest minification.
+    if(!nativeMedia&&anisotropy>1&&mag[0]==='linear'&&t.minFilter===T.NearestMipmapLinearFilter)
       fail('SAMPLER','Anisotropic nearest minification requires an explicit sampler profile');
     const maxAnisotropy=mag[0]==='linear'&&t.minFilter===T.LinearMipmapLinearFilter?anisotropy:1;
     const data=layered||(cube?!nativeAllocation&&t.image[0]?.isDataTexture===true:t.isDataTexture===true);
@@ -357,9 +362,11 @@ function textureInspector(T,{
     // r186 uncompressed cubes list ADDITIONAL mip levels; ordinary DataTextures
     // include the base level in mipmaps. Do not drop or duplicate either base.
     const levels=nativeAllocation==='default'?1:manual?t.mipmaps.length+Number(cube):t.generateMipmaps?full:1;
-    if(levels>full||(filter[2]&&levels!==full))fail('MIPS','Mipmapped filtering requires a complete source pyramid');
+    if(levels>full||(!nativeMedia&&filter[2]&&levels!==full))fail('MIPS','Mipmapped filtering requires a complete source pyramid');
     if(norm16&&!manual&&levels>1)fail('MIPS','Normalized 16-bit mipmaps require authored source levels');
     const renderable=norm?features.has('texture-formats-tier1'):!packed||packed==='rg11b10ufloat'&&features.has('rg11b10ufloat-renderable');
+    if(nativeMedia&&array&&t.flipY&&(!filterable||!renderable))
+      fail('FORMAT','Native array flipY requires the source filterable render-attachment format');
     if(packed&&!renderable&&!manual&&levels>1)
       fail('MIPS',packed==='rgb9e5ufloat'?'RGB9E5 mipmaps require authored source levels':
         'Generated RGB11F mipmaps need the rg11b10ufloat-renderable device feature');
@@ -379,7 +386,7 @@ function textureInspector(T,{
     for(let level=0;level<levels;level++)bytes+=Math.max(1,width>>level)*Math.max(1,height>>level)*channels*bpc*(volume?Math.max(1,layers>>level):layers);
     if(cube&&nativeAllocation==='default')bytes=24;
     if(bytes>maxTextureBytes)fail('LIMIT','Texture exceeds byte budget');
-    if(!nativeAllocation&&data&&t.premultiplyAlpha)fail('FORMAT','Premultiplied byte data requires an explicit upload profile');
+    if(!nativeAllocation&&data&&t.premultiplyAlpha&&!nativeMedia)fail('FORMAT','Premultiplied byte data requires an explicit upload profile');
     for(const {image,level} of uploads){
       if(!data){
         const bitmap=instance(image,'ImageBitmap');
@@ -387,11 +394,11 @@ function textureInspector(T,{
           fail('SOURCE','Use decoded images, ImageBitmaps, canvases or ImageData');
         // r186 WebGLTextures skips UNPACK_FLIP_Y/PREMULTIPLY for ImageBitmaps (their
         // decode options already decided both) while WebGPUTextureUtils applies them.
-        // The native cube profile follows WebGPU; ordinary pools admit only
-        // the bitmap flags where both source renderers agree.
+        // Native copies follow WebGPU; the WebGL-compatible profile admits
+        // only bitmap flags where both source renderers agree.
         // A private bitmap captured from a mutable image/canvas retains that
         // source's upload contract. It is not an application-authored ImageBitmap.
-        if(bitmap&&!capturedImages.has(image)&&!(nativeCube&&cube)&&(t.flipY||t.premultiplyAlpha))
+        if(bitmap&&!capturedImages.has(image)&&!nativeMedia&&!(nativeCube&&cube)&&(t.flipY||t.premultiplyAlpha))
           fail('SOURCE','ImageBitmap sources require flipY=false and premultiplyAlpha=false (orientation and alpha are decided at decode)');
         if(channels!==4)fail('FORMAT','External images require RGBA storage');
         if(instance(image,'ImageData')&&image.colorSpace&&image.colorSpace!=='srgb')fail('COLOR','ImageData requires the sRGB copy profile');
@@ -402,7 +409,7 @@ function textureInspector(T,{
         const a=image.data,Kind=packed?Uint32Array:integral?kind.Kind:norm?norm.Kind:bpc===1?Uint8Array:bpc===2?Uint16Array:Float32Array;
         if(!(a instanceof Kind)||!(a.buffer instanceof ArrayBuffer)||a.buffer.resizable)fail('STORAGE',`Expected fixed, unshared ${Kind.name} source`);
         try{new Uint8Array(a.buffer,0,0);}catch{fail('STORAGE','Source pixels are detached');}
-        const row=image.width*channels*bpc,pitch=Math.ceil(row/t.unpackAlignment)*t.unpackAlignment;
+        const row=image.width*channels*bpc,pitch=Math.ceil(row/alignment)*alignment;
         if(a.byteLength<((layered?layers:1)*image.height-1)*pitch+row)fail('STORAGE','Source pixels do not fill the unpacked image');
       }
     }
@@ -424,7 +431,7 @@ function textureInspector(T,{
       for(const layer of layerUpdates)integer(layer,0,layers-1,'updated layer');
       // r186 slices partial-layer data with a tightly packed byte count. Do not
       // silently switch its offset convention when UNPACK_ALIGNMENT adds padding.
-      if(layerUpdates.length&&width*channels*bpc%t.unpackAlignment!==0)
+      if(layerUpdates.length&&width*channels*bpc%alignment!==0)
         fail('RANGE','Partial layer uploads require tightly packed source rows');
     }
     const prefix=channels===4?'rgba':channels===2?'rg':'r';
@@ -435,13 +442,16 @@ function textureInspector(T,{
     const viewFormat=cubeDefault?'rgba8unorm':t.colorSpace===T.SRGBColorSpace?'rgba8unorm-srgb':baseFormat,
       format=nativeAllocation==='default'?viewFormat:baseFormat;
     const sampler={addressModeU:wraps.get(t.wrapS),addressModeV:wraps.get(t.wrapT),magFilter:mag[0],minFilter:filter[0],
-      mipmapFilter:filter[1],lodMinClamp:0,lodMaxClamp:filter[2]?levels-1:0,maxAnisotropy,...(layered?{addressModeW:wraps.get(t.wrapR)}:{})};
+      mipmapFilter:filter[1],lodMinClamp:0,lodMaxClamp:nativeMedia?32:filter[2]?levels-1:0,maxAnisotropy,...(layered?{addressModeW:wraps.get(t.wrapR)}:{})};
     const viewDimension=volume?'3d':array?'2d-array':cube?'cube':'2d';
-    const key=JSON.stringify([width,height,levels,format,viewFormat,sampler,t.flipY,t.premultiplyAlpha,t.unpackAlignment,t.generateMipmaps&&!manual,manual,data,...(nativeAllocation==='default'?['native-default',viewDimension,layers]:layered?[viewDimension,layers]:cube?['cube']:video?['video']:[])]);
+    // Typed native uploads ignore alpha premultiplication. Ignored source
+    // metadata must not change the upload bytes or split compatible residency.
+    const premultiplyAlpha=nativeMedia&&data?false:t.premultiplyAlpha;
+    const key=JSON.stringify([width,height,levels,format,viewFormat,sampler,t.flipY,premultiplyAlpha,alignment,t.generateMipmaps&&!manual,manual,data,...(nativeAllocation==='default'?['native-default',viewDimension,layers]:layered?[viewDimension,layers]:cube?['cube']:video?['video']:[])]);
     return {source:t.source,width,height,levels,layers,cube,volume,array,layered,layerUpdates,viewDimension,video,videoReady,nativeMedia:nativeMedia&&video,nativeAllocation,
       native2D:nativeMedia&&!layered&&!cube,native2DData:nativeMedia&&data&&!layered&&!cube,imagesPending,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,bpc,
       integral,packed,renderable:cubeDefault||renderable,sampleType:integral?kind.sampleType:filterable?'float':'unfilterable-float',
-      flipY:t.flipY,premultiplyAlpha:t.premultiplyAlpha,alignment:t.unpackAlignment};
+      nativeData:nativeMedia&&data,flipY:t.flipY,premultiplyAlpha,alignment};
   }
   return describe;
 }
@@ -618,7 +628,19 @@ export function createGpuThreeTextures(device,{
         }else if(d.layered){
           const row=d.width*d.channels*d.bpc,pitch=Math.ceil(row/d.alignment)*d.alignment;
           const src=new Uint8Array(t.image.data.buffer,t.image.data.byteOffset,t.image.data.byteLength);
-          if(d.layerUpdates?.length){
+          if(d.flipY){
+            // Source flips selected array layers independently. Reuse one
+            // private slice, preserve selection order and leave CPU data alone.
+            const data=new Uint8Array(row*d.height),slice=pitch*d.height;
+            const selected=d.layerUpdates?.length?d.layerUpdates:null;
+            for(let index=0;index<(selected?.length??d.layers);index++){
+              const layer=selected?selected[index]:index;
+              for(let y=0;y<d.height;y++)data.set(src.subarray(layer*slice+(d.height-1-y)*pitch,layer*slice+(d.height-1-y)*pitch+row),y*row);
+              native(()=>device.queue.writeTexture({texture:a.texture,origin:[0,0,layer]},data,
+                {bytesPerRow:row,rowsPerImage:d.height},[d.width,d.height,1]));stats.writeCalls++;
+            }
+            if(selected)t.clearLayerUpdates();
+          }else if(d.layerUpdates?.length){
             const slice=pitch*d.height;
             for(const layer of d.layerUpdates){
               native(()=>device.queue.writeTexture({texture:a.texture,origin:[0,0,layer]},
@@ -647,9 +669,9 @@ export function createGpuThreeTextures(device,{
           const row=image.width*d.channels*d.bpc,pitch=Math.ceil(row/d.alignment)*d.alignment;
           const src=new Uint8Array(image.data.buffer,image.data.byteOffset,image.data.byteLength);
           let data=src;
-          // r186's native CPU cube path flips the base after every authored
-          // mip upload; the authored mip rows themselves remain unchanged.
-          const flipY=nativeCube&&d.cube&&d.manual?d.flipY&&level===0&&d.levels%2===1:d.flipY;
+          // r186's typed-data helper flips the base after every authored mip
+          // upload, for 2D and cube data. Higher mip rows remain unchanged.
+          const flipY=(d.nativeData||nativeCube&&d.cube)&&d.manual?d.flipY&&level===0&&d.levels%2===1:d.flipY;
           if(flipY){data=new Uint8Array(row*image.height);for(let y=0;y<image.height;y++)data.set(src.subarray((image.height-1-y)*pitch,(image.height-1-y)*pitch+row),y*row);}
           const size=[image.width,image.height,1];
           native(()=>device.queue.writeTexture({texture:a.texture,mipLevel:level,...(d.cube?{origin:[0,0,layer]}:{})},data,{bytesPerRow:flipY?row:pitch},size));stats.writeCalls++;

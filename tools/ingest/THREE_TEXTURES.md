@@ -25,9 +25,9 @@ owner.dispose(); // Does not dispose texture, its image, or device.
 Unsigned-byte DataTexture R, RG and RGBA storage maps to native unorm formats.
 RGBA sRGB textures use an unorm upload texture and sRGB sampling/render views;
 the encoded source bytes are not gamma-converted on the CPU. Linear-sRGB and
-NoColorSpace are sampled as linear numeric channels. Rows honor unpackAlignment
-and optional flipY without mutating source arrays. Premultiplied DataTexture
-bytes are not admitted: their conversion requires a separate explicit profile.
+NoColorSpace are sampled as linear numeric channels. The WebGL-compatible
+profile honors unpackAlignment and optional flipY without mutating source
+arrays; premultiplied DataTexture bytes require a separate explicit profile.
 
 Already decoded HTMLImageElement, HTMLCanvasElement, OffscreenCanvas and sRGB
 ImageData use WebGPU external-image copies with the requested flip and alpha
@@ -36,7 +36,7 @@ not an assertion of raw embedded-profile equivalence with every WebGL image
 upload. Wide-gamut/raw decode requirements can keep using caller-owned bindings.
 ImageBitmap flags are fixed at bitmap creation in WebGL (r186 skips the unpack
 flip/premultiply state for bitmaps) while the r186 WebGPU backend applies them at
-copy time. This owner admits ImageBitmap only with `flipY=false` and
+copy time. The WebGL-compatible profile admits ImageBitmap only with `flipY=false` and
 `premultiplyAlpha=false`, the profile where both renderers agree (GLTFLoader's
 ImageBitmapLoader path); other flags are refused rather than guessing which
 renderer's behavior the application expected. Video, float, depth,
@@ -44,16 +44,44 @@ cube/array/3D, render-target, external and compressed textures also retain their
 separate paths. These are implementation boundaries, not removed project goals.
 
 All six source minification filters, nearest/linear magnification, clamp/repeat/
-mirrored-repeat and admitted anisotropy are mapped to native samplers. Mipmapped
+mirrored-repeat and admitted anisotropy are mapped to native samplers. In the
+WebGL-compatible profile, mipmapped
 filters require a complete pyramid. A nonmip filter clamps LOD to zero. Unsupported
 anisotropic nearest minification is rejected rather than silently changed.
 
-Authored DataTexture mip arrays include level zero and upload verbatim; source
-generation must already be disabled. Generated pyramids use GPU render passes,
+Authored DataTexture mip arrays include level zero. In the WebGL-compatible
+profile, source generation must already be disabled. Generated pyramids use GPU render passes,
 sampling each previous level into the next. sRGB mip filtering occurs through
 sRGB views. The downsample profile is the same linear fullscreen pass used by
 the existing glTF texture path; this is not a promise of byte-identical native
 WebGL generateMipmap output, which needs native conformance measurements.
+
+### Native WebGPU upload profile
+
+The native renderer enables `nativeMedia: true` on this owner. Typed 2D,
+array, volume and cube data use tightly packed rows regardless of
+`unpackAlignment`; `premultiplyAlpha` has no effect on typed bytes. Both source
+properties remain unchanged. Native ImageBitmap external copies instead apply
+the requested `flipY` and `premultiplyAlpha`, as the pinned source does.
+
+Native data arrays support `flipY`, including selected `layerUpdates`: rows
+reverse within each requested layer, selection order is preserved, and
+unrequested layers retain their accepted GPU contents. The owner uses at most
+one private slice and never mutates source pixels. Source-invalid volume flips
+and array formats that the source flip pass cannot filter/render remain refused.
+
+Native samplers use the source's LOD range of 0–32. Anisotropy is enabled only
+when minification, magnification and mip filtering are all linear; other filter
+combinations retain anisotropy 1. Incomplete authored mip chains are admitted
+and suppress generation without changing `generateMipmaps`. Typed authored 2D
+and cube uploads preserve the pinned helper's unusual flip behavior: each mip
+upload flips level zero again, so only the base level changes orientation,
+according to the total number of uploaded levels. Higher mip rows stay intact.
+
+`three_texture_native_uploads.test.mjs` compares upload layouts, sampler
+descriptors and external-copy flags with the unchanged pinned WebGPU helpers,
+then checks bytes, selected-layer updates and queued version ownership using
+the existing recording device. It does not establish browser pixel parity.
 
 ## Packed HDR source data
 
