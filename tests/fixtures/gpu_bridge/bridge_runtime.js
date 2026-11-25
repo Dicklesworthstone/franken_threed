@@ -475,7 +475,7 @@ export class WebGpuBridgeHost {
     const dataPayload = packetBytes.subarray(dataBlockStart);
 
     // Native creation is synchronous, but validity is not. Later packets may
-    // issue against a provisional pipeline/bundle without yielding; their
+    // issue against provisional allocations, pipelines or bundles without yielding. Their
     // validation receipt must also await its producer. Keep the exact objects
     // so a late failure cannot remove a newer replacement using the same ID.
     const device = this.device;
@@ -498,7 +498,11 @@ export class WebGpuBridgeHost {
       for (const { cache, id, value } of created) {
         preparations.delete(value);
         if (failed && this.device === device && this.deviceGeneration === deviceGeneration &&
-            cache.get(id) === value) cache.delete(id);
+            cache.get(id) === value) {
+          cache.delete(id);
+          if (cache === this.buffers) this.bufferEpochs.delete(id);
+          if (cache === this.textures && this.lastRenderTargetId === id) this.lastRenderTargetId = null;
+        }
       }
       created.length = 0;
     };
@@ -588,7 +592,7 @@ export class WebGpuBridgeHost {
                 size: alignedSize,
                 usage: usage,
               });
-              this.buffers.set(bufferId, buffer);
+              publishPrepared(this.buffers, bufferId, buffer);
               this.bufferEpochs.delete(bufferId);
               encodedEpochs.delete(bufferId);
               break;
@@ -605,7 +609,7 @@ export class WebGpuBridgeHost {
               const dataLength = dataView.getUint32(cursor + 12, true);
               cursor += 16;
 
-              const buffer = this.buffers.get(bufferId);
+              const buffer = usePrepared(this.buffers.get(bufferId));
               if (!buffer) {
                 throw new Error(`WriteBuffer: unknown bufferId ${bufferId}`);
               }
@@ -680,7 +684,7 @@ export class WebGpuBridgeHost {
                 usage: usage,
                 sampleCount,
               });
-              this.textures.set(textureId, texture);
+              publishPrepared(this.textures, textureId, texture);
               if (!isDepth) {
                 this.lastRenderTargetId = textureId;
               }
@@ -700,7 +704,7 @@ export class WebGpuBridgeHost {
               const dataLength = dataView.getUint32(cursor + 20, true);
               cursor += 24;
 
-              const texture = this.textures.get(textureId);
+              const texture = usePrepared(this.textures.get(textureId));
               if (!texture) {
                 throw new Error(`WriteTexture: unknown textureId ${textureId}`);
               }
@@ -1118,7 +1122,7 @@ export class WebGpuBridgeHost {
               }
               const addressMode = ADDRESS_MODE_NAMES[addressModeCode];
 
-              const texture = this.textures.get(textureId);
+              const texture = usePrepared(this.textures.get(textureId));
               if (!texture) {
                 throw new Error(`CreatePipelineTextured: unknown textureId ${textureId}`);
               }
@@ -1320,7 +1324,7 @@ export class WebGpuBridgeHost {
                   // Canvas swapchain view is acquired at most once per packet execution (§8.5, [S48])
                   targetView = getCanvasView();
                 } else if (targetKind === TARGET_OFFSCREEN) {
-                  const texture = this.textures.get(targetId);
+                  const texture = usePrepared(this.textures.get(targetId));
                   if (!texture) {
                     throw new Error(`RenderPass: unknown offscreen targetId ${targetId}`);
                   }
@@ -1341,7 +1345,7 @@ export class WebGpuBridgeHost {
                   colorAttachmentDesc.clearValue = { r: cr, g: cg, b: cb, a: ca };
                 }
                 if (hasResolve) {
-                  colorAttachmentDesc.resolveTarget = colorResolveView(sourceTexture, this.textures.get(resolveTargetId));
+                  colorAttachmentDesc.resolveTarget = colorResolveView(sourceTexture, usePrepared(this.textures.get(resolveTargetId)));
                 }
 
                 currentPassEncoder = encoder().beginRenderPass({
@@ -1392,7 +1396,7 @@ export class WebGpuBridgeHost {
                   if (needsRebind) {
                     let uniformBuf = null;
                     if (hasUniform) {
-                      uniformBuf = this.buffers.get(uniformBufferId);
+                      uniformBuf = usePrepared(this.buffers.get(uniformBufferId));
                       if (!uniformBuf) {
                         throw new Error(
                           `RenderPass: uniform buffer ${uniformBufferId} missing for pipeline`,
@@ -1452,7 +1456,7 @@ export class WebGpuBridgeHost {
 
                 if (vertexBufferId > 0) {
                   if (passState.vertexBufferId !== vertexBufferId) {
-                    const vb = this.buffers.get(vertexBufferId);
+                    const vb = usePrepared(this.buffers.get(vertexBufferId));
                     if (!vb) {
                       throw new Error(`RenderPass: unknown vertexBufferId ${vertexBufferId}`);
                     }
@@ -1558,7 +1562,7 @@ export class WebGpuBridgeHost {
                   // Canvas swapchain view is acquired at most once per packet execution (§8.5, [S48])
                   targetView = getCanvasView();
                 } else if (targetKind === TARGET_OFFSCREEN) {
-                  const texture = this.textures.get(targetId);
+                  const texture = usePrepared(this.textures.get(targetId));
                   if (!texture) {
                     throw new Error(`RenderPassDepth: unknown offscreen targetId ${targetId}`);
                   }
@@ -1568,7 +1572,7 @@ export class WebGpuBridgeHost {
                   throw new Error(`Invalid render pass targetKind: ${targetKind}`);
                 }
 
-                const depthTexture = this.textures.get(depthTargetId);
+                const depthTexture = usePrepared(this.textures.get(depthTargetId));
                 if (!depthTexture) {
                   throw new Error(`RenderPassDepth: unknown depthTargetId ${depthTargetId}`);
                 }
@@ -1591,7 +1595,7 @@ export class WebGpuBridgeHost {
                   colorAttachmentDesc.clearValue = { r: cr, g: cg, b: cb, a: ca };
                 }
                 if (hasResolve) {
-                  colorAttachmentDesc.resolveTarget = colorResolveView(sourceTexture, this.textures.get(resolveTargetId));
+                  colorAttachmentDesc.resolveTarget = colorResolveView(sourceTexture, usePrepared(this.textures.get(resolveTargetId)));
                 }
 
                 const depthReadOnly = depthReadOnlyCode === 1;
@@ -1655,7 +1659,7 @@ export class WebGpuBridgeHost {
                   if (needsRebind) {
                     const bindGroupEntries = [];
                     if (hasUniform) {
-                      const uniformBuf = this.buffers.get(uniformBufferId);
+                      const uniformBuf = usePrepared(this.buffers.get(uniformBufferId));
                       if (!uniformBuf) {
                         throw new Error(
                           `RenderPassDepth: uniform buffer ${uniformBufferId} missing for pipeline`,
@@ -1700,7 +1704,7 @@ export class WebGpuBridgeHost {
 
                 if (vertexBufferId > 0) {
                   if (passState.vertexBufferId !== vertexBufferId) {
-                    const vb = this.buffers.get(vertexBufferId);
+                    const vb = usePrepared(this.buffers.get(vertexBufferId));
                     if (!vb) {
                       throw new Error(`RenderPassDepth: unknown vertexBufferId ${vertexBufferId}`);
                     }
@@ -1729,8 +1733,8 @@ export class WebGpuBridgeHost {
 
               encodedEpochs.set(bufferId, { epochHi, epochLo, preparation });
 
-              const texture = this.textures.get(textureId);
-              const buffer = this.buffers.get(bufferId);
+              const texture = usePrepared(this.textures.get(textureId));
+              const buffer = usePrepared(this.buffers.get(bufferId));
               if (!texture || !buffer) {
                 throw new Error("CopyTextureToBuffer: invalid texture or buffer id");
               }
@@ -1814,11 +1818,11 @@ export class WebGpuBridgeHost {
                 );
               }
 
-              const srcBuffer = this.buffers.get(sourceBufferId);
+              const srcBuffer = usePrepared(this.buffers.get(sourceBufferId));
               if (!srcBuffer) {
                 throw new Error(`CopyBufferToBuffer: unknown source bufferId ${sourceBufferId}`);
               }
-              const dstBuffer = this.buffers.get(destinationBufferId);
+              const dstBuffer = usePrepared(this.buffers.get(destinationBufferId));
               if (!dstBuffer) {
                 throw new Error(
                   `CopyBufferToBuffer: unknown destination bufferId ${destinationBufferId}`,
@@ -1918,7 +1922,7 @@ export class WebGpuBridgeHost {
                 throw new Error(`RecordBundle: unsupported sample count ${sampleCount}`);
               }
               const uniformBuf = pipelineRecord.hasUniformBuffer
-                ? this.buffers.get(uniformBufferId)
+                ? usePrepared(this.buffers.get(uniformBufferId))
                 : null;
               if (pipelineRecord.hasUniformBuffer && !uniformBuf) {
                 throw new Error(
@@ -1993,7 +1997,7 @@ export class WebGpuBridgeHost {
               }
 
               if (vertexBufferId > 0) {
-                const vb = this.buffers.get(vertexBufferId);
+                const vb = usePrepared(this.buffers.get(vertexBufferId));
                 if (!vb) {
                   throw new Error(`RecordBundle: unknown vertexBufferId ${vertexBufferId}`);
                 }
@@ -2142,7 +2146,7 @@ export class WebGpuBridgeHost {
                   }
                   targetView = getCanvasView();
                 } else {
-                  const texture = this.textures.get(targetId);
+                  const texture = usePrepared(this.textures.get(targetId));
                   if (!texture) {
                     throw new Error(`ExecuteBundles: unknown offscreen targetId ${targetId}`);
                   }
@@ -2480,7 +2484,7 @@ export class WebGpuBridgeHost {
                   );
                 }
 
-                const buffer = this.buffers.get(bufferId);
+                const buffer = usePrepared(this.buffers.get(bufferId));
                 if (!buffer) {
                   throw new Error(
                     `DispatchCompute: unknown bufferId ${bufferId} for binding ${bindingIndex}`,
@@ -2667,13 +2671,15 @@ export class WebGpuBridgeHost {
 
     // Capture metadata with this buffer: a later packet can reuse its numeric ID
     // while mapAsync is pending, but must not relabel these older GPU bytes.
+    const allocation = this.pendingPreparations.get(buffer);
     const { epochHi, epochLo, preparation } = this.bufferEpochs.get(bufferId) || { epochHi: 0, epochLo: 0 };
     await buffer.mapAsync(GPUMapMode.READ, 0, byteLength);
     let copy;
     try {
       // mapAsync can succeed on an older buffer value when an invalid command
       // buffer was discarded. Never stamp those bytes with the failed writer's epoch.
-      if (preparation) await preparation.promise;
+      if (allocation) await allocation.promise;
+      if (preparation && preparation !== allocation) await preparation.promise;
       if (
         !this.wrongImplSkipReadbackDeviceCheck &&
         (this.device !== device || this.deviceGeneration !== deviceGeneration)

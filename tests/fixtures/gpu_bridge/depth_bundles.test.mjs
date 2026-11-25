@@ -476,3 +476,23 @@ test("readback waits for its writer's validation and preserves epochs across res
   await f.host.executePacket(packet([copyWithEpoch(8)]));
   assert.equal((await f.host.readbackBuffer(51, 4)).epochLo, 8);
 });
+
+test("failed allocation invalidates provisional consumers without evicting newer same-ID storage", async () => {
+  const f = readbackFixture(), validation = deferred();
+  f.host.device.createTexture = () => ({});
+  f.validationResults.push(validation.promise);
+  const produce = outcome(f.host.executePacket(packet([[1, [51, 16, 9]], [6, [52, 1, 1, 2, 17]]])));
+  const oldRead = outcome(f.host.readbackBuffer(51, 4));
+  // Create the destination separately so this copy depends only on its source texture.
+  await f.host.executePacket(packet([[1, [53, 256, 9]]]));
+  const copy = outcome(f.host.executePacket(packet([[5, [52, 53, 1, 1, 0, 12]]])));
+  const copiedRead = outcome(f.host.readbackBuffer(53, 4));
+  await f.host.executePacket(packet([[1, [51, 16, 9]]]));
+  validation.resolve({message: "allocation failed"});
+  for (const message of await Promise.all([produce, oldRead, copy, copiedRead]))
+    assert.match(message, /allocation failed/);
+  assert.equal(f.host.textures.has(52), false);
+  assert.equal(f.host.lastRenderTargetId, null);
+  assert.equal(f.host.buffers.has(51), true);
+  assert.equal((await f.host.readbackBuffer(51, 4)).epochLo, 0);
+});
