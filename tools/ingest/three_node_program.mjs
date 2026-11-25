@@ -2564,6 +2564,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const node of state.analyticLightNodes) if (!checkAnalyticLight(node, state.lights))
       fail('LIGHTS', 'Native analytic light identity changed after source construction');
     for (const [node, light] of state.shadowGraphs.roots) inspectThreeNativeShadowGraph(three, node, light);
+    for (const [node, light] of state.shadowGraphs.replacements) inspectThreeNativeShadowGraph(three, node, light);
   }
   function checkMaterialMaps(state) {
     const filtering = state.materialVersion === state.material.version ? state.textureFiltering : null;
@@ -2918,7 +2919,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       const state = stateOf(descriptor);
       // Extension setup can create any ordinary source update phase. Public
       // precompilation runs them around each pipeline, even without compute.
-      return materialExtension(state.material) || state.builder.updateBeforeNodes.some(node => node.isComputeNode ||
+      return materialExtension(state.material) || state.shadowGraphs.replacements.size > 0 || state.builder.updateBeforeNodes.some(node => node.isComputeNode ||
         state.shadowGraphs.roots.has(node) && !(node instanceof three.ShadowNode));
     },
     geometry(descriptor) { const state = stateOf(descriptor); return descriptor.wireframe ? wireframes.geometry(descriptor)

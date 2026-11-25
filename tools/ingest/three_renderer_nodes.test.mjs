@@ -1814,7 +1814,7 @@ test('registered SunLight refuses unsupported shadow effects before updates and 
   f.mesh.receiveShadow=true;f.renderer.shadowMap.enabled=true;f.renderer.shadowMap.type=T.PCFShadowMap;
   sun.shadow.filterNode=T.TSL.float(1);
   assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_SHADOW'});sun.shadow.filterNode=null;
-  sun.shadow.shadowNode=T.TSL.float(1);
+  sun.shadow.shadowNode={isNode:true};
   assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_SHADOW'});
   sun.shadow.shadowNode=undefined;
   assert.equal(updates,0);assert.equal(f.acquired(),0);assert.equal(f.device.submissions.length,0);

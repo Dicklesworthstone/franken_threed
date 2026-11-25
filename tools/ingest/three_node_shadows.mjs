@@ -19,13 +19,17 @@ export function inspectThreeNativeShadowFilter(shadow) {
   return filter;
 }
 
-/** Authored shadow compositions retain their own graph construction and node
- * updates. Only the pinned base owns caster selection and shadow materials;
- * arbitrary renderer/backend hooks do not acquire that privilege here. */
+/** AnalyticLightNode accepts an authored shadow multiplier instead of a shadow
+ * map. Ordinary source graphs retain their normal resource/update admission;
+ * only ShadowBaseNode compositions acquire caster and shadow-material helpers.
+ */
 export function inspectThreeNativeShadowGraph(three, node, light) {
   if (node == null) return null;
+  if (!(node instanceof three.Node) || node.isNode !== true)
+    reject('Authored shadow replacements require a source TSL node');
+  if (!(node instanceof three.ShadowBaseNode)) return node;
   const base = three.ShadowBaseNode.prototype;
-  if (!(node instanceof three.ShadowBaseNode) || node.light !== light ||
+  if (node.light !== light ||
       ['getShadowMaterial', 'disposeShadowMaterial', 'getShadowRenderObjectFunction', 'setupShadowPosition']
         .some(key => node[key] !== base[key]))
     reject('Authored shadow compositions require a source ShadowBaseNode coupled to their selected light and the pinned caster/material helpers');
@@ -50,19 +54,22 @@ export function captureThreeNativeShadowGraphs(three, builder) {
     return addChain.call(this, node);
   };
   return analyticNodes => {
-    const roots = new Map(), children = new Map();
+    const roots = new Map(), children = new Map(), replacements = new Map();
     for (const analytic of analyticNodes) {
       const root = analytic.shadowNode;
       if (root instanceof three.ShadowBaseNode) {
         inspectThreeNativeShadowGraph(three, root, analytic.light);
         roots.set(root, analytic.light);
+      } else if (root != null) {
+        inspectThreeNativeShadowGraph(three, root, analytic.light);
+        replacements.set(root, analytic.light);
       }
     }
     for (const [node, candidates] of ancestors) {
       const root = [...candidates].find(candidate => roots.has(candidate));
       if (root) children.set(node, Object.freeze({root, parentLight: roots.get(root), light: node.light, shadow: node.shadow}));
     }
-    return {roots, children};
+    return {roots, children, replacements};
   };
 }
 

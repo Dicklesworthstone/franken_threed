@@ -2427,7 +2427,7 @@ test('registered SunLight respects disabled shadows and refuses unsupported acti
   f.renderer.shadowMap.enabled = true; f.renderer.shadowMap.type = THREE.PCFShadowMap;
   f.sun.shadow.filterNode = N.float(1);
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_SHADOW'}); f.sun.shadow.filterNode = null;
-  f.sun.shadow.shadowNode = N.float(1);
+  f.sun.shadow.shadowNode = {isNode: true};
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_SHADOW'}); f.sun.shadow.shadowNode = undefined;
   f.sun.map = dataTexture(); assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'}); f.sun.map = null;
   f.sun.colorNode = () => N.vec3(1); assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'});

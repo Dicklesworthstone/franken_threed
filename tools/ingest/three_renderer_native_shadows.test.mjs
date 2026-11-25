@@ -315,6 +315,104 @@ test(`shadow extension compilation runs node callbacks without rendering shadow 
   assert.notEqual(f.renderer._isPreCompiling, true); assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
+for (const Light of [T.DirectionalLight, T.SpotLight, T.PointLight])
+test(`${Light.name}: authored shadow multipliers preserve source WGSL without allocating a shadow map`, async t => {
+  const f = fixture(t), reference = fixture(t);
+  for (const entry of [f, reference]) {
+    entry.scene.remove(entry.light, entry.light.target);
+    const light = entry.light = new Light(0xffe6cc, 2); light.position.set(-3, 4, 5); light.castShadow = true;
+    const factor = N.uniform(.375).setName('authoredShadowFactor');
+    light.shadow.shadowNode = N.Fn(() => N.vec3(factor, factor.mul(.5), factor.mul(.25)))();
+    entry.scene.add(light); if (light.target) entry.scene.add(light.target);
+  }
+  await reference.renderer.init();
+  const source = new T.WGSLNodeBuilder(reference.receiver, reference.renderer);
+  source.scene = reference.scene; source.camera = reference.camera;
+  source.lightsNode = N.lights(reference.scene.children.filter(object => object.isLight)); source.build();
+  await f.renderer.renderAsync(f.scene, f.camera);
+  const receiver = receiverDraws(f.device).at(-1);
+  assert.ok(receiver); assert.match(shader(receiver), /authoredShadowFactor/);
+  assert.equal(shader(receiver), source.fragmentShader);
+  assert.equal(receiver.pipeline.vertex.module.code, source.vertexShader);
+  assert.equal(f.light.shadow.map, null); assert.equal(targetPasses(f.device).length, 0);
+  assert.ok(uniformValues(receiver).includes(.375));
+  assert.equal(f.renderer.info.f3d.route, 'general-webgpu');
+});
+
+test('queued replacement shadow updates capture each accepted uniform value and original callback identities', async t => {
+  const f = fixture(t), calls = [], factor = N.uniform(.125).setName('queuedShadowFactor');
+  factor.onObjectUpdate(frame => {
+    calls.push([frame.renderer, frame.object, frame.material, frame.scene, frame.camera]);
+    return factor.value;
+  });
+  f.light.shadow.shadowNode = factor;
+  await f.renderer.init();
+  for (const value of [.125, .375, .625]) {
+    factor.value = value; f.renderer.render(f.scene, f.camera);
+  }
+  factor.value = .875; await drain(f.renderer);
+  const receivers = receiverDraws(f.device); assert.equal(receivers.length, 3);
+  for (const [index, value] of [.125, .375, .625].entries()) assert.ok(uniformValues(receivers[index]).includes(value));
+  assert.equal(calls.length, 3);
+  assert.ok(calls.every(([renderer, object, material, scene, camera]) => renderer === f.renderer &&
+    object === f.receiver && material === f.material && scene === f.scene && camera === f.camera));
+  assert.equal(f.light.shadow.map, null); assert.equal(targetPasses(f.device).length, 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('replacement shadow precompilation retains source before/current/after callbacks without rendering', async t => {
+  const f = fixture(t), calls = [];
+  class ShadowFactor extends T.Node {
+    constructor() {
+      super('float'); this.updateBeforeType = this.updateType = this.updateAfterType = 'object';
+      this.factor = N.uniform(.625).setName('precompiledShadowFactor');
+    }
+    setup() { return this.factor; }
+    updateBefore(frame) { calls.push(['before', frame.renderer._isPreCompiling === true, frame.object]); }
+    update(frame) { calls.push(['current', frame.renderer._isPreCompiling === true, frame.object]); }
+    updateAfter(frame) { calls.push(['after', frame.renderer._isPreCompiling === true, frame.object]); }
+  }
+  f.light.shadow.shadowNode = new ShadowFactor();
+  await f.renderer.compileAsync(f.scene, f.camera);
+  assert.deepEqual(calls, ['before', 'current', 'after'].map(phase => [phase, true, f.receiver]));
+  assert.equal(f.device.submissions.length, 0); assert.equal(f.acquired(), 0);
+  calls.length = 0;
+  await f.renderer.renderAsync(f.scene, f.camera);
+  assert.deepEqual(calls, ['before', 'current', 'after'].map(phase => [phase, false, f.receiver]));
+  assert.equal(receiverDraws(f.device).length, 1); assert.equal(f.light.shadow.map, null);
+  assert.notEqual(f.renderer._isPreCompiling, true);
+});
+
+test('replacement shadows retain baked texture inputs and source light-node cache selection', async t => {
+  const f = fixture(t), map = new T.DataTexture(new Uint8Array([48, 96, 144, 255]), 1, 1);
+  map.needsUpdate = true; t.after(() => map.dispose());
+  const original = N.texture(map, N.uv()).rgb; f.light.shadow.shadowNode = original;
+  await f.renderer.renderAsync(f.scene, f.camera);
+  const first = receiverDraws(f.device).at(-1);
+  assert.equal(textureResources(first).some(view => view.texture.pixels?.[0] === 48), true);
+  f.light.shadow.shadowNode = N.uniform(.875).setName('unusedReplacementShadow');
+  f.material.needsUpdate = true;
+  await f.renderer.renderAsync(f.scene, f.camera);
+  const second = receiverDraws(f.device).at(-1);
+  assert.doesNotMatch(shader(second), /unusedReplacementShadow/);
+  const firstMap = textureResources(first).find(view => view.texture.pixels?.[0] === 48);
+  const secondMap = textureResources(second).find(view => view.texture.pixels?.[0] === 48);
+  assert.equal(secondMap.texture, firstMap.texture, 'the pinned analytic node retains its constructed shadow until disposal');
+  assert.equal(f.light.shadow.map, null); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('replacement shadow graphs still reject generated graphics writes before updates or submission', async t => {
+  const f = fixture(t); let updates = 0;
+  const storage = N.storage(new T.StorageBufferAttribute(1, 4), 'vec4', 1);
+  f.light.shadow.shadowNode = N.Fn(() => {
+    storage.element(0).assign(N.vec4(1)); return N.float(.5);
+  })();
+  f.material.colorNode.onObjectUpdate(() => { updates++; });
+  await assert.rejects(f.renderer.renderAsync(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_STORAGE'});
+  assert.equal(updates, 0); assert.equal(f.acquired(), 0); assert.equal(f.device.submissions.length, 0);
+  assert.equal(f.light.shadow.map, null); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('pinned CSM renders source virtual cascade casters before their native receiver', async t => {
   const f = fixture(t), csm = new CSMShadowNode(f.light, {cascades: 3, maxFar: 20, lightMargin: 2});
   f.light.shadow.shadowNode = csm;

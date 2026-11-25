@@ -2033,6 +2033,24 @@ and dynamic mode changes, with zero GPU validation errors.
 
 ## Native source shadows
 
+Directional, spot and point lights can replace their shadow map with an authored
+`light.shadow.shadowNode` graph. Scalar/color uniforms, procedural TSL and baked
+texture masks retain the pinned `AnalyticLightNode` multiplication, its cached
+graph selection and ordinary node update frequencies. Each accepted draw owns
+its captured uniforms and sampled-texture leases; later edits cannot replace a
+queued shadow mask. These replacements allocate no shadow-map target or caster
+pass. Public precompilation runs their source before/current/after updates without
+submitting a frame. Generated graphics writes still pass the ordinary storage
+admission checks, and plain graphs do not acquire the caster-selection privileges
+of `ShadowBaseNode` compositions. Nested custom shadow-map lifecycles retain their
+existing boundaries.
+
+`three_renderer_native_shadows.test.mjs` compares complete generated WGSL with
+independent pinned-source builders for all three light types, and checks queued
+values, callback identity, precompilation, baked texture/cache retention and
+rejection before submission. These are shader/command/data tests, not browser
+pixel or hardware-performance evidence.
+
 The native facade accepts `PCFSoftShadowMap` with the pinned renderer's
 compatibility behavior: compile and render warn, then replace the public
 selection with `PCFShadowMap` before scene callbacks. Assigning the deprecated
