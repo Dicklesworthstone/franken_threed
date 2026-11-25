@@ -7,7 +7,7 @@ const dataUrl = (source) => "data:text/javascript;base64," + Buffer.from(source)
 const memorySource = await readFile(new URL("./memory_transport.js", import.meta.url), "utf8");
 const bridgeSource = await readFile(new URL("./bridge_runtime.js", import.meta.url), "utf8");
 const { WebGpuBridgeHost } = await import(dataUrl(
-  "const GPUShaderStage = {VERTEX: 1, FRAGMENT: 2, COMPUTE: 4};\n" +
+  "const GPUShaderStage = {VERTEX: 1, FRAGMENT: 2, COMPUTE: 4}, GPUMapMode = {READ: 1};\n" +
   bridgeSource.replace('"./memory_transport.js"', JSON.stringify(dataUrl(memorySource))),
 ));
 
@@ -426,4 +426,42 @@ test("successful concurrent preparation remains reusable and observer failure ow
   }), /observer failed after submission/);
   assert.equal(f.host.computePipelines.has(101), false);
   assert.equal(f.host.pipelines.get(100), successful);
+});
+
+function readbackFixture() {
+  const f = fixture();
+  const destination = { mapAsync: async () => {}, getMappedRange: () => new ArrayBuffer(4),
+    unmap() { f.events.push(["unmap"]); } };
+  f.host.buffers.set(51, destination);
+  f.host.device.createCommandEncoder = () => ({copyTextureToBuffer() {}, finish: () => ({})});
+  f.host.device.createBuffer = () => ({...destination});
+  return f;
+}
+const copyWithEpoch = epoch => [5, [10, 51, 1, 1, 0, epoch]];
+
+test("discarded encoders and throwing submissions preserve the last issued readback epoch", async () => {
+  const f = readbackFixture();
+  await f.host.executePacket(packet([copyWithEpoch(1)]));
+  await assert.rejects(f.host.executePacket(packet([copyWithEpoch(2), [0xffff, []]])), /Unknown opcode/);
+  assert.equal((await f.host.readbackBuffer(51, 4)).epochLo, 1);
+  f.host.device.queue.submit = () => { throw new Error("submission failed"); };
+  await assert.rejects(f.host.executePacket(packet([copyWithEpoch(3)])), /submission failed/);
+  assert.equal((await f.host.readbackBuffer(51, 4)).epochLo, 1);
+});
+
+test("readback waits for its writer's validation and preserves epochs across residency replacement", async () => {
+  const f = readbackFixture(), validation = deferred();
+  f.validationResults.push(validation.promise);
+  const producer = outcome(f.host.executePacket(packet([copyWithEpoch(7)])));
+  let resolved = false;
+  const read = outcome(f.host.readbackBuffer(51, 4)).then(value => { resolved = true; return value; });
+  await new Promise(setImmediate);
+  assert.equal(resolved, false);
+  await f.host.executePacket(packet([[1, [51, 16, 9]]]));
+  assert.equal((await f.host.readbackBuffer(51, 4)).epochLo, 0);
+  validation.resolve({message: "copy validation failed"});
+  for (const message of await Promise.all([producer, read])) assert.match(message, /copy validation failed/);
+  assert.equal(f.events.filter(([name]) => name === "unmap").length, 2);
+  await f.host.executePacket(packet([copyWithEpoch(8)]));
+  assert.equal((await f.host.readbackBuffer(51, 4)).epochLo, 8);
 });

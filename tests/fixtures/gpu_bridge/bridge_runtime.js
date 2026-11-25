@@ -511,6 +511,7 @@ export class WebGpuBridgeHost {
       let commandEncoder = null;
       const encoder = () => (commandEncoder ??= device.createCommandEncoder());
       const stagingBuffers = [];
+      const encodedEpochs = new Map();
       try {
         let cursor = headerLen;
         let currentPassEncoder = null;
@@ -588,6 +589,8 @@ export class WebGpuBridgeHost {
                 usage: usage,
               });
               this.buffers.set(bufferId, buffer);
+              this.bufferEpochs.delete(bufferId);
+              encodedEpochs.delete(bufferId);
               break;
             }
 
@@ -618,6 +621,7 @@ export class WebGpuBridgeHost {
               }
               if (!commandEncoder) {
                 device.queue.writeBuffer(buffer, offset, chunk);
+                if (dataLength) this.bufferEpochs.delete(bufferId);
               } else {
                 if (offset % 4 !== 0 || dataLength % 4 !== 0 || offset + dataLength > buffer.size)
                   throw new RangeError("WriteBuffer: copy must be aligned and fit in the destination");
@@ -630,6 +634,7 @@ export class WebGpuBridgeHost {
                 new Uint8Array(stagingBuffer.getMappedRange()).set(chunk);
                 stagingBuffer.unmap();
                 commandEncoder.copyBufferToBuffer(stagingBuffer, 0, buffer, offset, dataLength);
+                if (dataLength) encodedEpochs.set(bufferId, { epochHi: 0, epochLo: 0, preparation });
               }
               break;
             }
@@ -1725,7 +1730,7 @@ export class WebGpuBridgeHost {
               const epochLo = dataView.getUint32(cursor + 20, true);
               cursor += 24;
 
-              this.bufferEpochs.set(bufferId, { epochHi, epochLo });
+              encodedEpochs.set(bufferId, { epochHi, epochLo, preparation });
 
               const texture = this.textures.get(textureId);
               const buffer = this.buffers.get(bufferId);
@@ -1860,7 +1865,7 @@ export class WebGpuBridgeHost {
                 );
               }
 
-              this.bufferEpochs.set(destinationBufferId, { epochHi, epochLo });
+              encodedEpochs.set(destinationBufferId, { epochHi, epochLo, preparation });
 
               encoder().copyBufferToBuffer(
                 srcBuffer,
@@ -2579,7 +2584,7 @@ export class WebGpuBridgeHost {
               for (let b = 0; b < parsedBindings.length; b++) {
                 const pb = parsedBindings[b];
                 if (pb.bindingType === BINDING_TYPE_STORAGE_READ_WRITE) {
-                  this.bufferEpochs.set(pb.bufferId, { epochHi: pb.epochHi, epochLo: pb.epochLo });
+                  encodedEpochs.set(pb.bufferId, { epochHi: pb.epochHi, epochLo: pb.epochLo, preparation });
                 }
               }
 
@@ -2619,6 +2624,9 @@ export class WebGpuBridgeHost {
         const commandBuffer = encoder().finish();
         this.device.queue.submit([commandBuffer]);
         submitted = true;
+        // Recording can fail after a copy or dispatch. Publish its epoch only
+        // after submit returns, and retain the validation receipt for readback.
+        for (const [id, epoch] of encodedEpochs) this.bufferEpochs.set(id, epoch);
       } finally {
         for (const sb of stagingBuffers) {
           sb.destroy();
@@ -2662,10 +2670,13 @@ export class WebGpuBridgeHost {
 
     // Capture metadata with this buffer: a later packet can reuse its numeric ID
     // while mapAsync is pending, but must not relabel these older GPU bytes.
-    const { epochHi, epochLo } = this.bufferEpochs.get(bufferId) || { epochHi: 0, epochLo: 0 };
+    const { epochHi, epochLo, preparation } = this.bufferEpochs.get(bufferId) || { epochHi: 0, epochLo: 0 };
     await buffer.mapAsync(GPUMapMode.READ, 0, byteLength);
     let copy;
     try {
+      // mapAsync can succeed on an older buffer value when an invalid command
+      // buffer was discarded. Never stamp those bytes with the failed writer's epoch.
+      if (preparation) await preparation.promise;
       if (
         !this.wrongImplSkipReadbackDeviceCheck &&
         (this.device !== device || this.deviceGeneration !== deviceGeneration)
