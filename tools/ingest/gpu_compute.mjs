@@ -544,7 +544,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     request.onCancel = error => { if (entry.request === request) releaseReadback(entry, error); };
     return entry;
   }
-  async function readCaptured(key, request) {
+  async function readCaptured(key, request, sourceCompletion = null) {
     live();
     if (!capturedReadbacks.has(request)) fail('READBACK_TARGET', 'Expected a captured readback request');
     request.check();
@@ -578,9 +578,13 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       // The copy observes only work issued through this submission boundary.
       // Capture its outstanding validation before mapping yields: later uploads
       // and dispatches must not hold an already completed readback open.
-      const validations = [...pending];
-      await interrupted(request.wait(buffer.mapAsync(MAP_READ, 0, size)));
-      await interrupted(request.wait(Promise.all(validations)));
+      // Other resource owners may still report failure for the source work.
+      // Capture their proof after this copy, and join it before exposing mapped
+      // bytes. Either failure releases staging even when mapping is stalled.
+      const validation = Promise.all([...pending, sourceCompletion?.()]);
+      // mapAsync can throw synchronously after the dependency was captured.
+      validation.catch(() => {});
+      await interrupted(request.wait(Promise.all([validation, buffer.mapAsync(MAP_READ, 0, size)])));
       live(); request.check(bytes);
       const mapped = buffer.getMappedRange(0, size);
       let result;

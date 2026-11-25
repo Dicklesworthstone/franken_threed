@@ -733,10 +733,9 @@ function createThreeCompute(renderer, three) {
     },
     read(attribute, request) {
       live(); validateAttribute(attribute);
-      // Submit the buffer snapshot before waiting for texture-owner errors.
-      return Promise.all([gpu.readCaptured(attribute, request), textureOwner.whenIdle()]).then(([bytes]) => {
-        request.check(); return bytes;
-      });
+      // Submit the buffer snapshot before capturing texture-owner completion,
+      // then validate both owners before publishing caller-visible bytes.
+      return gpu.readCaptured(attribute, request, () => textureOwner.whenIdle());
     },
     dispose() {
       if (disposed) return; disposed = true;

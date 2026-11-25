@@ -436,6 +436,93 @@ test('pre-init ranged readback handles and failed queue admission release their 
   assert.deepEqual([...new Float32Array(target.buffer)], [4]);
 });
 
+for (const outcome of ['success', 'failure'])
+test(`source resource ${outcome} gates caller-owned readback publication`, async t => {
+  const {renderer, buffers, events} = setup(), gate = deferred();
+  t.after(() => { gate.resolve(); renderer.dispose(); });
+  const data = attribute(new Float32Array([1, 2, 3, 4]));
+  renderer.compute(node([storage(data)]));
+  const textures = renderer._getSampledTextureInputs();
+  let checks = 0;
+  textures.whenIdle = () => { checks++; return gate.promise; };
+  const target = new Float32Array([-1, -1, -1]).buffer;
+  const result = renderer.getArrayBufferAsync(data, target, 4, 8);
+  result.catch(() => {});
+  assert.equal(events.filter(event => event[0] === 'read').length, 1, 'copy submits in its source turn');
+  await new Promise(resolve => setImmediate(resolve));
+  const staging = buffers.find(buffer => buffer.usage === 9);
+  assert.equal(checks, 1);
+  assert.deepEqual([...new Float32Array(target)], [-1, -1, -1], 'unvalidated bytes remain private');
+  assert.equal(staging.destroyed, 0);
+  if (outcome === 'success') {
+    gate.resolve();
+    assert.equal(await result, target);
+    assert.deepEqual([...new Float32Array(target)], [3, 4, -1]);
+  } else {
+    const failure = new Error('source texture proof failed');
+    gate.reject(failure);
+    await assert.rejects(result, error => error === failure);
+    assert.deepEqual([...new Float32Array(target)], [-1, -1, -1]);
+  }
+  assert.equal(staging.destroyed, 1);
+  assert.equal(checks, 1);
+});
+
+for (const outcome of ['success', 'failure'])
+test(`source resource ${outcome} gates reusable mapping publication`, async t => {
+  const {renderer, buffers} = setup(), gate = deferred(), target = readbackTarget(16);
+  t.after(() => { gate.resolve(); target.dispose(); renderer.dispose(); });
+  const data = attribute(new Float32Array([1, 2, 3, 4]));
+  renderer.compute(node([storage(data)]));
+  const textures = renderer._getSampledTextureInputs();
+  textures.whenIdle = () => gate.promise;
+  const result = renderer.getArrayBufferAsync(data, target, 4, 8);
+  result.catch(() => {});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(target._mapped, true, 'the source handle remains reserved');
+  assert.equal(target.buffer, null, 'a successful map alone cannot publish source bytes');
+  const staging = buffers.find(buffer => buffer.usage === 9);
+  if (outcome === 'success') {
+    gate.resolve();
+    assert.equal(await result, target);
+    assert.deepEqual([...new Float32Array(target.buffer)], [3, 4]);
+    assert.equal(target._mapped, true);
+    assert.equal(staging.destroyed, 0);
+    target.release();
+  } else {
+    const failure = new Error('source texture proof failed');
+    gate.reject(failure);
+    await assert.rejects(result, error => error === failure);
+  }
+  assert.equal(target._mapped, false);
+  assert.equal(target.buffer, null);
+  textures.whenIdle = async () => {};
+  assert.equal(await renderer.getArrayBufferAsync(data, target, 0, 4), target);
+  assert.deepEqual([...new Float32Array(target.buffer)], [2]);
+  assert.equal(buffers.filter(buffer => buffer.usage === 9).length, 1, 'the released staging allocation is reusable');
+});
+
+test('failed source resource proof releases a stalled caller readback map', async t => {
+  const mapping = deferred(), gate = deferred(), {renderer, buffers} = setup({mapping});
+  t.after(() => { mapping.resolve(); gate.resolve(); renderer.dispose(); });
+  const data = attribute(new Float32Array([1, 2, 3, 4]));
+  renderer.compute(node([storage(data)]));
+  renderer._getSampledTextureInputs().whenIdle = () => gate.promise;
+  const target = new Float32Array([-1, -1]).buffer;
+  const result = renderer.getArrayBufferAsync(data, target, 0, 8);
+  result.catch(() => {});
+  await new Promise(resolve => setImmediate(resolve));
+  const staging = buffers.find(buffer => buffer.usage === 9), failure = new Error('source failed while map is pending');
+  gate.reject(failure);
+  await assert.rejects(result, error => error === failure);
+  assert.equal(staging.destroyed, 1, 'a failed dependency releases staging without waiting for mapAsync');
+  assert.deepEqual([...new Float32Array(target)], [-1, -1]);
+  mapping.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(staging.destroyed, 1);
+  assert.deepEqual([...new Float32Array(target)], [-1, -1]);
+});
+
 for (const failure of ['resource completion', 'released mapping'])
 test(`late ${failure} cannot leak or overwrite a reusable native mapping`, async t => {
   const {renderer, device, buffers} = setup(), data = attribute(new Float32Array([1, 2, 3, 4])), target = readbackTarget(16);
