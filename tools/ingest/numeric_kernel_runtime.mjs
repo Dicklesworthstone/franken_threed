@@ -11,6 +11,7 @@
 const SECTION = 'f3d.numeric-kernel';
 const PAGE_BYTES = 65536;
 const MAX_BYTES = 1024 * 1024 * 1024;
+const isSafeInteger = Number.isSafeInteger;
 const F64Array = Float64Array;
 const F32Array = Float32Array;
 const U8Array = Uint8Array;
@@ -447,9 +448,14 @@ function planNumericStorage(records, refuse) {
  * Enable it only for compiler products that preserve ordered memory operations
  * without assuming disjoint parameters. Mixed-type writable overlaps still
  * retain JavaScript. The default keeps the existing independent-prefix ABI.
+ * A library kernel can supply resultPrefixWidths when its body never reads
+ * the named outputs and overwrites each nonempty view densely from zero to
+ * result * width. Empty optional views must be unused. Full view lengths still
+ * govern all kernel address checks, memory bounds and alias guards.
  */
 export function instantiateNumericKernel(bytes, {
   fallback = null, maxMemoryBytes = null, resolveMath = null, preserveAliasing = false, captureGuard = null,
+  resultPrefixWidths = null,
 } = {}) {
   if (typeof preserveAliasing !== 'boolean') throw new TypeError('preserveAliasing must be a boolean');
   if (fallback !== null && typeof fallback !== 'function') throw new TypeError('fallback must be a function or null');
@@ -471,6 +477,17 @@ export function instantiateNumericKernel(bytes, {
   const generalControl = manifest.version === 8 ||
     (manifest.version === 9 && manifest.kind === 'closed-numeric-control');
   const checkedIndexing = manifest.version === 7 || manifest.version === 9 || generalControl;
+  const prefixWidths = resultPrefixWidths === null ? null : new Map();
+  if (prefixWidths) {
+    if (!generalControl || preserveAliasing || manifest.resultType !== 'f64')
+      throw new TypeError('Result-sized outputs require disjoint checked storage and a numeric count');
+    for (const [name, width] of Object.entries(resultPrefixWidths)) {
+      const index = manifest.parameters.findIndex(param => param.name === name && param.write);
+      if (index < 0 || !isSafeInteger(width) || width <= 0)
+        throw new TypeError('Expected a writable output parameter and a positive record width');
+      prefixWidths.set(index, width);
+    }
+  }
   const boundParameters = checkedIndexing ? manifest.lengthParameters
     : pipeline ? manifest.boundParameters : [manifest.boundParameter];
   const boundSet = new Set(boundParameters);
@@ -595,7 +612,7 @@ export function instantiateNumericKernel(bytes, {
     // Acquire every view AFTER possible memory.grow; never retain detached views.
     const scratchBuffer = memory.buffer;
     for (const record of records) values[record.index] = record.ptr;
-    const inputs = [], outputs = [];
+    const inputs = [], outputs = [], prefixes = prefixWidths ? [] : null;
     let copiedBytes = 0;
     if (storage) {
       for (const [spans, destination, reverse] of [
@@ -608,13 +625,18 @@ export function instantiateNumericKernel(bytes, {
       }
     } else {
       for (const record of records) {
+        const width = prefixWidths?.get(record.index);
+        if (width !== undefined) {
+          if (record.count) prefixes.push({ record, width });
+          continue;
+        }
         const source = new record.ArrayType(record.buffer, record.offset, record.count);
         const scratch = new record.ArrayType(scratchBuffer, record.ptr, record.count);
         if (record.param.read) { inputs.push({ target: scratch, args: [source] }); copiedBytes += record.byteLength; }
         if (record.param.write) { outputs.push({ target: source, args: [scratch] }); copiedBytes += record.byteLength; }
       }
     }
-    return { inputs, outputs, copiedBytes, values, counts };
+    return { inputs, outputs, prefixes, scratchBuffer, copiedBytes, values, counts };
   }
 
   function run(...args) {
@@ -640,6 +662,24 @@ export function instantiateNumericKernel(bytes, {
       result = execute(...prepared.values, ...prepared.counts);
       if (manifest.version >= 5 && manifest.resultType === 'f64' && typeof result !== 'number') {
         refuse('KERNEL_ABI_MISMATCH', 'Numeric return was not produced before publication');
+      }
+      // Size every copy before publishing anything, including writes to the
+      // normal cache. A bad result or allocation failure retains source execution.
+      if (prepared.prefixes) {
+        if (!isSafeInteger(result) || result < 0)
+          refuse('KERNEL_RESULT_EXTENT', 'Expected a nonnegative integer output count');
+        for (const { record, width } of prepared.prefixes) {
+          const count = result * width;
+          if (count > record.count)
+            refuse('KERNEL_RESULT_EXTENT', 'Produced prefix exceeds its destination');
+          const bytes = count * record.elementBytes;
+          if (bytes) {
+            const target = new U8Array(record.buffer, record.offset, bytes);
+            const source = new U8Array(prepared.scratchBuffer, record.ptr, bytes);
+            prepared.outputs.push({ target, args: [source] });
+            prepared.copiedBytes += bytes;
+          }
+        }
       }
       // The Boolean result tag is mandatory: older readers reject it instead
       // of silently exposing an internal f64 0/1 as a JavaScript Number.

@@ -267,3 +267,22 @@ test("runtime module imports with DOM, GPU and WebAssembly globals unavailable",
     Object.defineProperty(globalThis, "WebAssembly", prior);
   }
 });
+
+test("invalid result-sized output refuses before any private write is published", () => {
+  function emit(cache, vertices, count) {
+    cache[0] = 19;
+    vertices[0] = 23;
+    return count;
+  }
+  const program = compileNumericKernel(emit.toString(), {
+    parameterTypes: ["f32[]", "f32[]", "f64"], generalControl: true,
+  });
+  const engine = instantiateNumericKernel(program.wasm, { resultPrefixWidths: { vertices: 1 } });
+  const cache = new Float32Array([7]), vertices = new Float32Array([11]);
+  for (const count of [2, -1, 0.5, Infinity, NaN]) {
+    assert.throws(() => engine.run(cache, vertices, count), { code: "KERNEL_RESULT_EXTENT" });
+    assert.deepEqual([...cache, ...vertices], [7, 11]);
+  }
+  assert.equal(engine.run(cache, vertices, 1), 1);
+  assert.deepEqual([...cache, ...vertices], [19, 23]);
+});

@@ -94,6 +94,34 @@ for(let flags=0;flags<8;flags++)test(`full pinned addon: all 256 cases under out
   assert.equal(actualModule.diagnostics(a).fallbackCalls,0);
 });
 
+test('polygonizer transfers only emitted attribute prefixes and preserves all retained bytes',()=>{
+  const [a,b]=pair(4,7,10000);
+  const keys=['positionArray','normalArray','uvArray','colorArray'];
+  for(const effect of [a,b]) for(const key of keys) {
+    const capacity=effect[key].length;
+    // Include a caller-owned prefix/suffix and noncanonical NaNs in the tail.
+    const storage=new Uint32Array(capacity+4).fill(0x7fc12345);
+    effect[key]=new Float32Array(storage.buffer,8,capacity);
+  }
+  a.update();b.update();
+  let previous=actualModule.diagnostics(a).kernel.copiedBytes;
+  const fixedBytes=a.field.byteLength+a.palette.byteLength+2*a.normal_cache.byteLength+
+    actualModule.edgeTable.byteLength+actualModule.triTable.byteLength+2*3*36*Float32Array.BYTES_PER_ELEMENT;
+  for(const [mask,uvs,colors] of [[61,true,true],[1,false,true],[1,true,false],[0,true,true]]) {
+    for(const effect of [a,b]) {
+      cubeField(effect,mask);effect.enableUvs=uvs;effect.enableColors=colors;effect.update();
+    }
+    assert.equal(a.count,b.count);
+    assert.deepEqual(a.geometry.drawRange,b.geometry.drawRange);
+    for(const key of keys)
+      assert.ok(Buffer.from(a[key].buffer).equals(Buffer.from(b[key].buffer)),key);
+    const {kernel,wasmCalls,fallbackCalls}=actualModule.diagnostics(a);
+    assert.ok(wasmCalls>0);assert.equal(fallbackCalls,0);
+    assert.equal(kernel.copiedBytes-previous,fixedBytes+4*a.count*(6+(uvs?2:0)+(colors?3:0)));
+    previous=kernel.copiedBytes;
+  }
+});
+
 test('full objects retain animated fields, material changes, stale normals and reinitialization',()=>{
   const [a,b]=pair(),method=a.update;
   for(let frame=0;frame<7;frame++) {

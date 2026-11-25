@@ -19,6 +19,10 @@ const materialPrototypes=new WeakSet();
 apply(setAdd,materialPrototypes,[Object.prototype]);
 const isInteger=Number.isInteger, U8=Uint8Array, decode=globalThis.atob, charCodeAt=String.prototype.charCodeAt;
 const empty=new Float32Array(0);
+// The polygonizer never reads these attributes. It writes every component
+// of each emitted vertex and returns the vertex count. Disabled attributes
+// receive empty views; cache and edge lists keep their full input histories.
+const vertexWidths=Object.freeze({position:3,normal:3,uv:2,color:3});
 // Do not invoke replacement platform getters/constructors during admission.
 const data=(object,key)=>object && descriptor(object,key)?.value;
 const wasm=data(globalThis,'WebAssembly');
@@ -79,7 +83,7 @@ function flatShading(material) {
 export function createMarchingCubesDispatch(base64,edgeTable,triTable) {
   if (typeof base64!=='string' || base64.length>1024*1024) throw new TypeError('Expected bounded compiled Wasm');
   const token=Object.freeze({});
-  dispatches.set(token,{base64,edgeTable,triTable,attempted:false,kernel:null,initializationFailure:null});
+  dispatches.set(token,{base64,edgeTable,triTable,resultPrefixWidths:vertexWidths,attempted:false,kernel:null,initializationFailure:null});
   return token;
 }
 function kernelFor(record) {
@@ -89,7 +93,8 @@ function kernelFor(record) {
       const binary=apply(decode,globalThis,[record.base64]),bytes=new U8(binary.length);
       for (let k=0;k<binary.length;k++) bytes[k]=apply(charCodeAt,binary,[k]);
       // Independent storage is essential: do NOT enable preserveAliasing.
-      record.kernel=instantiateNumericKernel(bytes,{resolveMath:record.resolveMath??null});
+      record.kernel=instantiateNumericKernel(bytes,{resolveMath:record.resolveMath??null,
+        resultPrefixWidths:record.resultPrefixWidths??null});
     } catch {
       // Host policy may throw arbitrary values with effectful accessors.
       record.initializationFailure='MARCHING_CUBES_INITIALIZATION';
