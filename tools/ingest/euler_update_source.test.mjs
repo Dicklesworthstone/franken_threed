@@ -169,18 +169,18 @@ test('production source-import builds keep Euler updates after relocation with a
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'f3d-source-euler-')),entry=path.join(root,'application.mjs'),out=path.join(root,'built');
   const body=`export function run(){const group=new Group();
     for(let i=0;i<12;i++){const child=new Object3D();child.rotation.set(i/19,.2,-.3);
-      child.userData.speed=new Euler(.01,i/37,-.2);group.add(child);}
+      child.userData.speed=i%2?new Vector3(.01,i/37,-.2):new Euler(.01,i/37,-.2);group.add(child);}
     ${loop}
     const dt=.03125;group.children.reverse();${loop.replace('speed.x','speed.x*dt').replace('speed.y','dt*speed.y').replace('speed.z','speed.z/dt')}
     return group.children.map(child=>[child.rotation.toArray(),child.quaternion.toArray()]);}`;
   fs.writeFileSync(entry,`import {Group} from 'three/src/objects/Group.js';
-    import {Object3D} from 'three/src/core/Object3D.js';import {Euler} from 'three/src/math/Euler.js';${body}`);
+    import {Object3D} from 'three/src/core/Object3D.js';import {Euler} from 'three/src/math/Euler.js';import {Vector3} from 'three/src/math/Vector3.js';${body}`);
   const built=await buildApplication(entry,out,{specializeNumeric:true,packageRootUrl:pathToFileURL(upstream+path.sep).href});
   const report=JSON.parse(fs.readFileSync(path.join(out,fs.readdirSync(out).find(name=>name.includes('numeric')&&name.endsWith('.json'))),'utf8'));
   assert.equal(report.libraryKernels.eulerUpdates.compiledModules,1);
   assert.equal(report.libraryKernels.eulerUpdates.compiledLoops,2);
   assert.equal(report.libraryKernels.eulerUpdates.modules.find(record=>record.kind==='pinned-euler-kernel').role,'Object3D');
-  const oracle=await import('data:text/javascript;base64,'+Buffer.from(`import {Group,Object3D,Euler} from ${JSON.stringify(
+  const oracle=await import('data:text/javascript;base64,'+Buffer.from(`import {Group,Object3D,Euler,Vector3} from ${JSON.stringify(
     pathToFileURL(path.join(upstream,'src/Three.Core.js')).href)};${body}`).toString('base64'));
   const relocated=path.join(root,'relocated');fs.renameSync(out,relocated);fs.renameSync(entry,path.join(root,'original-application.mjs'));
   const module=pathToFileURL(path.join(relocated,built.entryFiles[0])).href,expected=oracle.run();

@@ -40,7 +40,7 @@ const scaledLoop=`for(let i=0;i<group.children.length;i++){
 const sourceScaled=new Function('group','dt',scaledLoop);
 async function fixture(options={}){
   const entry='\0euler-update-fixture',plugin=marchingCubesRollupPlugin(options);
-  const text='export {Object3D,Group,Mesh,Euler,Quaternion,BufferGeometry,MeshBasicMaterial} from '+
+  const text='export {Object3D,Group,Mesh,Vector3,Euler,Quaternion,BufferGeometry,MeshBasicMaterial} from '+
     JSON.stringify(path.join(upstream,'build/three.core.js'))+';'+
     'export {eulerUpdateDiagnostics as diagnostics} from '+JSON.stringify('\0f3d-euler-update-adapter')+';'+
     'let group;const api={count:0};export function update(next,count){group=next;api.count=count;'+originalLoop+'}\n'+
@@ -121,6 +121,35 @@ test('frame-scaled updates reread the step each call and preserve operand order 
   }
   assert.equal(f.api.diagnostics(f.actual).wasmCalls,5);
   assert.equal(f.api.diagnostics(f.actual).objects,150);
+});
+
+test('pinned Vector3 and Euler velocities may mix in one frame-scaled transaction',()=>{
+  const f=pair(compiled.api,30);
+  for(const [api,root] of [[f.api,f.actual],[reference,f.expected]]){
+    const shared=new api.Vector3(-.5,.375,4);
+    for(let i=0;i<root.children.length;i+=2)root.children[i].userData.rotationSpeed=shared;
+  }
+  f.api.scaled(f.actual,.25);sourceScaled(f.expected,.25);same(f.actual,f.expected);
+  advance(f);
+  assert.equal(f.api.diagnostics(f.actual).wasmCalls,2);assert.equal(f.api.diagnostics(f.actual).objects,60);
+});
+
+test('foreign and accessor-backed Vector3 velocities preserve source observations',()=>{
+  for(const mode of ['proxy','getter','coercion']){
+    const f=pair(),calls=[0,0];
+    for(const [index,[api,root]] of [[f.api,f.actual],[reference,f.expected]].entries()){
+      const speed=new api.Vector3(.125,.25,-1);
+      if(mode==='getter')Object.defineProperty(speed,'x',{get(){calls[index]++;return .75;}});
+      if(mode==='coercion')speed.x={valueOf(){calls[index]++;return .5;}};
+      root.children[1].userData.rotationSpeed=mode==='proxy'?new Proxy(speed,{
+        get(target,key){calls[index]++;return Reflect.get(target,key);},
+        getOwnPropertyDescriptor(){assert.fail('probed foreign velocity');},
+      }):speed;
+    }
+    f.api.scaled(f.actual,.5);sourceScaled(f.expected,.5);same(f.actual,f.expected);
+    assert.deepEqual(calls,mode==='proxy'?[3,3]:[2,2]);
+    assert.equal(f.api.diagnostics(f.actual).wasmCalls,0);
+  }
 });
 
 test('a coercing frame step keeps the original per-axis reads and effects',()=>{

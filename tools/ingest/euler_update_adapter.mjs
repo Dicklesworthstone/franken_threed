@@ -3,7 +3,7 @@
  * Packing and identity-preserving publication are included; no speed claim. */
 import {instantiateNumericKernel} from './numeric_kernel_runtime.mjs';
 import {matrixNumericPlatformIntact} from './matrix_multiply_adapter.mjs';
-import {isTransformChildren} from './transform_batch_adapter.mjs';
+import {isTransformChildren,isTransformNumeric} from './transform_batch_adapter.mjs';
 import {isNumericObject} from './numeric_objects.mjs';
 const host=globalThis,apply=Reflect.apply,descriptor=Object.getOwnPropertyDescriptor,prototype=Object.getPrototypeOf;
 const hasOwn=Object.hasOwn,freeze=Object.freeze,create=Object.create,source=Function.prototype.toString;
@@ -78,6 +78,15 @@ function numeric(object,name,record,writable=false){
   }
   return {cls,values};
 }
+function velocityValues(speed){
+  // Pinned Vector3 allocations store their public components as own values.
+  // Accept only those cells. Replaced accessors must run in the source loop.
+  if(isTransformNumeric(speed)){
+    const x=data(speed,'x'),y=data(speed,'y'),z=data(speed,'z');
+    if(typeof x==='number' && typeof y==='number' && typeof z==='number')return [x,y,z];
+  }
+  return numeric(speed,'Euler',null,false)?.values;
+}
 function method(object,key,cls){
   const value=descriptor(object,key)??descriptor(cls.proto,key),expected=cls.properties[key];
   return !!value && hasOwn(value,'value') && value.value===expected?.value && typeof value.value==='function';
@@ -116,12 +125,12 @@ function input(group,bound,plan,scale){
       if(j>0 && !apply(has,dataObjects,[speed]))return null;
       speed=data(speed,plan.path[j]);
     }
-    const velocity=numeric(speed,'Euler',null,false);if(!velocity)return null;
+    const velocity=velocityValues(speed);if(!velocity)return null;
     speeds[i]=speed;
     const offset=i*17,ops=plan.operations,angles=[];
     for(let j=0;j<3;j++){
       state[offset+j]=euler.values[j];
-      const delta=velocity.values[ops[j*3+1]],mode=plan.scales[j];
+      const delta=velocity[ops[j*3+1]],mode=plan.scales[j];
       const step=mode==='none'?delta:mode==='multiply'?delta*scale:mode==='divide'?delta/scale:scale*delta;
       state[offset+j+3]=step;
       angles[j]=term(euler.values[ops[j*3]],step,ops[j*3+2]);

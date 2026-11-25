@@ -26,6 +26,7 @@ export function registerTransformNumeric(object){apply(weakAdd,numbers,[object])
 export function registerTransformChildren(array){apply(weakAdd,arrays,[array]);return array;}
 // Shared by source update islands; inspection never invokes a Proxy trap.
 export function isTransformChildren(array){return apply(weakHas,arrays,[array]);}
+export function isTransformNumeric(object){return apply(weakHas,numbers,[object]);}
 export function createTransformBatchDispatch(base64,stride,maxMemoryPages,Matrix4){
   const token=freeze({});
   const classes=create(null);
