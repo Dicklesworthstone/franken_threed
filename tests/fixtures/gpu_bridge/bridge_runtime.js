@@ -673,9 +673,6 @@ export class WebGpuBridgeHost {
               } else {
                 throw new Error(`Invalid texture formatCode: ${formatCode}`);
               }
-              if (isMultisampledCommand && isDepth) {
-                throw new Error("CreateTextureMultisampled: depth textures are not implemented");
-              }
 
               const texture = this.device.createTexture({
                 size: [width, height, 1],

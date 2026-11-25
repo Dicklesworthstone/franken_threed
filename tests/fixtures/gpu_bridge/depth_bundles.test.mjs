@@ -241,7 +241,18 @@ for (const depthFormat of ["depth24plus", "depth32float"]) {
   for (const readOnly of [false, true]) {
     test(`4x ${depthFormat} resolve preserves bundles, direct rebind and readOnly=${readOnly}`, async () => {
       const f = fixture({ depthFormat, depthWriteEnabled: !readOnly, sampleCount: 4 });
-      await f.host.executePacket(packet([recordBundle({ batch: true })]));
+      f.host.textures.clear();
+      f.host.device.createTexture = ({size, format, usage, sampleCount}) => ({
+        width: size[0], height: size[1], format, usage, sampleCount,
+        createView() { return {texture: this}; },
+      });
+      await f.host.executePacket(packet([
+        [23, [10, 64, 64, 2, 16, 4]],
+        [6, [11, 64, 64, 2, 17]],
+        [23, [99, 64, 64, depthFormat === "depth24plus" ? 3 : 4, 16, 4]],
+        recordBundle({ batch: true }),
+      ]));
+      assert.equal(f.host.lastRenderTargetId, 11, "depth allocation preserves the color output");
       await f.host.executePacket(packet([
         depthPass(0, { readOnly, resolve: true }), executeBundles(),
         depthPass(3, { newPass: false, readOnly, resolve: true }),
@@ -250,8 +261,8 @@ for (const depthFormat of ["depth24plus", "depth32float"]) {
       assert.equal(f.descriptors[0].depthStencilFormat, depthFormat);
       assert.equal(f.descriptors[0].depthReadOnly, readOnly);
       assert.equal(f.passes.length, 1, "resolve occurs after both the bundle and direct draw");
-      assert.equal(f.passes[0].colorAttachments[0].resolveTarget.id, 11);
-      assert.equal(f.passes[0].depthStencilAttachment.view.id, 99);
+      assert.equal(f.passes[0].colorAttachments[0].resolveTarget.texture, f.host.textures.get(11));
+      assert.equal(f.passes[0].depthStencilAttachment.view.texture, f.host.textures.get(99));
       assert.equal("depthLoadOp" in f.passes[0].depthStencilAttachment, !readOnly);
       assert.equal(f.host.lastRenderTargetId, 11);
       assert.deepEqual(f.events.filter(([name]) => name === "pass:draw"), [["pass:draw", 3, 1, 0, 0]]);
