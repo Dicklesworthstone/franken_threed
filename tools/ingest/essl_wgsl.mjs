@@ -1077,7 +1077,7 @@ class Unit {
         const r = this.expr(e, ctx);
         if (!r.c) return [];
         if (e.k === 'call' && r.t.k === 'void') return [`${r.c};`];
-        if (e.k === 'call' && this.isUserCall(e)) return [`_ = ${r.c};`];
+        if (this.impure(e)) return [`_ = ${r.c};`];
         return []; // pure expression statement: no effect
       }
     }
@@ -1099,12 +1099,12 @@ class Unit {
       lv.swizzle.forEach((comp, i) => {
         const src = value.t.k === 'v' ? `${t}.${'xyzw'[i]}` : t;
         lines.push(binop === null ? `${lv.base}.${comp} = ${src};`
-          : `${lv.base}.${comp} = ${this.binaryCode(binop, {c: `${lv.base}.${comp}`, t: S(scalarOf(lv.t))}, {c: src, t: S(scalarOf(value.t))}, line).c};`);
+          : `${lv.base}.${comp} = ${this.binaryCode(binop, {c: `${lv.base}.${comp}`, t: S(scalarOf(lv.t))}, {c: src, t: S(scalarOf(value.t))}, line, ctx).c};`);
       });
       return ['{', ...lines.map(x => '  ' + x), '}'];
     }
     if (binop === null) return [`${lv.c} = ${value.c};`];
-    const r = this.binaryCode(binop, {c: lv.c, t: lv.t}, value, line);
+    const r = this.binaryCode(binop, {c: lv.c, t: lv.t}, value, line, ctx);
     return [`${lv.c} = ${r.c};`];
   }
   lvalue(e, ctx, indices = null) {
@@ -1431,13 +1431,14 @@ class Unit {
       return {c: tmp, t: BOOL};
     }
     const [a, b] = this.sequence(ctx, [() => this.expr(e.a, ctx), () => this.expr(e.b, ctx)]);
-    const result = this.binaryCode(e.op, a, b, e.line);
+    const constantOperands = (isMat(a.t) || isMat(b.t)) && this.constEvaluable(e, ctx.scope);
+    const result = this.binaryCode(e.op, a, b, e.line, ctx, constantOperands);
     // User-defined WGSL helper calls are not module constant expressions.
     // Existing entry initialization also handles constants depending on them.
     ctx.runtime ||= result.runtime;
     return result;
   }
-  binaryCode(op, a, b, line) {
+  binaryCode(op, a, b, line, ctx, constantOperands = false) {
     const ta = a.t, tb = b.t;
     switch (op) {
       case '^^': return {c: `(${a.c} != ${b.c})`, t: BOOL};
@@ -1463,16 +1464,16 @@ class Unit {
         let t;
         if (ta.k === 'm' && tb.k === 'm') {
           if (op === '*') { if (ta.c !== tb.r) essError('Matrix size mismatch', line); t = M(tb.c, ta.r); }
-          else if (op === '/') return {c: this.helperMatDiv(a, b), t: ta};
+          else if (op === '/') return {c: this.helperMatDiv(a, b, ctx, constantOperands), t: ta};
           else t = ta;
         } else if (ta.k === 'm' && tb.k === 'v') { if (op !== '*') essError('Bad matrix-vector operator', line); t = V('float', ta.r); }
         else if (ta.k === 'v' && tb.k === 'm') { if (op !== '*') essError('Bad vector-matrix operator', line); t = V('float', tb.c); }
         else if (ta.k === 'm' && tb.k === 's') {
           if (op === '/') return {c: `(${a.c} * (1.0 / ${b.c}))`, t: ta};
-          if (op === '+' || op === '-') return {c: this.matScalar(op, a, b, false), t: ta};
+          if (op === '+' || op === '-') return {c: this.matScalar(op, a, b, false, ctx, constantOperands), t: ta};
           t = ta;
         } else if (ta.k === 's' && tb.k === 'm') {
-          if (op === '+' || op === '-' || op === '/') return {c: this.matScalar(op, b, a, true), t: tb};
+          if (op === '+' || op === '-' || op === '/') return {c: this.matScalar(op, b, a, true, ctx, constantOperands), t: tb};
           t = tb;
         } else {
           if (scalarOf(ta) !== scalarOf(tb) || scalarOf(ta) === 'bool') essError(`Operator ${op} on ${glslName(ta)} and ${glslName(tb)}`, line);
@@ -1513,11 +1514,22 @@ class Unit {
     }
     return `${name}(${left}, ${right})`;
   }
-  matScalar(op, m, s, scalarFirst) {
+  matScalar(op, m, s, scalarFirst, ctx, constantOperands) {
+    // Per-column expansion must not repeat calls or reread operands after a
+    // later source operand mutates them. Constants stay valid in case labels
+    // and texture offsets; other operands are snapshotted in source order.
+    if (!constantOperands) {
+      const first = this.capture(scalarFirst ? s : m, ctx, true);
+      const second = this.capture(scalarFirst ? m : s, ctx, true);
+      m = scalarFirst ? second : first; s = scalarFirst ? first : second;
+    }
     const cols = Array.from({length: m.t.c}, (_, i) => scalarFirst ? `(${s.c} ${op} ${m.c}[${i}])` : `(${m.c}[${i}] ${op} ${s.c})`);
     return `mat${m.t.c}x${m.t.r}<f32>(${cols.join(', ')})`;
   }
-  helperMatDiv(a, b) {
+  helperMatDiv(a, b, ctx, constantOperands) {
+    if (!constantOperands) {
+      a = this.capture(a, ctx, true); b = this.capture(b, ctx, true);
+    }
     const cols = Array.from({length: a.t.c}, (_, i) => `(${a.c}[${i}] / ${b.c}[${i}])`);
     return `mat${a.t.c}x${a.t.r}<f32>(${cols.join(', ')})`;
   }
@@ -1617,8 +1629,8 @@ class Unit {
       return {c: `${wt}(${args.map(a => convertScalar(a, 'float')).join(', ')})`, t: type};
     return this.flattenCtor(type, args, ctx, line);
   }
-  capture(r, ctx) {
-    if (isTrivialCode(r.c)) return r;
+  capture(r, ctx, force = false) {
+    if (!force && isTrivialCode(r.c)) return r;
     const t = this.tmp(); ctx.pre.push(`let ${t} = ${r.c};`); return {c: t, t: r.t};
   }
 

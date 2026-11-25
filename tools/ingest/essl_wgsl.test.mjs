@@ -12,6 +12,92 @@ const F = (body, decls = '') => `#version 300 es\nprecision highp float;\nlayout
 const program = (vs, fs) => compileEsslProgram(vs, fs);
 const minimalVS = V('gl_Position = mvp * vec4(position, 1.0);');
 
+// Execute only emitted expression/control-flow scheduling with instrumented
+// callees. Constructors are placeholders; this does not emulate GPU arithmetic.
+function expressionEffects(wgsl, values) {
+  const prefix = /fn main_\(\) \{\n([\s\S]*?)  color =/.exec(wgsl)[1];
+  const code = prefix.replace(/\bvar (\w+): (?:mat[234]x[234]<f32>|bool|f32|i32)/g, 'let $1')
+    .replace(/\b(?:mat[234]x[234]|vec[234])<f32>/g, 'construct')
+    .replace(/\b_\s*=/g, 'void');
+  Function('construct', 'sin', ...Object.keys(values), code)(
+    (...args) => args, Math.sin, ...Object.values(values));
+}
+
+test('discarded expressions retain nested calls and conditional execution', () => {
+  const declarations = 'float bump(){return 1.0;} bool hit(){return true;}';
+  for (const [statement, expected] of [
+    ['sin(bump());', ['bump']], ['vec2(bump());', ['bump']],
+    ['bump() + 1.0;', ['bump']], ['-bump();', ['bump']],
+    ['bump() > 0.0;', ['bump']], ['(bump(), bump() + 1.0);', ['bump', 'bump']],
+    ['true ? bump() : bump();', ['bump']], ['false ? bump() : bump();', ['bump']],
+    ['false && hit();', []], ['true || hit();', []],
+    ['true && hit();', ['hit']], ['false || hit();', ['hit']],
+  ]) {
+    const wgsl = compileEsslStage('fragment', F(statement + 'color = vec4(1.0);', declarations));
+    const calls = [];
+    expressionEffects(wgsl, {bump: () => { calls.push('bump'); return 1; },
+      hit: () => { calls.push('hit'); return true; }});
+    assert.deepEqual(calls, expected, statement);
+  }
+  const marker = new Error('source fragment discarded');
+  const wgsl = compileEsslStage('fragment', F('sin(stop()); color = vec4(1.0);',
+    'float stop(){discard; return 1.0;}'));
+  assert.throws(() => expressionEffects(wgsl, {stop: () => { throw marker; }}), error => error === marker);
+});
+
+test('matrix component expansion evaluates each operand once in source order', () => {
+  for (const columns of [2, 3, 4]) for (const rows of [2, 3, 4]) {
+    const type = 'mat' + columns + 'x' + rows;
+    const declarations = type + ' matrixValue(){return ' + type + '(1.0);}\n' +
+      type + ' otherMatrix(){return ' + type + '(2.0);}\nfloat scalarValue(){return 3.0;}';
+    const expressions = [
+      ['matrixValue() + scalarValue()', ['matrix', 'scalar']],
+      ['matrixValue() - scalarValue()', ['matrix', 'scalar']],
+      ['scalarValue() + matrixValue()', ['scalar', 'matrix']],
+      ['scalarValue() - matrixValue()', ['scalar', 'matrix']],
+      ['scalarValue() / matrixValue()', ['scalar', 'matrix']],
+      ['matrixValue() / otherMatrix()', ['matrix', 'other']],
+    ];
+    for (const [expression, expected] of expressions) for (const active of [true, false]) {
+      const body = type + ' result = ' + (active ? expression : 'false ? (' + expression + ') : ' + type + '(1.0)') + ';';
+      const wgsl = compileEsslStage('fragment', F(body + 'color = vec4(result[0][0]);', declarations));
+      const calls = [], matrix = Array(columns).fill(2);
+      expressionEffects(wgsl, {matrixValue: () => { calls.push('matrix'); return matrix; },
+        otherMatrix: () => { calls.push('other'); return matrix; },
+        scalarValue: () => { calls.push('scalar'); return 3; }});
+      assert.deepEqual(calls, active ? expected : [], type + ': ' + body);
+    }
+    for (const [operator, right, expected] of [
+      ['+=', 'scalarValue()', ['matrix', 'scalar']],
+      ['-=', 'scalarValue()', ['matrix', 'scalar']],
+      ['/=', 'otherMatrix()', ['matrix', 'other']],
+    ]) {
+      const wgsl = compileEsslStage('fragment', F(type + ' result = matrixValue(); result ' + operator + ' ' + right + '; color = vec4(1.0);', declarations));
+      const calls = [], matrix = Array(columns).fill(2);
+      expressionEffects(wgsl, {matrixValue: () => { calls.push('matrix'); return matrix; },
+        otherMatrix: () => { calls.push('other'); return matrix; },
+        scalarValue: () => { calls.push('scalar'); return 3; }});
+      assert.deepEqual(calls, expected, type + ' ' + operator);
+    }
+  }
+});
+
+test('constant matrix arithmetic remains usable in switch labels and texture offsets', () => {
+  for (const global of [false, true]) for (const expression of [
+    'mat2(1.0) + 1.0', '1.0 + mat2(1.0)', 'mat2(1.0) - 1.0',
+    '1.0 - mat2(1.0)', '2.0 / mat2(1.0, 2.0, 2.0, 1.0)',
+    'mat2(2.0, 4.0, 4.0, 2.0) / mat2(1.0, 2.0, 2.0, 1.0)',
+  ]) {
+    const declaration = 'const mat2 offset = ' + expression + ';';
+    const body = (global ? '' : declaration) +
+      'switch(0){case int(offset[0][0]): break; default: break;}' +
+      'color = textureOffset(image, vec2(.5), ivec2(offset[0]));';
+    const wgsl = compileEsslStage('fragment', F(body, 'uniform sampler2D image;' + (global ? declaration : '')));
+    assert.match(wgsl, /const offset: mat2x2<f32> =/);
+    assert.match(wgsl, /textureSample\(image_texture, image_sampler, .*vec2<i32>/);
+  }
+});
+
 test('integer builtin selectors retain signed and unsigned boundary semantics', () => {
   for (const [index, expected] of [
     ['sign(-8) + 1', 0], ['sign(0)', 0], ['sign(8)', 1],
