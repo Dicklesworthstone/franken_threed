@@ -197,3 +197,70 @@ test('device errors, loss and cancellation reject completion and release resourc
   const idle = cancelled.owner.whenIdle(); controller.abort(new Error('cancelled'));
   await assert.rejects(idle, /cancelled/); assert.equal(cancelled.owner.allocatedBytes, 0);
 });
+
+for (const failedScope of [0, 1]) {
+  test(`storage scope ${failedScope} failure settles validation and idle while the sibling and queue are pending`, async t => {
+    const sibling = deferred(), completion = deferred();
+    const {device, owner, texture} = setup({completion});
+    t.after(() => owner.dispose());
+    const reports = [sibling.promise, sibling.promise];
+    reports[failedScope] = Promise.resolve({message: 'storage allocation invalid'});
+    device.popErrorScope = () => reports.shift();
+    owner.ensure(owner.capture(texture));
+    const validation = owner.validation, idle = owner.whenIdle();
+    const outcomes = await Promise.race([
+      Promise.allSettled([validation, idle]),
+      new Promise(resolve => setImmediate(() => resolve(null))),
+    ]);
+    assert.ok(outcomes, 'a reported error must not wait for another scope or queue completion');
+    for (const outcome of outcomes) {
+      assert.equal(outcome.status, 'rejected');
+      assert.equal(outcome.reason.code, 'THREE_STORAGE_TEXTURE_GPU');
+      assert.match(outcome.reason.message, /storage allocation invalid/);
+    }
+    assert.equal(owner.allocatedBytes, 0); assert.equal(owner.size, 0);
+    assert.equal(device.textures[0].destroyed, 1); assert.equal(texture.listeners.size, 0);
+    sibling.reject(new Error('late scope rejection')); completion.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+    await assert.rejects(owner.whenIdle(), /storage allocation invalid/);
+    owner.dispose(); assert.equal(device.textures[0].destroyed, 1);
+  });
+}
+
+test('storage transfer failure does not wait for a pending producer validation', async t => {
+  const {device, owner, texture} = setup(), producer = deferred();
+  t.after(() => owner.dispose());
+  texture.generateMipmaps = false;
+  const entry = owner.ensure(owner.capture(texture));
+  await owner.whenIdle();
+  device.validationError('invalid destination transfer');
+  let calls = 0;
+  owner.withTexture(entry, () => { calls++; }, null, {validation: producer.promise});
+  const outcome = await Promise.race([
+    owner.validation.then(() => null, error => error),
+    new Promise(resolve => setImmediate(() => resolve(null))),
+  ]);
+  assert.match(outcome?.message ?? '', /invalid destination transfer/);
+  assert.equal(calls, 1); assert.equal(owner.allocatedBytes, 0);
+  producer.reject(new Error('late producer rejection'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(device.textures[0].destroyed, 1);
+});
+
+test('successful storage scopes still wait for producer validation and GPU completion', async t => {
+  const completion = deferred(), producer = deferred();
+  const {owner, texture} = setup({completion});
+  t.after(() => owner.dispose());
+  texture.generateMipmaps = false;
+  const entry = owner.ensure(owner.capture(texture));
+  owner.withTexture(entry, () => {}, null, {validation: producer.promise});
+  let validated = false, idle = false;
+  const validation = owner.validation.then(() => { validated = true; });
+  const finished = owner.whenIdle().then(() => { idle = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(validated, false); assert.equal(idle, false);
+  producer.resolve(); await validation;
+  assert.equal(idle, false); assert.ok(owner.allocatedBytes > 0);
+  completion.resolve(); await finished;
+  assert.equal(idle, true);
+});

@@ -53,11 +53,14 @@ export function createThreeTimestampQueries({getDevice, enabled, signal = null, 
     d.pushErrorScope('out-of-memory'); d.pushErrorScope('validation');
     let value, error;
     try { value = run(); } catch (cause) { error = cause; }
-    const validation = Promise.all([d.popErrorScope(), d.popErrorScope()]).then(errors => {
-      if (error) throw error;
-      const invalid = errors.find(Boolean);
-      if (invalid) throw new ThreeTimestampError('GPU', invalid.message ?? 'GPU timestamp validation failed');
-    });
+    const scopes = [d.popErrorScope(), d.popErrorScope()];
+    // A failed query or resolve must release pending readbacks even when a
+    // sibling scope never settles. No timestamp is published until all pass.
+    const validation = Promise.all([error ? Promise.reject(error) : null,
+      ...scopes.map(scope => Promise.resolve(scope).then(invalid => {
+        if (invalid) throw new ThreeTimestampError('GPU', invalid.message ?? 'GPU timestamp validation failed');
+      })),
+    ]).then(() => {});
     validation.catch(stop);
     if (error) throw error;
     return {value, validation};

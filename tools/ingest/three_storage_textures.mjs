@@ -150,9 +150,12 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     try { return run(d); }
     catch (error) { stop(error); throw error; }
     finally {
-      const task = Promise.all([d.popErrorScope(), d.popErrorScope(), validation]).then(([invalid, oom]) => {
-        const error = invalid || oom; if (error) throw new ThreeStorageTextureError('GPU', error.message);
-      }).catch(error => { stop(error); throw error; });
+      const scopes = [d.popErrorScope(), d.popErrorScope()];
+      // A reported destination failure must not wait for another native scope
+      // or an unfinished producer. Successful work still joins every check.
+      const task = Promise.all([validation, ...scopes.map(scope => Promise.resolve(scope).then(error => {
+        if (error) throw new ThreeStorageTextureError('GPU', error.message);
+      }))]).then(() => {}).catch(error => { stop(error); throw error; });
       pending.add(task); task.finally(() => pending.delete(task)).catch(() => {});
     }
   }

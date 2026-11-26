@@ -99,3 +99,38 @@ test('delayed validation of a measured pass must succeed before timestamps becom
   assert.equal(f.owner.pendingCount, 0);
   assert.ok(f.queries.every(query => query.destroyed));
 });
+
+for (const phase of ['query', 'resolve']) for (const scope of ['validation', 'out-of-memory']) {
+  test(`${phase} timestamp ${scope} failure rejects pending mapping without waiting for a sibling scope`, async t => {
+    const f = fixture(t), sibling = deferred(), mapping = deferred();
+    f.d.map = mapping.promise;
+    const originalPop = f.d.popErrorScope;
+    let failed = false;
+    f.d.popErrorScope = () => {
+      const active = f.d.scopes.at(-1);
+      const result = originalPop();
+      if (phase === 'query' ? f.buffers.length === 0 : f.buffers.length > 0) {
+        if (active === scope) { failed = true; return Promise.resolve({message: 'invalid timestamp work'}); }
+        return sibling.promise;
+      }
+      return result;
+    };
+    f.owner.begin('render', 'r:1:f1').writes();
+    const result = f.owner.resolve();
+    const outcome = await Promise.race([
+      result.then(() => null, error => error),
+      new Promise(resolve => setImmediate(() => resolve(null))),
+    ]);
+    assert.equal(failed, true);
+    assert.match(outcome?.message ?? '', /invalid timestamp work/);
+    assert.equal(f.owner.pendingCount, 0);
+    assert.equal(f.owner.hasTimestampQuery('r:1:f1'), false);
+    assert.deepEqual(f.owner.getTimestampFrames('render'), []);
+    assert.ok(f.queries.every(query => query.destroyed));
+    assert.ok(f.buffers.every(buffer => buffer.destroyed && !buffer.unmapped));
+    sibling.reject(new Error('late scope failure')); mapping.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.owner.hasTimestampQuery('r:1:f1'), false);
+    assert.throws(() => f.owner.begin('render', 'r:2:f2'), /invalid timestamp work/);
+  });
+}
