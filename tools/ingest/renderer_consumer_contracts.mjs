@@ -1,6 +1,6 @@
 /**
- * Source-verified ownership summaries for retained camera controls, inspectors
- * and standard postprocessing passes (r186, 148ef33ecb6d2502ff796d4554abd1549c95d519).
+ * Source-verified ownership summaries for retained camera controls, inspectors,
+ * render pipelines and postprocessing passes (r186, 148ef33ecb6d2502ff796d4554abd1549c95d519).
  * These objects retain their canvas or renderer. Callers must track the
  * returned instances, inherited methods and callbacks; this is not a generic
  * exemption for imported calls.
@@ -33,6 +33,7 @@ const BUILDS = new Set([
 const BASE_EXPORTS = new Set(['Controls', 'EventDispatcher', 'Renderer', 'CanvasTarget', 'InspectorBase']);
 const RENDERER_INSPECTOR = 'sha256:4252223601805bb32df911328e1626c3161284b5211d95ad399865d880dbeeae';
 const TSL = 'sha256:6e6b92d8ce467818944f73815a96abadc6392fb34de577d479a23810b6aeeed0';
+export const RENDER_PIPELINE_EXPORTS = new Set(['RenderPipeline', 'DirectRenderPipeline', 'PostProcessing']);
 
 /** Return contracts only for a completely analyzed graph and verified imports.
  * The analyzer's default remains conservative when this proof is unavailable.
@@ -50,6 +51,16 @@ export function verifiedRendererConsumerContracts(modules, {externalModules = []
     if (BUILDS.has(mod.content_hash) && mod.static_imports.length > 0 &&
         mod.static_imports.every(request => cores.has(request.resolved_id))) bases.add(id);
   }
+  const pipelineBuilds = new Set([...bases].filter(id => modules.get(id).content_hash === WEBGPU));
+  // Only an existing application ownership boundary needs this additional
+  // contract. Ordinary renderer apps must not acquire unrelated consumer
+  // restrictions simply because their build also exports pipeline classes.
+  const pipelineBoundary = [...modules].some(([id, mod]) => !bases.has(id) && mod.routing_facts?.has_opaque_gl_escapes) &&
+    [...modules].some(([id, mod]) => !bases.has(id) && mod.static_imports.some(request =>
+      pipelineBuilds.has(request.resolved_id) && request.imported_bindings?.some(binding =>
+        binding.type === 'namespace' || RENDER_PIPELINE_EXPORTS.has(binding.imported))));
+  const pipelines = pipelineBoundary ? pipelineBuilds : new Set();
+  contracts.pipelineSources = pipelineBuilds;
   const controls = new Map();
   for (const [id, mod] of modules) {
     const source = CONTROL_SOURCES.get(mod.content_hash);
@@ -84,10 +95,11 @@ export function verifiedRendererConsumerContracts(modules, {externalModules = []
   contracts.retainedSources = new Map([...controls].map(([id, source]) => [id, {...source}]));
   for (const id of inspectors)
     contracts.retainedSources.set(id, {name: 'RendererInspector', role: 'renderer-inspector'});
-  if (!controls.size && !passes.size && !computations.size && !inspectors.size) return contracts;
+  if (!controls.size && !passes.size && !computations.size && !inspectors.size && !pipelines.size) return contracts;
 
   const role = (id, name) => inspectors.has(id) && name === 'RendererInspector' ? 'renderer-inspector' :
     computations.has(id) && name === 'GPUComputationRenderer' ? 'gpu-computation' :
+    pipelines.has(id) && RENDER_PIPELINE_EXPORTS.has(name) ? 'render-pipeline' :
     passes.get(id)?.exports[name] ?? (controls.get(id)?.name === name ? controls.get(id).role :
     bases.has(id) && BASE_EXPORTS.has(name) ? 'base' :
     bases.has(id) && name === 'WebGPURenderer' ? 'webgpu' :
@@ -102,7 +114,7 @@ export function verifiedRendererConsumerContracts(modules, {externalModules = []
           if (controls.has(request.resolved_id)) namespaces.set(binding.local, controls.get(request.resolved_id).role);
           else if (computations.has(request.resolved_id)) namespaces.set(binding.local, 'gpu-computation');
           else if (inspectors.has(request.resolved_id)) namespaces.set(binding.local, 'renderer-inspector');
-          else if (bases.has(request.resolved_id)) namespaces.set(binding.local, 'base');
+          else if (bases.has(request.resolved_id)) namespaces.set(binding.local, pipelines.has(request.resolved_id) ? 'pipeline-base' : 'base');
         } else {
           const kind = role(request.resolved_id, binding.imported);
           if (kind) bindings.set(binding.local, kind);

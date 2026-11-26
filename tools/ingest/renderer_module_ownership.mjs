@@ -7,7 +7,7 @@ import {rollup} from 'rollup';
 import {createHash} from 'node:crypto';
 import {analyzeModuleAst} from './ast_analyzer.mjs';
 import {isInternalLibraryModule} from './route_bridge.mjs';
-import {verifiedRendererConsumerContracts} from './renderer_consumer_contracts.mjs';
+import {verifiedRendererConsumerContracts, RENDER_PIPELINE_EXPORTS} from './renderer_consumer_contracts.mjs';
 
 // Immutable r186 build bytes, also recorded in evidence/01.1/build_sha256.txt.
 // A path or a matching export name cannot establish a library boundary.
@@ -36,7 +36,9 @@ export async function closeRendererModuleOwnership(modules, sourceInputs, roots,
   {packageRootUrl, externalModules = []} = {}) {
   if (roots.length !== 1 || externalModules.size || externalModules.length) return false;
   const library = new Set(), application = new Map();
-  const consumers = verifiedRendererConsumerContracts(modules, {externalModules}).retainedSources ?? new Map();
+  const verifiedConsumers = verifiedRendererConsumerContracts(modules, {externalModules});
+  const consumers = verifiedConsumers.retainedSources ?? new Map();
+  const pipelines = verifiedConsumers.pipelineSources ?? new Set();
   let sourceBytes = 0, hasBoundary = false;
   for (const [id, mod] of modules) {
     if (isInternalLibraryModule(id, packageRootUrl)) {
@@ -125,13 +127,15 @@ export async function closeRendererModuleOwnership(modules, sourceInputs, roots,
       const source = consumers.get(id);
       if (source) return source.name === name ? source.role : null;
       if (!library.has(id)) return null;
+      if (pipelines.has(id) && RENDER_PIPELINE_EXPORTS.has(name)) return 'render-pipeline';
       return name === 'WebGPURenderer' ? 'webgpu' : name === 'WebGLRenderer' ? 'webgl' :
         ['Controls', 'EventDispatcher', 'Renderer', 'CanvasTarget', 'InspectorBase'].includes(name) ? 'base' : null;
     };
     for (const request of imports.staticImports) {
       if (!boundary(request.specifier)) return false;
       for (const binding of request.imported_bindings) {
-        if (binding.type === 'namespace') contract.namespaces.set(binding.local, consumers.get(request.specifier)?.role ?? 'base');
+        if (binding.type === 'namespace') contract.namespaces.set(binding.local,
+          consumers.get(request.specifier)?.role ?? (pipelines.has(request.specifier) ? 'pipeline-base' : 'base'));
         else if (role(request.specifier, binding.imported)) contract.bindings.set(binding.local, role(request.specifier, binding.imported));
       }
     }

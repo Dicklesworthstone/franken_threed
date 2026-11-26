@@ -10,7 +10,62 @@ const fail = (message, code = 'PASS') => {
 };
 const nativePasses = new WeakMap();
 const lightingHooks = new WeakMap();
+const directPipelineContexts = new WeakMap();
+const pipelineFields = new Set(['renderPipeline', 'renderPipelineState',
+  'onBeforePipelineCallbacks', 'onAfterPipelineCallbacks', 'toneMapping', 'outputColorSpace']);
 let lightingHookSerial = 0;
+
+/** Observe one source DirectRenderPipeline generation, without rebuilding its
+ * closure from live pipeline settings. Those settings can change while accepted
+ * draws still reference an older context. The callable output hook has the same
+ * authored-graph boundary as ordinary contexts; writable source fields do not
+ * authenticate how a hook was created before its first observation. */
+function inspectDirectPipelineContext(three, node, data, child, renderer, code) {
+  const pipeline = Object.getOwnPropertyDescriptor(data, 'renderPipeline')?.value;
+  const source = three.DirectRenderPipeline?.prototype;
+  if (!source || !pipeline || Object.getPrototypeOf(pipeline) !== source || !renderer)
+    fail('Native direct contexts require their pinned DirectRenderPipeline renderer owner', code);
+  const fields = Object.getOwnPropertyDescriptors(pipeline);
+  if (fields.renderer?.value !== renderer ||
+      ['render', '_update', '_updateContext', '_getBackgroundNode', 'dispose', 'renderAsync']
+        .some(key => fields[key] && !('value' in fields[key]) || pipeline[key] !== source[key]))
+    fail('Native direct contexts require the source pipeline methods and renderer identity', code);
+  let record = directPipelineContexts.get(node);
+  if (record && (record.renderer !== renderer || record.pipeline !== pipeline || record.child !== child || record.data !== data))
+    fail('An accepted direct context must retain its renderer, pipeline and child context', code);
+  const metadata = record?.metadata ?? fields._contextData?.value;
+  if (!metadata || ![Object.prototype, null].includes(Object.getPrototypeOf(metadata)))
+    fail('Native direct contexts require the source pipeline metadata', code);
+  const values = Object.getOwnPropertyDescriptors(metadata), keys = Reflect.ownKeys(values);
+  if (keys.some(key => !pipelineFields.has(key) || !('value' in values[key])) ||
+      values.renderPipeline?.value !== pipeline ||
+      !Array.isArray(values.onBeforePipelineCallbacks?.value) || !Array.isArray(values.onAfterPipelineCallbacks?.value) ||
+      Object.hasOwn(values, 'toneMapping') !== Object.hasOwn(values, 'outputColorSpace'))
+    fail('Native direct contexts require source pipeline callback and output metadata', code);
+  const state = values.renderPipelineState?.value;
+  if (!state || ![Object.prototype, null].includes(Object.getPrototypeOf(state)) ||
+      Reflect.ownKeys(state).length !== 1 || Object.getOwnPropertyDescriptor(state, 'viewOffsetOwner')?.value !== null)
+    fail('Native direct view offsets require their captured texture-producer owner', code);
+  const descriptors = Object.getOwnPropertyDescriptors(data);
+  if (Reflect.ownKeys(descriptors).length !== keys.length + 1 ||
+      typeof descriptors.getOutput?.value !== 'function' ||
+      keys.some(key => !descriptors[key] || !('value' in descriptors[key]) || descriptors[key].value !== values[key].value))
+    fail('Native direct contexts must retain their source metadata references and callable output hook', code);
+  if (record) {
+    if (record.entries.length !== keys.length + 1 || record.entries.some(([key, value]) => descriptors[key]?.value !== value))
+      fail('An accepted direct context cannot replace its output hook or metadata', code);
+  } else {
+    const quad = fields._quadMesh?.value, context = quad?.material?.contextNode;
+    if (fields._contextNode?.value !== node || fields._rendererContextNode?.value !== child ||
+        !(quad instanceof three.QuadMesh) || !context || Object.getPrototypeOf(context) !== three.ContextNode.prototype ||
+        context.node !== null || context.value !== metadata || context.getFlowContextData !== three.ContextNode.prototype.getFlowContextData)
+      fail('Native direct contexts require the current source pipeline generation and wrapped renderer context', code);
+    record = Object.freeze({renderer, pipeline, child, data, metadata,
+      entries: Object.freeze(Reflect.ownKeys(descriptors).map(key => Object.freeze([key, descriptors[key].value])))});
+    directPipelineContexts.set(node, record);
+  }
+  return pipelineFields;
+}
 
 /** Ordinary array views share their parent's source list and node lifecycle.
  * XR/multiview need different attachment and binding ownership. */
@@ -28,7 +83,7 @@ export function inspectThreeNativeCamera(three, camera, code = 'CAMERA') {
  * retained builder; never evaluate them during admission.
  * Hook identity and ContextNode.version are structural, uniform values live.
  */
-export function inspectThreeLightingContext(three, context, code = 'GRAPH', matrixValues = true) {
+export function inspectThreeLightingContext(three, context, code = 'GRAPH', matrixValues = true, renderer = null) {
   if (context == null) return null;
   const seen = new Set(), signature = [];
   let hasHooks = false;
@@ -45,11 +100,14 @@ export function inspectThreeLightingContext(three, context, code = 'GRAPH', matr
         !descriptors.node || !('value' in descriptors.node) || child !== null && child?.isContextNode !== true ||
         Object.values(descriptors).some(descriptor => !('value' in descriptor)))
       fail('Native lighting contexts require source data properties and ContextNode children', code);
+    const directFields = Object.hasOwn(data, 'renderPipeline')
+      ? inspectDirectPipelineContext(three, node, data, child, renderer, code) : null;
     const hooks = [];
     for (const key of Reflect.ownKeys(data)) {
       const descriptor = Object.getOwnPropertyDescriptor(data, key);
       if (!('value' in descriptor))
         fail('Native context fields require ordinary data properties', code);
+      if (directFields?.has(key)) continue;
       if (key === 'forceUVContext' && typeof descriptor.value === 'boolean' ||
           ['getUV', 'getTextureLevel', 'getShadow', 'getOutput'].includes(key) && descriptor.value === null) {
         hooks.push([key, descriptor.value]); hasHooks = true; continue;

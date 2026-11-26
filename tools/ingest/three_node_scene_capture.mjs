@@ -215,7 +215,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // Keep the accepted source selection even when queued preparation observes a
   // later graph replacement. The fixed adapter must not apply scene.fog again.
   const sceneFogNode = !!root?.fogNode;
-  const lightingContext = inspectThreeLightingContext(three, renderer?.contextNode);
+  const lightingContext = inspectThreeLightingContext(three, renderer?.contextNode, 'GRAPH', true, renderer);
   const retainedPrecisionScene = highPrecisionSceneHistory.get(renderer)?.has(renderRoot) === true;
   const precisionRequested = lightingContext !== null && hasThreeHighPrecisionContext(three, renderer?.contextNode);
   const nativePrecisionScene = retainedPrecisionScene || precisionRequested;

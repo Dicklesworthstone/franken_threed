@@ -210,6 +210,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (!Number.isSafeInteger(value) || value < 1) fail('LIMIT', `Invalid ${name}`);
   const frame = renderer._nodes.nodeFrame, cache = new WeakMap(), entries = new Set();
   const effects = createThreeNodeEffects(three, renderer, {fail});
+  const inspectRendererContext = (code = 'GRAPH', matrixValues = true) =>
+    inspectThreeLightingContext(three, renderer.contextNode, code, matrixValues, renderer);
   const physicalPrototypes = [three.MeshPhysicalNodeMaterial.prototype,
     ...(three.MeshSSSNodeMaterial ? [three.MeshSSSNodeMaterial.prototype] : [])];
   const standardPrototypes = [three.MeshStandardNodeMaterial.prototype, ...physicalPrototypes];
@@ -1337,7 +1339,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (material.transparent && material.side === three.DoubleSide && !material.forceSinglePass &&
         !(context.compilation === true && context.sidePass === true))
       fail('RASTER', 'Transparent DoubleSide node graphs require captured FrontSide and BackSide draw variants');
-    inspectThreeLightingContext(three, renderer.contextNode);
+    inspectRendererContext();
     const pipelineContext = inspectThreePipelineContext(three, renderer, material, object, effects);
     // The pinned WebGPU renderer does not invoke Material's legacy
     // onBeforeCompile or onBeforeRender hooks. Preserve those source properties
@@ -1345,7 +1347,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // program cache keys at its construction/invalidation boundaries. The
     // shared rigid PBR profile has that complete source cache lifecycle.
     if ((extension || hasThreeCustomProgramCacheKey(three, sourceMaterial)) && !sharedConstruction(sourceMaterial, material,
-      object, context, lights, inspectThreeLightingContext(three, renderer.contextNode), true))
+      object, context, lights, inspectRendererContext(), true))
       fail('HOOK', 'Native material extensions and custom program keys require their shared source construction profile');
     for (const key of Object.keys(material)) {
       const value = material[key];
@@ -1378,7 +1380,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     const mrt = inspectThreeMRT(three, renderer, material);
     const sharedSetup = (customGeometrySetup(sourceMaterial) || lazyGeometrySetup(sourceMaterial)) && sharedConstruction(sourceMaterial, material,
-      object, context, lights, inspectThreeLightingContext(three, renderer.contextNode), true)?.geometrySetup === true;
+      object, context, lights, inspectRendererContext(), true)?.geometrySetup === true;
     const seen = new Set(), stack = [...GRAPH_SLOTS.map(key => key === 'lightsNode' ? lightsNode : material[key]).filter(Boolean),
       ...(extension ? Object.values(material).filter(value => value?.isNode === true) : []),
       ...(volume ? [...VOLUME_FUNCTION_SLOTS].map(key => material[key]).filter(node => typeof node === 'function' && node.isNode === true) : []),
@@ -1740,7 +1742,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       renderer.contextNode.id, renderer.contextNode.version);
     return {contextId, dynamic, chain, lightsNode, geometrySetup, namedGeometry, materialProfile: !!extension, clippingKey};
   }
-  function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side, version = material.version, rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode)) {
+  function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side, version = material.version, rendererContextSignature = inspectRendererContext()) {
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
     // builder nodes which close over a particular source object.
@@ -1801,7 +1803,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (!lazyGeometrySetup(material) && !sharedBasicEnvironmentMaterial(material)) return compileProgram(material, object, context);
       const prepared = inspect(material, object, context);
       if (!sharedConstruction(material, prepared, object, context, sourceLights(prepared, context),
-          inspectThreeLightingContext(three, renderer.contextNode), true)) return compileProgram(material, object, context);
+          inspectRendererContext(), true)) return compileProgram(material, object, context);
     }
     const priorPasses = cache.get(object)?.get(material);
     const previous = priorPasses?.get(chain) ?? priorPasses?.get(context.passId ?? null);
@@ -1820,7 +1822,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const profile = () => {
       const prepared = inspect(material, object, context);
       const construction = sharedConstruction(material, prepared, object, context, sourceLights(prepared, context, materialExtension(material)),
-        inspectThreeLightingContext(three, renderer.contextNode), false, geometryProfile, materialProfile);
+        inspectRendererContext(), false, geometryProfile, materialProfile);
       if (!construction || construction.chain !== chain)
         fail('HOOK', 'Custom native material construction must retain its shared source profile');
       return construction;
@@ -1869,8 +1871,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       state.environmentGraph = environmentGraphKey(prepared, context);
       state.basicEnvironmentSignature = basicEnvironmentSignature(prepared, environment);
       state.mrtSignature = inspectThreeMRT(three, renderer, prepared)?.key ?? null;
-      state.rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
-      state.rendererContextCache = inspectThreeLightingContext(three, renderer.contextNode, 'GRAPH', false);
+      state.rendererContextSignature = inspectRendererContext();
+      state.rendererContextCache = inspectRendererContext('GRAPH', false);
       state.clippingSignature = inspectThreeNodeClipping(three, context, maxNodes, fail);
       state.sharedClippingKey = construction.clippingKey;
       return record.entry.descriptor;
@@ -1919,8 +1921,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const batchSignature = inspectThreeNativeBatch(three, object, fail);
     const skinSignature = inspectSkinning(object);
     const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object, effects);
-    let rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
-    let rendererContextCache = inspectThreeLightingContext(three, renderer.contextNode, 'GRAPH', false);
+    let rendererContextSignature = inspectRendererContext();
+    let rendererContextCache = inspectRendererContext('GRAPH', false);
     const construction = sharedConstruction(material, preparedMaterial, object, context, lights, rendererContextSignature,
       false, sourceKey?.geometrySetup === true, sourceKey?.materialProfile === true);
     const fogKey = fogSignature(preparedMaterial, context), alphaHash = preparedMaterial.alphaHash === true;
@@ -2097,14 +2099,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     assertBatch(object, batchSignature);
     assertSkinning(object, skinSignature);
     assertMorphs(object, morphSignature);
-    const acceptedRendererContext = inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED');
+    const acceptedRendererContext = inspectRendererContext('CHANGED');
     if (!construction?.materialProfile && acceptedRendererContext !== rendererContextSignature)
       fail('CHANGED', 'Native lighting context changed during source graph construction');
     // Context construction hooks may update the root context themselves.
     // The source keeps this builder for the current draw and observes the
     // resulting identity/version on the next RenderObject comparison.
     rendererContextSignature = acceptedRendererContext;
-    rendererContextCache = inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED', false);
+    rendererContextCache = inspectRendererContext('CHANGED', false);
     if ((inspectThreeMRT(three, renderer, material)?.key ?? null) !== mrtKey)
       fail('CHANGED', 'Native MRT context changed during source graph construction');
     const currentPrepared = prepareMaterial(material, materialPrototype(preparedMaterial));
@@ -2665,10 +2667,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return history.bytes;
   }
   function checkPipelineContext(state, object = state.object) {
-    const changed = inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED') !== state.rendererContextSignature;
+    const changed = inspectRendererContext('CHANGED') !== state.rendererContextSignature;
     if (state.sharedBuilder?.materialProfile ? changed ||
-        inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED', false) !== state.rendererContextCache : changed &&
-        inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED', false) !== state.rendererContextCache)
+        inspectRendererContext('CHANGED', false) !== state.rendererContextCache : changed &&
+        inspectRendererContext('CHANGED', false) !== state.rendererContextCache)
       fail('CHANGED', 'Native renderer lighting context changed; compile the material graph again');
     if (inspectThreePipelineContext(three, renderer, state.material, object, effects) !== state.pipelineSignature)
       fail('CHANGED', 'Native render-pipeline context changed; compile its output graph again');
@@ -2677,8 +2679,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function acceptRendererContext(state) {
     if (!state.sharedBuilder?.materialProfile) return;
-    const signature = inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED');
-    const cache = inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED', false);
+    const signature = inspectRendererContext('CHANGED');
+    const cache = inspectRendererContext('CHANGED', false);
     // Source selects its render object before NodeFrame callbacks. Context
     // edits during a successful update affect the following draw, while this
     // draw keeps the selected graph and the remaining source update nodes.
