@@ -357,7 +357,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         fail('ATTRIBUTE', 'Native storage vertex inputs require the source scalar/vector attribute without interleaved conversion');
       return;
     }
-    if ([Float32Array, Int32Array, Uint32Array].includes(node.value?.constructor)) return;
+    if ([Float32Array, Int32Array, Uint32Array, Int8Array, Uint8Array, Int16Array, Uint16Array].includes(node.value?.constructor)) return;
     const inputs = object?.isInstancedMesh ? [object.instanceMatrix, object.instanceColor].filter(Boolean) : [];
     const value = node.value;
     // Raw arrays receive a private owner from BufferAttributeNode. Instance.js
@@ -381,7 +381,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (value instanceof three.BufferAttribute && value.itemSize <= 4 && node.attribute === value ||
         value instanceof three.InterleavedBuffer && (node.attribute === null || node.attribute?.data === value))
       return true;
-    fail('ATTRIBUTE', 'Native generated streams require raw 32-bit arrays, source buffer attributes or source interleaved buffers');
+    fail('ATTRIBUTE', 'Native generated streams require raw f32/integer arrays, source buffer attributes or source interleaved buffers');
   }
   function attributeSignature(nodes, object) {
     return JSON.stringify(nodes.map(node => {
@@ -395,8 +395,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       }
       if (!attribute || !array || inputArray !== array)
         fail('CHANGED', 'Native buffer attribute nodes must retain their source backing array; replace the node or instance attribute');
+      const scalar = shared ? inspectThreeNodeSharedAttribute(three, attribute, fail).scalar : array.constructor;
       return [node.id, node.nodeType, node.bufferType, node.bufferStride, node.bufferOffset, node.instanced, node.usage,
-        sourceId(node.value), sourceId(attribute), sourceId(owner), shared ? array.constructor.name : sourceId(array), array.length, array.byteLength,
+        sourceId(node.value), sourceId(attribute), sourceId(owner), shared ? scalar.name : sourceId(array), array.length,
+        shared ? array.length * scalar.BYTES_PER_ELEMENT : array.byteLength,
         attribute.count, attribute.itemSize, attribute.normalized, attribute.gpuType, attribute.isInterleavedBufferAttribute,
         attribute.offset, attribute.isInstancedBufferAttribute, owner.stride, owner.meshPerAttribute,
         owner.isInstancedInterleavedBuffer, owner.usage];
@@ -412,7 +414,6 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         : vector?.[1] === 'i' || vector?.[3] === 'int' ? 'int' : 'float';
       const node = attribute.node, source = node?.attribute ?? geometry.attributes[attribute.name];
       const storage = source?.isStorageBufferAttribute || source?.isStorageInstancedBufferAttribute;
-      const narrowInteger = !node && pinNamed && object.isSkinnedMesh === true && attribute.name === 'skinIndex';
       const padded = storage && source.itemSize === 4 && components === 3;
       if (!components || !source || source.itemSize !== components && !padded ||
           node && !(node instanceof three.BufferAttributeNode))
@@ -421,16 +422,18 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (inputArray && !storage) {
         // Preserve the source scalar type even when the general uploader could
         // convert it to the type requested by the authored shader.
-        const expected = inputArray instanceof Uint32Array ? 'uint' : inputArray instanceof Int32Array ? 'int' : 'float';
+        const integer = source.normalized !== true && source.isFloat16BufferAttribute !== true;
+        const expected = integer && [Uint8Array, Uint16Array, Uint32Array].includes(inputArray.constructor) ? 'uint'
+          : integer && [Int8Array, Int16Array, Int32Array].includes(inputArray.constructor) ? 'int' : 'float';
         if (scalar !== expected)
           fail('ATTRIBUTE', `Native generated attribute ${attribute.name} scalar type must match its source array`);
       }
       if (!node?.attribute) {
         named.push([attribute.name, namedAttributeId(source), source]);
-        if (pinNamed && inspectThreeNodeSharedAttribute(three, source, fail, narrowInteger).instanced)
+        if (pinNamed && inspectThreeNodeSharedAttribute(three, source, fail).instanced)
           fail('ATTRIBUTE', 'Shared named geometry requires ordinary vertex inputs');
       }
-      if (node || storage || pinNamed) generated.push({name: attribute.name, attribute: source, narrowInteger,
+      if (node || storage || pinNamed) generated.push({name: attribute.name, attribute: source,
         shared: node ? inspectAttributeInput(node, object) === true : !storage});
       return Object.freeze({name: attribute.name, location, locations: 1, components, scalar});
     });
@@ -1629,6 +1632,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const namedGeometry = geometrySetup || sharedVertexExtension &&
       Object.values(object.geometry.attributes).some(attribute =>
         attribute.isStorageBufferAttribute || attribute.isInterleavedBufferAttribute || attribute.normalized ||
+        (ordinaryGeometryExtension || primitiveExtension) && !attribute.isStorageBufferAttribute && attribute.normalized === false &&
+          [Int8Array, Uint8Array, Int16Array, Uint16Array, Int32Array, Uint32Array].includes(attribute.array?.constructor) ||
         typeof Float16Array === 'function' && attribute.array?.constructor === Float16Array);
     // Transparent side passes retain separate render-object bindings. Their
     // builders share only when the source material/dynamic keys are identical,
@@ -1662,6 +1667,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
             [Uint8Array, Uint16Array, Uint32Array].includes(attribute.array?.constructor)) &&
             !(sharedVertexExtension && attribute.normalized === true &&
               [Int8Array, Uint8Array, Int16Array, Uint16Array].includes(attribute.array?.constructor)) &&
+            !((ordinaryGeometryExtension || primitiveExtension) && !attribute.isStorageBufferAttribute && attribute.normalized === false &&
+              [Int8Array, Uint8Array, Int16Array, Uint16Array, Int32Array, Uint32Array].includes(attribute.array?.constructor)) &&
             !(sharedVertexExtension && typeof Float16Array === 'function' && attribute.array?.constructor === Float16Array) ||
           attribute.isInterleavedBufferAttribute && !instancedGeometryExtension && !sharedVertexExtension ||
           !instancedGeometryExtension && (attribute.isInstancedBufferAttribute || attribute.data?.isInstancedInterleavedBuffer) ||
@@ -1673,11 +1680,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         !extension && (context.clippingContext?.unionPlanes?.length || context.clippingContext?.intersectionPlanes?.length) ||
         !extension && ((context.colorAttachmentCount ?? 1) !== 1 || renderer.getMRT?.() != null) ||
         renderer.getOutputRenderTarget?.()?.multiview) return null;
-    if (sharedVertexExtension) for (const [name, attribute] of Object.entries(object.geometry.attributes)) {
+    if (sharedVertexExtension) for (const attribute of Object.values(object.geometry.attributes)) {
       if (attribute.isStorageBufferAttribute) inspectThreeNodeStorageAttribute(three, attribute, fail);
       else if (attribute.isInterleavedBufferAttribute || attribute.normalized ||
+          [Int8Array, Uint8Array, Int16Array, Uint16Array, Int32Array, Uint32Array].includes(attribute.array?.constructor) ||
           typeof Float16Array === 'function' && attribute.array?.constructor === Float16Array)
-        inspectThreeNodeSharedAttribute(three, attribute, fail, skinExtension && name === 'skinIndex');
+        inspectThreeNodeSharedAttribute(three, attribute, fail);
     }
     const {attachment, chain} = builderScope(context);
     const clippingKey = threeNodeClippingCacheKey(context, fail);

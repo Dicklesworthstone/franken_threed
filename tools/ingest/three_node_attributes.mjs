@@ -31,21 +31,21 @@ export function inspectThreeNodeStorageAttribute(three, attribute, reject) {
       attribute.isInstancedBufferAttribute === true, attribute.meshPerAttribute])};
 }
 
-export function inspectThreeNodeSharedAttribute(three, attribute, reject, narrowInteger = false) {
-  return inspectAttribute(three, attribute, reject, true, narrowInteger);
+export function inspectThreeNodeSharedAttribute(three, attribute, reject) {
+  return inspectAttribute(three, attribute, reject, true);
 }
-function inspectAttribute(three, attribute, reject, shared = false, allowNarrowInteger = false) {
+function inspectAttribute(three, attribute, reject, shared = false) {
   if (attribute?.isStorageBufferAttribute || attribute?.isStorageInstancedBufferAttribute)
     return inspectThreeNodeStorageAttribute(three, attribute, reject);
   const interleaved = attribute?.isInterleavedBufferAttribute === true;
   const owner = interleaved ? attribute.data : attribute, array = owner?.array;
   const normalized = shared && attribute?.normalized === true &&
     [Int8Array, Uint8Array, Int16Array, Uint16Array].includes(array?.constructor);
-  // Named skin indices may be byte/word integers. Native separate uploads
-  // promote them; interleaved inputs retain their source integer vertex format.
-  // Both use the existing public geometry history, never a generated copy.
-  const narrowInteger = shared && allowNarrowInteger && attribute?.normalized === false &&
-    !attribute.isFloat16BufferAttribute && [Uint8Array, Uint16Array].includes(array?.constructor);
+  // Native separate uploads promote byte/word integers; interleaved inputs
+  // retain their source array. Both public node inputs and named geometry
+  // must share that upload history. Private raw-array nodes are interleaved.
+  const narrowInteger = (shared || interleaved) && attribute?.normalized === false &&
+    !attribute.isFloat16BufferAttribute && [Int8Array, Uint8Array, Int16Array, Uint16Array].includes(array?.constructor);
   // Native Float16Array vectors have real source float16 vertex formats. The
   // separate Uint16-backed Float16BufferAttribute follows a different source
   // upload path; neither its flag nor normalization can opt a stream in here.
@@ -56,6 +56,7 @@ function inspectAttribute(three, attribute, reject, shared = false, allowNarrowI
       !Number.isSafeInteger(array.length) || !Number.isSafeInteger(attribute?.count) || attribute.count < 0 ||
       !Number.isSafeInteger(attribute?.itemSize) || attribute.itemSize < 1 || attribute.itemSize > 4 ||
       normalized && (attribute.itemSize < 2 || attribute.isFloat16BufferAttribute) ||
+      narrowInteger && interleaved && attribute.itemSize < 2 ||
       !shared && attribute.gpuType === three.IntType ||
       !Number.isSafeInteger(owner.version) || owner.version < 0)
     reject('ATTRIBUTE', 'Native vertex inputs require fixed 32-bit streams or shared Float16Array/8/16-bit integer vectors');
@@ -75,8 +76,13 @@ function inspectAttribute(three, attribute, reject, shared = false, allowNarrowI
   const bytes = array.BYTES_PER_ELEMENT, formatBytes = Math.ceil(attribute.itemSize * bytes / 4) * 4;
   if (interleaved && (stride * bytes % 4 || offset * bytes % 4 || offset * bytes + formatBytes > stride * bytes))
     reject('ATTRIBUTE', 'Shared native interleaved inputs require aligned source vertex formats');
-  return {owner, array, interleaved, instanced, stride, offset,
-    signature: JSON.stringify([array.constructor.name, array.length, attribute.count, stride, offset, attribute.itemSize,
+  // First upload changes a separate public narrow array to this 32-bit type.
+  // That source transition is one layout, not a graph invalidation.
+  const scalar = narrowInteger && !interleaved
+    ? array.constructor === Int8Array || array.constructor === Int16Array ? Int32Array : Uint32Array
+    : array.constructor;
+  return {owner, array, scalar, interleaved, instanced, stride, offset,
+    signature: JSON.stringify([scalar.name, array.length, attribute.count, stride, offset, attribute.itemSize,
       interleaved, instanced, owner.meshPerAttribute, attribute.normalized, attribute.gpuType])};
 }
 
@@ -89,12 +95,12 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
   const owners = new Map(), geometries = new Map(), views = new WeakMap();
   let allocatedBytes = 0, disposed = false;
   const live = () => { if (disposed) reject('DISPOSED', 'Native attribute histories are disposed'); };
-  const shape = (attribute, shared = false, narrowInteger = false) => inspectAttribute(three, attribute, reject, shared, narrowInteger);
+  const shape = (attribute, shared = false) => inspectAttribute(three, attribute, reject, shared);
   function register(descriptor, geometry, attributes) {
     live();
     if (views.has(descriptor)) reject('ATTRIBUTE', 'Native generated geometry is already registered');
-    const sources = attributes.map(({name, attribute, shared = false, narrowInteger = false}) =>
-      ({name, attribute, shared, narrowInteger, ...shape(attribute, shared, narrowInteger)}));
+    const sources = attributes.map(({name, attribute, shared = false}) =>
+      ({name, attribute, shared, ...shape(attribute, shared)}));
     const ordinaryOwners = new Set(Object.values(geometry.attributes).map(attribute =>
       attribute.isInterleavedBufferAttribute ? attribute.data : attribute));
     if (sources.some(source => !source.gpu && !source.shared && ordinaryOwners.has(source.owner)))
@@ -180,7 +186,7 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
     const state = stateOf(descriptor);
     // Validate the entire selection before consuming a later stream's ranges.
     for (const source of state.sources) {
-      const current = shape(source.attribute, source.shared, source.narrowInteger);
+      const current = shape(source.attribute, source.shared);
       if (current.owner !== source.owner || current.signature !== source.signature)
         reject('CHANGED', 'Native generated attribute identity or layout changed; compile the graph again');
     }
@@ -197,8 +203,18 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
     const state = validate(descriptor);
     if (state.gpuSources.length && typeof captureVertexAttribute !== 'function')
       reject('ATTRIBUTE', 'Native storage vertex streams require the renderer storage owner');
-    const vertexPackets = state.gpuSources.map(source => captureVertexAttribute(source.attribute, source.view));
     if (!Number.isSafeInteger(renderId) || renderId < 0) reject('ATTRIBUTE', 'Native attribute capture requires a logical render id');
+    // Native interleaved uploads retain their narrow elements. Validate every
+    // pending upload before consuming any stream's ranges or storage updates.
+    // First uploads ignore ranges, and one render uploads each owner only once.
+    for (const {source, record} of state.privateOwners.values()) {
+      if (record.snapshot && record.renderId !== renderId &&
+          (record.version < source.version || source.usage === three.DynamicDrawUsage) &&
+          source.array.BYTES_PER_ELEMENT < 4 && source.updateRanges.some(({start, count}) =>
+            start * source.array.BYTES_PER_ELEMENT % 4 || count * source.array.BYTES_PER_ELEMENT % 4))
+        reject('ATTRIBUTE', 'Native interleaved attribute update ranges require four-byte offsets and sizes');
+    }
+    const vertexPackets = state.gpuSources.map(source => captureVertexAttribute(source.attribute, source.view));
     let bytes = 0;
     const selected = [];
     for (const target of state.privateOwners.values()) {

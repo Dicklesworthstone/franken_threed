@@ -119,10 +119,14 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
         !Number.isSafeInteger(range.count) || range.count < 0 || range.start + range.count > array.length))
       reject('ATTRIBUTE', 'Bundle attribute update ranges must fit their source array');
     const half = typeof Float16Array === 'function' && array.constructor === Float16Array;
+    const promoted = !interleaved && attribute.normalized === false && attribute.isFloat16BufferAttribute !== true
+      ? array.constructor === Int8Array || array.constructor === Int16Array ? Int32Array
+        : array.constructor === Uint8Array || array.constructor === Uint16Array ? Uint32Array : null
+      : null;
     const rangeItemSize = !interleaved && attribute.itemSize > 1 &&
       (half || attribute.normalized === true && [Int8Array, Uint8Array, Int16Array, Uint16Array].includes(array.constructor)) &&
       attribute.itemSize * array.BYTES_PER_ELEMENT % 4 ? attribute.itemSize : 0;
-    return {attribute, owner, array, interleaved, stride, offset, usage: owner.usage, rangeItemSize, half,
+    return {attribute, owner, array, interleaved, stride, offset, usage: owner.usage, rangeItemSize, half, promoted,
       shape: [attribute.count, attribute.itemSize, stride, offset, attribute.normalized, attribute.gpuType,
         attribute.isFloat16BufferAttribute === true, attribute.isInstancedBufferAttribute === true,
         owner.isInstancedInterleavedBuffer === true, owner.meshPerAttribute]};
@@ -161,7 +165,9 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
     const attributes = attributeNames === null ? Object.entries(geometry.attributes)
       : [...new Set(attributeNames)].map(name => [name, geometry.attributes[name]]).filter(([, attribute]) => attribute !== undefined);
     const selection = attributes.map(([name, attribute]) => ({name, ...inspect(attribute)}));
-    if (geometry.index) selection.push({name: null, ...inspectIndex(geometry.index, captureIndexAttribute)});
+    // Index promotion has separate primitive-restart rules owned by the index
+    // path. The public transition here belongs only to vertex attributes.
+    if (geometry.index) selection.push({name: null, ...inspectIndex(geometry.index, captureIndexAttribute), promoted: null});
     const unique = new Map(selection.filter(source => !source.gpu).map(source => [source.owner, source]));
     let addedBytes = 0;
     for (const source of unique.values()) {
@@ -178,7 +184,8 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
           source.array.BYTES_PER_ELEMENT < 4 && source.owner.updateRanges.some(({start, count}) =>
             start * source.array.BYTES_PER_ELEMENT % 4 || count * source.array.BYTES_PER_ELEMENT % 4))
         reject('ATTRIBUTE', 'Native unpadded attribute update ranges require four-byte offsets and sizes');
-      if (source.upload) addedBytes += source.array.byteLength;
+      if (source.upload) addedBytes += !record?.generation && source.promoted
+        ? source.array.length * source.promoted.BYTES_PER_ELEMENT : source.array.byteLength;
     }
     // Cached alternatives must not pin superseded uploads against the byte
     // budget. Accepted leases keep their own generations after cache eviction.
@@ -198,6 +205,11 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
       if (source.upload) {
         const first = !record.generation, ranges = source.owner.updateRanges;
         if (first) {
+          // WebGPUAttributeUtils replaces separate unnormalized byte/word
+          // attributes on their first upload. Preserve that public mutation at
+          // capture, after admission, rather than at deferred GPU submission.
+          // Interleaved storage and subsequent uploads keep the source type.
+          if (source.promoted) source.owner.array = source.array = new source.promoted(source.array);
           // r186 pads separate normalized narrow and Float16Array vectors to
           // a four-byte vertex stride. Its later ranges upload whole affected vertices,
           // including edited components outside the requested component span.

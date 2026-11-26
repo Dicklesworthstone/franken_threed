@@ -190,8 +190,9 @@ test('interleaved, integer, index and instance layouts reach the existing GPU ge
   assert.notEqual(view.attributes.position.data, data);
   assert.equal(view.attributes.normal.offset, 3); assert.equal(view.attributes.position.data.stride, 6);
   assert.equal(view.attributes.ids.meshPerAttribute, 3);
-  assert.ok(view.attributes.ids.array instanceof Uint16Array); assert.ok(view.index.array instanceof Uint32Array);
-  assert.equal(captured.bytes, 64); assert.equal(owner.diagnostics.allocatedBytes, 64);
+  assert.ok(source.attributes.ids.array instanceof Uint32Array, 'native first upload promotes the public separate integer stream');
+  assert.ok(view.attributes.ids.array instanceof Uint32Array); assert.ok(view.index.array instanceof Uint32Array);
+  assert.equal(captured.bytes, 72); assert.equal(owner.diagnostics.allocatedBytes, 72);
   const device = geometryDevice(), gpu = createGpuProgramGeometry(device, view, [...positionProgram,
     {name: 'normal', location: 1, locations: 1, components: 3, scalar: 'float'},
     {name: 'ids', location: 2, locations: 1, components: 2, scalar: 'uint'}], {attributeTypes: 'webgpu'});

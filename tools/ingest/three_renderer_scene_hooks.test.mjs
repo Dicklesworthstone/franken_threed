@@ -57,6 +57,51 @@ function fixture(t, {linear = true} = {}) {
   return {renderer, device, scene, camera, material, mesh, canvas};
 }
 
+for (const [Type, Promoted, word] of [[Uint8Array, Uint32Array, 233], [Uint16Array, Uint32Array, 65003],
+  [Int8Array, Int32Array, -119], [Int16Array, Int32Array, -32003]])
+for (const extension of [false, true])
+test(`${Type.name} public native node geometry retains promotion, queued uploads and source cache identity (extension=${extension})`, async t => {
+  const f = fixture(t), original = new Type([word, word + 1, word + 2, word + 3]);
+  const attribute = new T.BufferAttribute(original, 1), input = T.TSL.bufferAttribute(attribute);
+  let setups = 0, updates = 0;
+  const observed = [];
+  class IntegerMaterial extends T.MeshBasicNodeMaterial {
+    setupDiffuseColor(builder) { setups++; return super.setupDiffuseColor(builder); }
+  }
+  const material = new (extension ? IntegerMaterial : T.MeshBasicNodeMaterial)();
+  material.colorNode = T.TSL.vec3(input).mul(T.TSL.uniform(1).onObjectUpdate(() => {
+    updates++; observed.push(attribute.array.constructor); return 1;
+  }));
+  f.mesh.material = material; t.after(() => material.dispose());
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  assert.equal(attribute.array.constructor, Promoted);
+  assert.notEqual(attribute.array, original, 'source promotion occurs before deferred GPU preparation');
+  assert.equal(attribute.version, 0); assert.equal(updates, 1);
+  assert.deepEqual(observed, [Promoted], 'source geometry uploads precede authored object updates');
+  attribute.array[0] = 7; attribute.array[1] = 19; attribute.addUpdateRange(0, 1); attribute.needsUpdate = true;
+  f.renderer.render(f.scene, f.camera);
+  assert.deepEqual(attribute.updateRanges, []);
+  attribute.array.fill(31); f.renderer.render(f.scene, f.camera);
+  await drain(f.renderer);
+  const components = draw => {
+    const slot = draw.pipeline.vertex.buffers.findIndex(layout => layout.attributes.some(attribute =>
+      attribute.format === (Promoted === Uint32Array ? 'uint32' : 'sint32')));
+    assert.ok(slot >= 0, 'native integer shader input owns an integer vertex stream');
+    const bytes = draw.contents.get(draw.streams.get(slot));
+    return [...new Promoted(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)];
+  };
+  const first = [word, word + 1, word + 2, word + 3], changed = [7, word + 1, word + 2, word + 3];
+  assert.deepEqual(draws(f.device).map(components), [first, changed, changed]);
+  assert.equal(updates, 3, 'native preparation must not replay authored node updates');
+  if (extension) assert.equal(setups, 1, 'source promotion keeps the accepted custom material builder');
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(components(draws(f.device).at(-1)), changed, 'warm draws retain unmarked GPU-stale bytes');
+  assert.equal(updates, 4); if (extension) assert.equal(setups, 1);
+  assert.deepEqual(observed, Array(4).fill(Promoted));
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+  assert.deepEqual([...original], first, 'the old narrow array no longer owns public storage');
+});
+
 test('custom node-material subclasses select source graphs without authored slots and freeze queued uniforms', async t => {
   const f = fixture(t), colors = [[.25, .5, .75], [.625, .375, .125]];
   let setups = 0;

@@ -2232,7 +2232,7 @@ test('interleaved and normalized extension boundaries reject invalid source layo
   }
   const item = f.add(new Extension()), geometry = item.object.geometry;
   for (const attribute of [new T.BufferAttribute(new Float64Array(12), 3),
-    new T.BufferAttribute(new Uint8ClampedArray(12), 3, true), new T.BufferAttribute(new Uint8Array(12), 3),
+    new T.BufferAttribute(new Uint8ClampedArray(12), 3, true), new T.BufferAttribute(new Uint8ClampedArray(12), 3),
     new T.BufferAttribute(new Uint32Array(12), 3, true)]) {
     geometry.setAttribute('applicationData', attribute);
     assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(effects, 0);

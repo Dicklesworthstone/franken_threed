@@ -1667,6 +1667,78 @@ test(`generated ${scalar} width ${width} instanced flag=${instanced} preserves s
   const slot = snapshot.layouts.findIndex(layout => layout.attributes.some(attribute => attribute.shaderLocation === reflected.location));
   assert.deepEqual([...new Type(snapshot.vertexBuffers[slot].data)], [...array]);
 });
+for (const [Type, scalar, word] of [[Uint8Array, 'uint', 233], [Uint16Array, 'uint', 65003],
+  [Int8Array, 'int', -119], [Int16Array, 'int', -32003]])
+for (const inputKind of ['separate', 'interleaved', 'raw'])
+test(`${Type.name} ${inputKind} node attributes retain source integer WGSL and exact uploaded components`, t => {
+  const f = rig(t), width = inputKind === 'separate' ? 1 : 3, stride = inputKind === 'separate' ? 1 : 4;
+  const array = new Type(Array.from({length: 4 * stride}, (_, index) => word + index));
+  const attribute = inputKind === 'separate' ? new THREE.BufferAttribute(array, width) : null;
+  const value = inputKind === 'interleaved' ? new THREE.InterleavedBuffer(array, stride) : attribute ?? array;
+  const input = inputKind === 'separate' ? N.bufferAttribute(value)
+    : N.bufferAttribute(value, `${scalar === 'uint' ? 'u' : 'i'}vec3`, stride);
+  f.material.colorNode = N.vec3(input);
+  const descriptor = f.compile(), source = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+  source.scene = f.scene; source.camera = f.camera; source.build();
+  assert.equal(descriptor.vertex, source.vertexShader); assert.equal(descriptor.fragment, source.fragmentShader);
+  const reflected = descriptor.attributes.find(item => item.name.startsWith('nodeAttribute'));
+  assert.equal(reflected.scalar, scalar); assert.equal(reflected.components, width);
+  assert.equal(inputKind === 'separate' ? attribute.array : value.array ?? value, array,
+    'shader construction cannot perform the first source upload');
+  const histories = createThreeNodeBundles(THREE); t.after(() => histories.dispose());
+  const view = f.owner.geometry(descriptor), draw = f.owner.captureDraw(descriptor, {...f.context,
+    captureGeometry: (view, attributes, inputs) => histories.captureGeometry(view, attributes, 1, inputs)});
+  draw.attributes?.install(); t.after(() => draw.bundleGeometry?.release());
+  const device = geometryDevice(), gpu = createGpuProgramGeometry(device, draw.bundleGeometry?.geometry ?? view,
+    descriptor.attributes, {attributeTypes: 'webgpu'});
+  t.after(() => gpu.dispose());
+  const snapshot = programGeometrySnapshot(gpu, device), slot = snapshot.layouts.findIndex(layout =>
+    layout.attributes.some(item => item.shaderLocation === reflected.location));
+  const layout = snapshot.layouts[slot], selected = layout.attributes.find(item => item.shaderLocation === reflected.location);
+  const Words = scalar === 'uint' ? Uint32Array : Int32Array;
+  const uploaded = new Words(snapshot.vertexBuffers[slot].data), actual = [];
+  for (let vertex = 0; vertex < 4; vertex++) for (let component = 0; component < width; component++)
+    actual.push(uploaded[(vertex * layout.arrayStride + selected.offset) / 4 + component]);
+  assert.deepEqual(actual, Array.from({length: 4}, (_, vertex) =>
+    [...array.subarray(vertex * stride, vertex * stride + width)]).flat());
+  assert.equal(inputKind === 'separate' ? view.attributes[reflected.name] : input.attribute.data.array, inputKind === 'separate' ? attribute : array);
+});
+
+for (const [Type, scalar] of [[Uint8Array, 'uint'], [Uint16Array, 'uint'], [Int8Array, 'int'], [Int16Array, 'int']])
+test(`${Type.name} named inputs remain available to inherited node-material construction`, t => {
+  const f = rig(t), values = new Type([1, 2, 3, 4]);
+  f.object.geometry.setAttribute('selection', new THREE.BufferAttribute(values, 1));
+  class SelectionMaterial extends THREE.MeshBasicNodeMaterial {
+    setupDiffuseColor(builder) {
+      super.setupDiffuseColor(builder);
+      N.diffuseColor.rgb.assign(N.vec3(N.attribute('selection')));
+    }
+  }
+  const material = new SelectionMaterial(); f.object.material = material;
+  const context = {...f.context, material};
+  const descriptor = f.owner.compile(material, f.object, context), source = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+  source.scene = f.scene; source.camera = f.camera; source.build();
+  assert.equal(descriptor.vertex, source.vertexShader); assert.equal(descriptor.fragment, source.fragmentShader);
+  assert.equal(descriptor.attributes.find(attribute => attribute.name === 'selection').scalar, scalar);
+  assert.equal(f.owner.geometry(descriptor).attributes.selection, f.object.geometry.attributes.selection);
+  assert.equal(f.owner.compile(material, f.object, context), descriptor);
+});
+
+test('narrow integer node streams reject mismatched scalar and source-invalid interleaved layouts before callbacks', t => {
+  for (const [Type, type, width, stride, offset] of [
+    [Uint8Array, 'ivec4', 4, 4, 0], [Int16Array, 'uvec2', 2, 2, 0],
+    [Uint16Array, 'vec2', 2, 2, 0], [Uint8Array, 'uint', 1, 4, 0],
+    [Int16Array, 'ivec3', 3, 3, 0], [Uint8Array, 'uvec2', 2, 4, 1],
+  ]) {
+    const f = rig(t); let updates = 0;
+    const array = new Type(stride * 4), owner = new THREE.InterleavedBuffer(array, stride);
+    const input = N.bufferAttribute(owner, type, stride, offset);
+    f.material.colorNode = N.vec3(input).mul(N.uniform(1).onObjectUpdate(() => { updates++; return 1; }));
+    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'}, `${Type.name}/${type}/${width}`);
+    assert.equal(updates, 0); assert.equal(f.owner.diagnostics.programs, 0);
+  }
+});
+
 test('generated integer stream scalar mismatches refuse before callbacks', t => {
   for (const [Type, type] of [[Uint32Array, 'vec3'], [Int32Array, 'uvec3'], [Uint32Array, 'ivec3'], [Float32Array, 'ivec3']]) {
     const f = rig(t); let calls = 0;
