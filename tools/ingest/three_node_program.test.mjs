@@ -2732,3 +2732,119 @@ test('4000 H1-shaped Toon objects fit the existing shader budget without sharing
   assert.notDeepEqual(a.uniforms, b.uniforms, 'H1 colors remain per-object values');
   f.owner.dispose(); assert.equal(f.owner.diagnostics.programs, 0); assert.equal(f.owner.diagnostics.shaderBytes, 0);
 });
+
+for (const width of [3, 4]) for (const inferred of [false, true]) for (const deferred of [false, true])
+test(`public mat${width} attribute columns preserve source WGSL and queued uploads inferred=${inferred} deferred=${deferred}`, t => {
+  const f = rig(t), stride = width * width;
+  const initial = Array.from({length: 4 * stride}, (_, index) => index / 128 - .25), array = new Float32Array(initial);
+  const wrapper = new THREE.BufferAttribute(array, stride);
+  wrapper.addUpdateRange(0, width); wrapper.needsUpdate = true;
+  let matrix;
+  const graph = () => {
+    matrix ??= inferred ? N.bufferAttribute(wrapper) : N.bufferAttribute(wrapper, `mat${width}`);
+    return width === 3 ? matrix.mul(N.positionLocal) : matrix.mul(N.vec4(N.positionLocal, 1)).xyz;
+  };
+  f.material.positionNode = deferred ? N.Fn(graph)() : graph();
+  const descriptor = f.compile(), source = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+  source.scene = f.scene; source.camera = f.camera; source.build();
+  assert.equal(descriptor.vertex, source.vertexShader); assert.equal(descriptor.fragment, source.fragmentShader);
+  assert.match(descriptor.vertex, new RegExp(`mat${width}x${width}<f32>`));
+  const view = f.owner.geometry(descriptor);
+  const inputs = descriptor.attributes.filter(input => !f.object.geometry.attributes[input.name]);
+  assert.equal(inputs.length, width);
+  const columns = inputs.map(input => view.attributes[input.name]);
+  assert.deepEqual(columns.map(column => column.offset), Array.from({length: width}, (_, index) => index * width));
+  assert.equal(new Set(columns.map(column => column.data)).size, 1);
+  assert.equal(columns[0].data.stride, stride);
+  const sourceOwner = matrix.node.nodes[0].attribute.data;
+  assert.ok(matrix.node.nodes.every(column => column.attribute.data === sourceOwner));
+  assert.notEqual(columns[0].data, sourceOwner); assert.equal(sourceOwner.array, array);
+  assert.equal(f.owner.attributeBytes(descriptor), array.byteLength, 'matrix columns share one private upload history');
+  const capture = renderId => f.owner.captureDraw(descriptor, {...f.context, renderId});
+  const first = capture(1); first.attributes.install();
+  assert.deepEqual([...columns[0].data.array], initial);
+  const device = geometryDevice(), gpu = createGpuProgramGeometry(device, view, descriptor.attributes, {attributeTypes: 'webgpu'});
+  t.after(() => gpu.dispose());
+  const snapshot = programGeometrySnapshot(gpu, device);
+  const sourceColumns = new Map(inputs.map((input, index) => [input.name, matrix.node.nodes[index].attribute]));
+  const expectedLayouts = new SourceWebGPUAttributeUtils(null).createShaderVertexBuffers({getAttributes: () =>
+    descriptor.attributes.map(input => sourceColumns.get(input.name) ?? f.object.geometry.attributes[input.name])});
+  assert.deepEqual(snapshot.layouts, expectedLayouts);
+  const slot = snapshot.layouts.findIndex(layout => layout.attributes.some(input => input.shaderLocation === inputs[0].location));
+  assert.deepEqual([...new Float32Array(snapshot.vertexBuffers[slot].data)], initial);
+  assert.deepEqual(wrapper.updateRanges, [{start: 0, count: width}], 'source matrix conversion never consumes the wrapper ranges');
+  array.fill(.875); wrapper.needsUpdate = true;
+  const stale = capture(2); stale.attributes.install();
+  assert.deepEqual([...columns[0].data.array], initial,
+    'marking the original matrix wrapper does not mark its source-created interleaved owner');
+  sourceOwner.addUpdateRange(width, width); sourceOwner.needsUpdate = true;
+  const current = capture(3); current.attributes.install();
+  const expected = initial.slice(); expected.fill(.875, width, width * 2);
+  assert.deepEqual([...columns[0].data.array], expected);
+  assert.deepEqual(sourceOwner.updateRanges, []);
+  assert.deepEqual(wrapper.updateRanges, [{start: 0, count: width}]);
+  first.attributes.install(); assert.deepEqual([...columns[0].data.array], initial);
+  current.attributes.install(); assert.deepEqual([...columns[0].data.array], expected);
+  assert.equal(wrapper.array, array); assert.equal(wrapper.itemSize, stride);
+});
+
+for (const width of [3, 4]) test(`public mat${width} wrappers retain one source array owner across aliases and recompilation`, t => {
+  const f = rig(t), stride = width * width, array = new Float32Array(4 * stride).fill(.25);
+  const left = new THREE.BufferAttribute(array, stride), right = new THREE.BufferAttribute(array, stride);
+  const position = N.bufferAttribute(left), color = N.bufferAttribute(right);
+  f.material.positionNode = width === 3 ? position.mul(N.positionLocal) : position.mul(N.vec4(N.positionLocal, 1)).xyz;
+  f.material.colorNode = width === 3 ? color.mul(N.vec3(.25)) : color.mul(N.vec4(.25)).xyz;
+  const descriptor = f.compile(), sourceOwner = position.node.nodes[0].attribute.data;
+  assert.equal(color.node.nodes[0].attribute.data, sourceOwner);
+  assert.equal(f.owner.attributeBytes(descriptor), array.byteLength);
+  const first = f.owner.captureDraw(descriptor, f.context); first.attributes.install();
+  array.fill(.875); f.material.opacityNode = N.uniform(.75);
+  const replacement = f.compile(); assert.notEqual(replacement, descriptor);
+  const next = f.owner.captureDraw(replacement, {...f.context, renderId: 2}); next.attributes.install();
+  const view = f.owner.geometry(replacement);
+  for (const input of replacement.attributes.filter(input => !f.object.geometry.attributes[input.name]))
+    assert.deepEqual([...view.attributes[input.name].data.array], Array(array.length).fill(.25));
+  assert.equal(f.owner.attributeBytes(replacement), array.byteLength);
+  sourceOwner.needsUpdate = true;
+  const updated = f.owner.captureDraw(replacement, {...f.context, renderId: 3}); updated.attributes.install();
+  for (const input of replacement.attributes.filter(input => !f.object.geometry.attributes[input.name]))
+    assert.deepEqual([...view.attributes[input.name].data.array], Array(array.length).fill(.875));
+});
+
+test('public matrix attribute wrappers retain the source-derived flags and callback upload boundary', t => {
+  const f = rig(t), wrapper = new THREE.BufferAttribute(new Float32Array(36).fill(.25), 9, true);
+  wrapper.gpuType = THREE.IntType; wrapper.setUsage(THREE.DynamicDrawUsage);
+  const matrix = N.bufferAttribute(wrapper), gain = N.uniform(1);
+  let sourceOwner, before = 0, current = 0;
+  gain.updateBeforeType = 'object';
+  gain.updateBefore = () => { before++; sourceOwner.array.fill(.5); sourceOwner.needsUpdate = true; };
+  gain.updateType = 'object';
+  gain.update = () => { current++; sourceOwner.array.fill(.75); sourceOwner.needsUpdate = true; };
+  f.material.positionNode = matrix.mul(N.positionLocal).mul(gain);
+  const descriptor = f.compile(); sourceOwner = matrix.node.nodes[0].attribute.data;
+  assert.equal(sourceOwner.usage, THREE.StaticDrawUsage, 'matrix conversion retains its own source usage');
+  assert.ok(matrix.node.nodes.every(column => column.attribute.normalized === false));
+  const draw = f.owner.captureDraw(descriptor, f.context); draw.attributes.install();
+  assert.equal(before, 1); assert.equal(current, 1);
+  const input = descriptor.attributes.find(input => !f.object.geometry.attributes[input.name]);
+  assert.deepEqual([...f.owner.geometry(descriptor).attributes[input.name].data.array], Array(36).fill(.5));
+  assert.deepEqual([...wrapper.array], Array(36).fill(.75));
+});
+
+test('public matrix attributes reject unsupported layouts and replaced arrays before update callbacks', t => {
+  const invalid = [[new Uint32Array(36), 9], [new Float32Array(35), 9],
+    [new Float32Array(new ArrayBuffer(144, {maxByteLength: 288})), 9]];
+  if (typeof SharedArrayBuffer === 'function') invalid.push([new Float32Array(new SharedArrayBuffer(144)), 9]);
+  for (const [array, stride] of invalid) {
+    const f = rig(t), wrapper = new THREE.BufferAttribute(array, stride), matrix = N.bufferAttribute(wrapper);
+    let updates = 0;
+    f.material.positionNode = matrix.mul(N.positionLocal).mul(N.uniform(1).onObjectUpdate(() => { updates++; return 1; }));
+    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'}); assert.equal(updates, 0);
+  }
+  const f = rig(t), wrapper = new THREE.BufferAttribute(new Float32Array(36), 9), matrix = N.bufferAttribute(wrapper);
+  let updates = 0;
+  f.material.positionNode = matrix.mul(N.positionLocal).mul(N.uniform(1).onObjectUpdate(() => { updates++; return 1; }));
+  const descriptor = f.compile(); wrapper.array = new Float32Array(36);
+  assert.throws(() => f.owner.captureDraw(descriptor, f.context), {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'});
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'}); assert.equal(updates, 0);
+});

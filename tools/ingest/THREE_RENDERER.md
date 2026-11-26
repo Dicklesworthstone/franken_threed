@@ -412,6 +412,16 @@ uniform layouts; F3D owns geometry, pipelines, bind groups, draw ordering and
 submission. Float attributes, scalar/vector/matrix uniforms and ordinary sampled
 2D texture graphs are supported. Graphics and compute share captured texture
 versions; native target sampling borrows the actual attachment storage.
+Native TSL graphics also accept public `BufferAttribute` matrix inputs backed
+by fixed `Float32Array` storage with `itemSize` 9 or 16, through `bufferAttribute`
+with explicit `mat3`/`mat4` types or source type inference, including deferred
+`Fn` construction. The pinned factory's vector columns share their derived
+interleaved upload owner. Its versions and ranges determine GPU-visible updates;
+marking the original matrix wrapper remains source-inert. Column aliases retain
+one captured byte history across queued draws and shader recompilation. Source
+WGSL, native vertex layouts and recorded buffer bytes are compared in
+`three_node_program.test.mjs`; this adds no browser-pixel or performance claim.
+
 Ordinary materials with bump/displacement/light maps or Physical sheen, iridescence,
 anisotropy and retroreflectivity use those source shaders without authored node
 slots. Other default node materials continue using the existing fixed path.

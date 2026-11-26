@@ -378,6 +378,18 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // The scene's geometry capture already shares version/range history with
     // ordinary attributes and other render objects; a private generated copy
     // here would consume the same ranges twice or expose unrequested CPU edits.
+    // The source matrix factory splits public itemSize 9/16 wrappers into
+    // vector columns of one cached InterleavedBuffer. That derived owner, not
+    // the original wrapper, owns upload versions and ranges. Preserve the same
+    // private history as a raw-array matrix; sharing the wrapper would observe
+    // needsUpdate/ranges that the source builder never consumes.
+    const matrixWidth = value instanceof three.BufferAttribute && (value.itemSize === 9 ? 3 : value.itemSize === 16 ? 4 : 0);
+    if (matrixWidth && node.bufferType === `vec${matrixWidth}` &&
+        node.bufferStride === value.itemSize && Number.isSafeInteger(node.bufferOffset) &&
+        node.bufferOffset >= 0 && node.bufferOffset < value.itemSize && node.bufferOffset % matrixWidth === 0 &&
+        (node.attribute === null || node.attribute instanceof three.InterleavedBufferAttribute &&
+          node.attribute.data?.array === value.array))
+      return false;
     if (value instanceof three.BufferAttribute && value.itemSize <= 4 && node.attribute === value ||
         value instanceof three.InterleavedBuffer && (node.attribute === null || node.attribute?.data === value))
       return true;
