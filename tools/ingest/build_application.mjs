@@ -41,8 +41,8 @@ import {
   parseHtmlEntries,
   parseSrcsetUrls,
   parseTagAttributes,
-  stripHtmlComments,
-  stripScriptAndStyleBodies,
+  htmlContextTags,
+  rewriteHtmlContextTags,
 } from "./html_parser.mjs";
 import { normalizeSpecifierKey, resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { buildModuleGraph } from "./module_graph.mjs";
@@ -213,14 +213,12 @@ export function extractRelativeAssetUrls(
   skipModulePreloads = false,
   documentRoot = null,
 ) {
-  const domHtml = stripScriptAndStyleBodies(rawHtmlContent);
+  const tags = [...htmlContextTags(rawHtmlContent)].filter(tag => !tag.closing);
   const assets = new Set();
 
   // 1. <link ...> quote-aware
-  const linkRegex = /<link\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>/gi;
-  let match;
-  while ((match = linkRegex.exec(domHtml)) !== null) {
-    const attrs = parseTagAttributes(match[1]);
+  for (const tag of tags.filter(tag => tag.name === "link")) {
+    const attrs = parseTagAttributes(tag.attributes);
     if (attrs.href && isDocumentResourceUrl(attrs.href, documentRoot)) {
       // If this is a modulepreload matching an emitted chunk, it is handled by Rollup bundle emission
       if (
@@ -236,9 +234,8 @@ export function extractRelativeAssetUrls(
   }
 
   // 2. <img ...> quote-aware
-  const imgRegex = /<img\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>/gi;
-  while ((match = imgRegex.exec(domHtml)) !== null) {
-    const attrs = parseTagAttributes(match[1]);
+  for (const tag of tags.filter(tag => tag.name === "img")) {
+    const attrs = parseTagAttributes(tag.attributes);
     if (attrs.src && isDocumentResourceUrl(attrs.src, documentRoot)) {
       assets.add(attrs.src);
     }
@@ -253,9 +250,8 @@ export function extractRelativeAssetUrls(
   }
 
   // 3. <script ...> where type != 'module' quote-aware
-  const scriptRegex = /<script\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>/gi;
-  while ((match = scriptRegex.exec(domHtml)) !== null) {
-    const attrs = parseTagAttributes(match[1]);
+  for (const tag of tags.filter(tag => tag.name === "script")) {
+    const attrs = parseTagAttributes(tag.attributes);
     const type = (attrs.type || "text/javascript").toLowerCase();
     if (type !== "module" && attrs.src && isDocumentResourceUrl(attrs.src, documentRoot)) {
       assets.add(attrs.src);
@@ -263,9 +259,8 @@ export function extractRelativeAssetUrls(
   }
 
   // 4. <video>, <audio>, <source>, <track> quote-aware
-  const mediaRegex = /<(?:video|audio|source|track)\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>/gi;
-  while ((match = mediaRegex.exec(domHtml)) !== null) {
-    const attrs = parseTagAttributes(match[1]);
+  for (const tag of tags.filter(tag => ["video", "audio", "source", "track"].includes(tag.name))) {
+    const attrs = parseTagAttributes(tag.attributes);
     if (attrs.src && isDocumentResourceUrl(attrs.src, documentRoot)) {
       assets.add(attrs.src);
     }
@@ -285,12 +280,10 @@ export function extractRelativeAssetUrls(
   // Inline styles share the document's effective base with markup resources.
   // Consume complete raw-text elements and quoted tags so markup-looking source
   // strings, comments and attribute values cannot create phantom dependencies.
-  const inlineResourceTags =
-    /<!--[\s\S]*?(?:-->|$)|<![^>]*>|<(script|style|textarea|title)\b((?:[^"'>]|"[^"]*"|'[^']*')*)>([\s\S]*?)(?:<\/\1\s*>|$)|<([a-z][a-z0-9:-]*)\b((?:[^"'>]|"[^"]*"|'[^']*')*)>/gi;
-  for (const tag of rawHtmlContent.matchAll(inlineResourceTags)) {
-    const name = (tag[1] ?? tag[4] ?? "").toLowerCase();
+  for (const tag of tags) {
+    const name = tag.name;
     if (!name) continue;
-    const attrs = parseTagAttributes(tag[2] ?? tag[5] ?? "");
+    const attrs = parseTagAttributes(tag.attributes);
     if (attrs.style !== undefined) {
       for (const url of extractRelativeCssUrls(decodeHtmlAssetAttribute(attrs.style), documentRoot)) {
         assets.add(url);
@@ -298,7 +291,7 @@ export function extractRelativeAssetUrls(
     }
     if (name === "style" && ["", "text/css"].includes((attrs.type ?? "").trim().toLowerCase())) {
       // Unlike attributes, a style element's raw text does not decode HTML entities.
-      for (const url of extractRelativeCssUrls(tag[3] ?? "", documentRoot)) assets.add(url);
+      for (const url of extractRelativeCssUrls(tag.body ?? "", documentRoot)) assets.add(url);
     }
     const resource = name === "image"
       ? attrs.href ?? attrs["xlink:href"]
@@ -788,33 +781,13 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
     options.documentRoot,
   );
 
-  // Quote-aware tag scanner:
-  // Match HTML comments, <script>...</script>, <style>...</style>, <base ...>, or <link ...>
-  const tagRegex =
-    /(<!--[\s\S]*?-->)|(<script\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/script\s*>)|(<style\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/style\s*>)|(<base\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>)|(<link\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>)/gi;
-
-  const rewritten = rawHtmlContent.replace(
-    tagRegex,
-    (
-      match,
-      isComment,
-      isScript,
-      scriptAttrs,
-      scriptBody,
-      isStyle,
-      styleAttrs,
-      styleBody,
-      isBase,
-      baseAttrs,
-      isLink,
-      linkAttrs,
-    ) => {
-      if (isComment || isStyle) {
-        return match;
-      }
+  const rewritten = rewriteHtmlContextTags(rawHtmlContent, tag => {
+      const match = tag.text;
+      if (tag.closing) return match;
 
       // Handle <script> tags
-      if (isScript) {
+      if (tag.name === "script" && tag.closed) {
+        const scriptAttrs = tag.attributes, scriptBody = tag.body;
         if (options.classicScriptRewrites?.has(match)) return options.classicScriptRewrites.get(match);
         const attrs = parseTagAttributes(scriptAttrs);
         const scriptType = (attrs.type || "text/javascript").toLowerCase();
@@ -864,12 +837,13 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
       }
 
       // Handle <base> tags: preserved verbatim in emitted HTML to keep document.baseURI semantics
-      if (isBase) {
+      if (tag.name === "base") {
         return match;
       }
 
       // Handle <link> tags: if modulepreload matches an emitted chunk, rewrite href and update SRI integrity
-      if (isLink) {
+      if (tag.name === "link") {
+        const linkAttrs = tag.attributes;
         const parsedLink = parseTagAttributes(linkAttrs);
         if (
           parsedLink.rel &&
@@ -898,8 +872,7 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
       }
 
       return match;
-    },
-  );
+    });
 
   // Enforce entry count equality in both directions
   if (moduleScriptIndex !== entryFiles.length) {
@@ -1034,14 +1007,12 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   if (isHtml) {
     const rawHtml = fs.readFileSync(resolvedEntryAbs, "utf8"), documentUrl = pathToFileURL(resolvedEntryAbs).href;
     const parsed = parseHtmlEntries(rawHtml, documentUrl, {documentRoot}), scripts = [];
-    // Skip markup-looking text in comments, styles and other raw-text elements.
-    const tags = /<!--[\s\S]*?(?:-->|$)|<(script|style|textarea|title)\b((?:[^"'>]|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/\1\s*>/gi;
-    for (const match of rawHtml.matchAll(tags)) {
-      if (match[1]?.toLowerCase() !== "script") continue;
-      const attrs = parseTagAttributes(match[2]);
+    for (const tag of htmlContextTags(rawHtml)) {
+      if (tag.name !== "script" || tag.closing || !tag.closed) continue;
+      const attrs = parseTagAttributes(tag.attributes);
       const sourceType = attrs.type?.trim().toLowerCase() === "module" ? "module" : "script";
       if ((sourceType === "script" && !isClassicJavaScriptType(attrs.type)) || attrs.src === "") continue;
-      let source = match[3], file = null, original = Buffer.from(source);
+      let source = tag.body, file = null, original = Buffer.from(source);
       if (attrs.src !== undefined) {
         const url = new URL(resolveDocumentUrl(attrs.src, parsed.baseUrl, documentRoot));
         if (url.protocol !== "file:" || !isDocumentResourceUrl(attrs.src, documentRoot)) {
@@ -1056,7 +1027,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         source = moduleSources.read(url.href, {sourceType}).code;
       }
       for (const name of workerGlobalBindings(source, {sourceType})) documentWorkerGlobals.add(name);
-      if (sourceType === "script") scripts.push({match, attrs, source, file, original});
+      if (sourceType === "script") scripts.push({tag, attrs, source, file, original});
     }
     const plugin = moduleWorkerRollupPlugin({_moduleSources: moduleSources, sourceType: "script",
       specializeNumeric: options.specializeNumeric, _workerNumericUnits: workerNumericUnits,
@@ -1070,7 +1041,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       targetFiles.set(asset.fileName, asset.source); return asset.fileName;
     }};
     plugin.buildStart();
-    for (const {match, attrs, source, file, original} of scripts) {
+    for (const {tag, attrs, source, file, original} of scripts) {
       // Preserve an original SRI failure instead of turning it into a working
       // script while rewriting its URLs. Supported digests use their strongest
       // algorithm, matching the browser's choice among multiple metadata tokens.
@@ -1086,12 +1057,12 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         if (known.length) {
           const metadata = tokens.map(token => /^(sha(?:256|384|512))-/.test(token)
             ? computeIntegrityForContent(token, transformed.code) : token).join(" ");
-          const updated = match[2].replace(/(?:^|\s+)([a-zA-Z0-9_:-]+)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?/g,
+          const updated = tag.attributes.replace(/(?:^|\s+)([a-zA-Z0-9_:-]+)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?/g,
             (attribute, name) => name.toLowerCase() === "integrity"
               ? attribute.replace(/integrity[\s\S]*/i, `integrity="${metadata}"`) : attribute);
-          classicScriptRewrites.set(match[0], `<script${updated}>${match[3]}</script>`);
+          classicScriptRewrites.set(tag.text, `<script${updated}>${tag.body}</script>`);
         }
-      } else classicScriptRewrites.set(match[0], `<script${match[2]}>${transformed.code}</script>`);
+      } else classicScriptRewrites.set(tag.text, `<script${tag.attributes}>${transformed.code}</script>`);
     }
   }
 
@@ -1192,15 +1163,13 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     }
 
     // Scan inline classic scripts in HTML for static literal dynamic imports
-    const sanitizedHtml = stripHtmlComments(rawHtmlContent);
-    const inlineScriptRegex = /<script\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/script\s*>/gi;
-    let inlineMatch;
-    while ((inlineMatch = inlineScriptRegex.exec(sanitizedHtml)) !== null) {
-      const attrs = parseTagAttributes(inlineMatch[1]);
+    for (const tag of htmlContextTags(rawHtmlContent)) {
+      if (tag.name !== "script" || !tag.closed || tag.closing) continue;
+      const attrs = parseTagAttributes(tag.attributes);
       if (attrs.src !== undefined || !isClassicJavaScriptType(attrs.type)) {
         continue;
       }
-      const scriptBody = inlineMatch[2];
+      const scriptBody = tag.body;
       if (!scriptBody || !scriptBody.trim()) continue;
       copyFetchResources(scriptBody, "script");
 

@@ -23,6 +23,7 @@ import { isThreeLoaderResourceModule } from "./three_loader_resources.mjs";
 import { analyzeDocumentFetch, isLocalDocumentFetchUrl } from "./document_fetch_assets.mjs";
 import { documentRelativePath, isRootRelativeDocumentUrl, normalizeDocumentRoot, resolveDocumentUrl } from "./document_urls.mjs";
 import { cssResources } from "./css_resources.mjs";
+import { htmlContextTags } from "./html_parser.mjs";
 
 export class HtmlPackingError extends Error {
   constructor(code, message) {
@@ -105,9 +106,6 @@ function replaceAttributes(raw, changes) {
     if (!done.has(key) && value !== null) output += ` ${key}="${quote(value)}"`;
   return output;
 }
-// Contextual scanning: markup-looking strings inside raw text are not elements.
-const TAGS =
-  /<!--[\s\S]*?(?:-->|$)|<![^>]*>|<(script|style|textarea|title)\b((?:[^"'>]|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/\1\s*>|<([a-z][a-z0-9:-]*)\b((?:[^"'>]|"[^"]*"|'[^']*')*)>/gi;
 const JS_TYPES = new Set([
   "",
   "text/javascript",
@@ -313,7 +311,7 @@ export function packHtml(
     return url.href;
   }
   const html = text(read(documentUrl));
-  const tags = [...html.matchAll(TAGS)];
+  const tags = [...htmlContextTags(html)].filter(tag => !tag.closing);
   let base = documentUrl,
     executableSeen = false,
     baseSeen = false,
@@ -321,8 +319,8 @@ export function packHtml(
   const sourceMaps = [],
     mapRanges = [];
   for (const tag of tags) {
-    const name = (tag[1] ?? tag[4] ?? "").toLowerCase(),
-      attrs = attributes(tag[2] ?? tag[5] ?? "");
+    const name = tag.name, attrs = attributes(tag.attributes);
+    if (name === "script" && !tag.closed) continue;
     if (name === "base") {
       // HTML uses the first href, independently of the first target. Keep all
       // source base elements intact so DOM reflection and navigation keep their
@@ -375,7 +373,7 @@ export function packHtml(
       if (attrs.src !== undefined) fail("IMPORT_MAP", "External import maps are not supported");
       let map;
       try {
-        map = JSON.parse(tag[3]);
+        map = JSON.parse(tag.body);
       } catch {
         fail("IMPORT_MAP", "Invalid import-map JSON");
       }
@@ -384,7 +382,7 @@ export function packHtml(
       if (map.integrity && Object.keys(map.integrity).length)
         fail("IMPORT_MAP_INTEGRITY", "Integrity-pinned import maps require the normal build");
       sourceMaps.push(map);
-      mapRanges.push({ start: tag.index, end: tag.index + tag[0].length, value: "" });
+      mapRanges.push({ start: tag.start, end: tag.end, value: "" });
     } else if (type === "module" || JS_TYPES.has(type)) executableSeen = true;
   }
   // Import maps are resolved in the source environment before any URLs change.
@@ -1176,12 +1174,12 @@ export function packHtml(
   let firstScript = html.length,
     inlineId = 0;
   for (const tag of tags) {
-    const name = (tag[1] ?? tag[4] ?? "").toLowerCase(),
-      raw = tag[2] ?? tag[5] ?? "",
+    const name = tag.name,
+      raw = tag.attributes,
       attrs = attributes(raw),
       changes = {};
-    if (!name || ["textarea", "title", "base"].includes(name)) continue;
-    let body = tag[3],
+    if (!name || name === "base" || name === "script" && !tag.closed) continue;
+    let body = tag.body,
       changedBody = false;
     const get = (key) => (attrs[key] === undefined ? null : entities(attrs[key]));
     const rewriteResource = (key, stylesheet = false, module = false) => {
@@ -1218,7 +1216,7 @@ export function packHtml(
       const type = (get("type") ?? "").trim().toLowerCase();
       if (type === "importmap") continue;
       if (type !== "module" && !JS_TYPES.has(type)) continue;
-      firstScript = Math.min(firstScript, tag.index);
+      firstScript = Math.min(firstScript, tag.start);
       if (type === "module") {
         if (attrs.src !== undefined) rewriteResource("src", false, true);
         else {
@@ -1240,16 +1238,16 @@ export function packHtml(
           changes.integrity = integrity(get("integrity"), original, Buffer.from(transformed));
       } else {
         body = javascript(body, base, "script");
-        changedBody = body !== tag[3];
+        changedBody = body !== tag.body;
       }
     } else if (name === "style") {
       body = css(body, base);
-      changedBody = body !== tag[3];
+      changedBody = body !== tag.body;
     } else if (name === "link") {
       const rel = (get("rel") ?? "").toLowerCase().split(/\s+/);
       if (rel.includes("stylesheet")) rewriteResource("href", true);
       else if (rel.includes("modulepreload")) {
-        firstScript = Math.min(firstScript, tag.index);
+        firstScript = Math.min(firstScript, tag.start);
         rewriteResource("href", false, true);
       } else if (rel.some((value) => ["icon", "preload"].includes(value))) rewriteResource("href");
       else if (attrs.href !== undefined)
@@ -1273,11 +1271,12 @@ export function packHtml(
       changes.srcset = rewriteSrcset(get("srcset"), (value) => assetFor(local(value, base)));
     if (attrs.style !== undefined) changes.style = css(get("style"), base);
     if (Object.keys(changes).length || changedBody) {
-      const open = `<${tag[1] ?? tag[4]}${replaceAttributes(raw, changes)}>`;
+      const open = `<${tag.rawName}${replaceAttributes(raw, changes)}>`;
       replacements.push({
-        start: tag.index,
-        end: tag.index + tag[0].length,
-        value: tag[1] ? open + body + `</${tag[1]}>` : open,
+        start: tag.start,
+        end: tag.end,
+        value: body === undefined ? open : open + body +
+          tag.text.slice(tag.bodyStart - tag.start + tag.body.length),
       });
     }
   }

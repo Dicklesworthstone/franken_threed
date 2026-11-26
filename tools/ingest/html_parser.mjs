@@ -12,67 +12,76 @@ import { IngestionParseError } from "./types.mjs";
 import { normalizeDocumentRoot, resolveDocumentUrl } from "./document_urls.mjs";
 import { normalizeSpecifierKey } from "./resolver.mjs";
 
-/**
- * Strips HTML comments while preserving characters and newlines
- * so that line numbers, column numbers, and byte offsets remain exact.
- * @param {string} html
- * @returns {string}
+/** Source-preserving HTML text boundaries shared by discovery and emission.
+ * A quote-aware ordinary tag is consumed as a whole, so a displayed tag in an
+ * attribute cannot start a second element. RCDATA/raw-text contents belong to
+ * their element until its matching end tag (or EOF), never to the module graph.
+ * Scripting is enabled for these application builds, including <noscript>.
+ * This is not a DOM tree builder: template activation and foreign-content tree
+ * construction are not inferred from these lexical text boundaries.
  */
-/**
- * Shared contextual scanner regex for HTML documents.
- * Matches HTML comments, <script>...</script>, and <style>...</style> tokens contextually
- * so that comment markers (<!--) inside script or style text are never confused with HTML comments.
- */
-export const HTML_CONTEXT_REGEX =
-  /(<!--[\s\S]*?-->)|(<script\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/script\s*>)|(<style\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/style\s*>)/gi;
+export function* htmlContextTags(html) {
+  const tags = /<!--[\s\S]*?(?:-->|$)|<![^>]*>|<\/?([a-z][^\t\n\f\r />]*)(?=[\t\n\f\r />])((?:[^"'<>]|"[^"]*"|'[^']*')*)>/gi;
+  const textNames = new Set(["script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "noscript", "plaintext"]);
+  let match;
+  while ((match = tags.exec(html)) !== null) {
+    const rawName = match[1], name = rawName?.toLowerCase() ?? "";
+    const token = {name, rawName, attributes: match[2] ?? "", start: match.index,
+      end: tags.lastIndex, bodyStart: tags.lastIndex, body: undefined,
+      closing: match[0].startsWith("</"), comment: match[0].startsWith("<!--"), closed: true};
+    if (!token.closing && textNames.has(name)) {
+      const endTag = new RegExp(`</${name}(?=[\\t\\n\\f\\r />])(?:[^"'<>]|"[^"]*"|'[^']*')*>`, "gi");
+      endTag.lastIndex = tags.lastIndex;
+      const end = name === "plaintext" ? null : endTag.exec(html);
+      token.body = html.slice(token.bodyStart, end?.index ?? html.length);
+      token.end = end ? endTag.lastIndex : html.length;
+      token.closed = end !== null;
+      tags.lastIndex = token.end;
+    }
+    token.text = html.slice(token.start, token.end);
+    yield token;
+  }
+}
+
+/** Rewrite only actual source tags, preserving every intervening byte. */
+export function rewriteHtmlContextTags(html, rewrite) {
+  const parts = [];
+  let end = 0;
+  for (const tag of htmlContextTags(html)) {
+    parts.push(html.slice(end, tag.start), rewrite(tag));
+    end = tag.end;
+  }
+  parts.push(html.slice(end));
+  return parts.join("");
+}
 
 /**
  * Strips HTML comments while preserving layout coordinates and byte offsets.
- * Recognizes complete script and style rawtext tokens so that comment markers
- * (e.g. const marker = "<!--";) inside script/style bodies are never treated as HTML comments.
+ * Comment markers inside RCDATA and raw text remain source content.
  *
  * @param {string} html
  * @returns {string}
  */
 export function stripHtmlComments(html) {
-  return html.replace(HTML_CONTEXT_REGEX, (match, comment) => {
-    if (comment) {
-      return comment.replace(/[^\r\n]/g, " ");
-    }
-    return match;
-  });
+  return rewriteHtmlContextTags(html, tag => tag.comment ? tag.text.replace(/[^\r\n]/g, " ") : tag.text);
 }
 
 /**
- * Masks comments as well as script and style bodies with spaces, preserving opening/closing
- * tags and exact byte offsets. Used for DOM-level asset discovery and base tag inspection
- * to prevent false discoveries inside JS/CSS strings.
+ * Masks comments and text-element bodies with spaces, preserving opening/closing
+ * tags and exact source offsets. Discovery uses htmlContextTags directly so
+ * quoted attribute values cannot introduce a second apparent tag.
  *
  * @param {string} html
  * @returns {string}
  */
 export function stripScriptAndStyleBodies(html) {
-  return html.replace(
-    HTML_CONTEXT_REGEX,
-    (match, comment, scriptBlock, scriptAttrs, scriptBody, styleBlock, styleAttrs, styleBody) => {
-      if (comment) {
-        return comment.replace(/[^\r\n]/g, " ");
-      }
-      if (scriptBlock) {
-        const openTagLen = 7 + scriptAttrs.length + 1;
-        const openTag = scriptBlock.slice(0, openTagLen);
-        const closeTag = scriptBlock.slice(openTagLen + scriptBody.length);
-        return openTag + scriptBody.replace(/[^\r\n]/g, " ") + closeTag;
-      }
-      if (styleBlock) {
-        const openTagLen = 6 + styleAttrs.length + 1;
-        const openTag = styleBlock.slice(0, openTagLen);
-        const closeTag = styleBlock.slice(openTagLen + styleBody.length);
-        return openTag + styleBody.replace(/[^\r\n]/g, " ") + closeTag;
-      }
-      return match;
-    },
-  );
+  return rewriteHtmlContextTags(html, tag => {
+    if (tag.comment) return tag.text.replace(/[^\r\n]/g, " ");
+    if (tag.body === undefined) return tag.text;
+    const openEnd = tag.bodyStart - tag.start;
+    return tag.text.slice(0, openEnd) + tag.body.replace(/[^\r\n]/g, " ") +
+      tag.text.slice(openEnd + tag.body.length);
+  });
 }
 
 /**
@@ -173,18 +182,12 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl, options = {}) {
   /** @type {string[]} */
   const preloads = [];
 
-  // Strip comments while preserving layout coordinates
-  const sanitizedHtml = stripHtmlComments(rawHtmlContent);
-
-  // Strip script and style bodies for DOM/base/preload discovery
-  const domHtml = stripScriptAndStyleBodies(sanitizedHtml);
+  const tags = [...htmlContextTags(rawHtmlContent)].filter(tag => !tag.closing);
 
   // Match <base href="..."> if present to determine effective base URL in DOM
   let baseHref = null;
-  const baseRegex = /<base\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>/gi;
-  let baseMatch;
-  while ((baseMatch = baseRegex.exec(domHtml)) !== null) {
-    const attrs = parseTagAttributes(baseMatch[1]);
+  for (const tag of tags.filter(tag => tag.name === "base")) {
+    const attrs = parseTagAttributes(tag.attributes);
     if (baseHref === null && Object.hasOwn(attrs, "href")) {
       baseHref = attrs.href;
     }
@@ -192,32 +195,26 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl, options = {}) {
   const effectiveBaseUrl = baseHref !== null ? resolveDocumentUrl(baseHref, documentUrl, documentRoot) : documentUrl;
 
   // Match <link rel="modulepreload" ...> using quote-aware attribute scanner on DOM
-  const linkRegex = /<link\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>/gi;
-  let linkMatch;
-  while ((linkMatch = linkRegex.exec(domHtml)) !== null) {
-    const attrs = parseTagAttributes(linkMatch[1]);
+  for (const tag of tags.filter(tag => tag.name === "link")) {
+    const attrs = parseTagAttributes(tag.attributes);
     if (attrs.rel && attrs.rel.toLowerCase() === "modulepreload" && attrs.href) {
       preloads.push(attrs.href);
     }
   }
 
   // Match all <script>...</script> tags with attributes using quote-aware scanner
-  const scriptRegex = /<script\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/script\s*>/gi;
-  let scriptMatch;
   let inlineModuleIndex = 0;
 
-  while ((scriptMatch = scriptRegex.exec(sanitizedHtml)) !== null) {
-    const fullTag = scriptMatch[0];
-    const attrString = scriptMatch[1];
-    const scriptBody = scriptMatch[2];
-    const matchOffset = scriptMatch.index;
+  for (const tag of tags.filter(tag => tag.name === "script" && tag.closed)) {
+    const attrString = tag.attributes;
+    const scriptBody = tag.body;
 
     const attrs = parseTagAttributes(attrString);
     const scriptType = (attrs.type || "text/javascript").toLowerCase();
 
     // Calculate line and column of script body start using matched attribute length
     // rather than indexOf('>') to prevent corruption when attributes contain quoted '>'
-    const openingTagEndIndex = matchOffset + 7 + attrString.length + 1;
+    const openingTagEndIndex = tag.bodyStart;
     const prefixBeforeBody = rawHtmlContent.slice(0, openingTagEndIndex);
     const lines = prefixBeforeBody.split("\n");
     const startLine = lines.length;
