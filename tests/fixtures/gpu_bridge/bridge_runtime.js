@@ -258,18 +258,31 @@ export class WebGpuBridgeHost {
   destroyDevice() {
     // Also cancel a pending request that has not published a device yet.
     this.deviceRequest++;
-    const device = this.device;
-    const generation = this.deviceGeneration;
+    const records = [...this.retiringResources.values()];
+    const devices = new Set(records.map((record) => record.device).filter(Boolean));
+    if (this.device) devices.add(this.device);
     this.clearDeviceResources();
     this.device = null;
     this.adapter = null;
     this.capabilityRecord = null;
     this.deviceGeneration++;
-    device?.destroy();
-    if (device) {
+    let cleanupError;
+    for (const device of devices) {
+      try {
+        device.destroy();
+      } catch (error) {
+        cleanupError ??= error;
+      }
       this.retiredDevices.add(device);
-      this.finishDeviceRetirements(device, generation);
     }
+    for (const record of records) {
+      try {
+        this.destroyRetiredResource(record);
+      } catch (error) {
+        cleanupError ??= error;
+      }
+    }
+    if (cleanupError) throw cleanupError;
   }
 
   /**

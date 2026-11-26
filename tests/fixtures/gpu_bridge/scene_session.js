@@ -4,6 +4,10 @@
  * The caller owns scheduling (there is no RAF/timer loop here). Rust/Wasm owns
  * scene compilation and packet production; this module only owns browser host
  * resources, cancellation, and publication of the latest scene generation.
+ * GPU completion returns submission credit; validation receipts do not.
+ * maxFramesInFlight is an opt-in positive limit for controlled throughput runs;
+ * the default null preserves caller-scheduled on-screen rendering. A limit is
+ * applied before a frame producer runs, so queued packets cannot grow unbounded.
  *
  * A scene factory receives {width, height, capabilities, signal, generation}
  * and returns {packet: Uint8Array, frame?: fn, dispose?: fn}. `frame` receives
@@ -17,6 +21,7 @@ export class WebGpuSceneSession {
     canvas,
     requiredProfile = {},
     maxRecoveryAttempts = 1,
+    maxFramesInFlight = null,
     onState = () => {},
     onError = () => {},
   }) {
@@ -31,6 +36,10 @@ export class WebGpuSceneSession {
     if (!Number.isSafeInteger(maxRecoveryAttempts) || maxRecoveryAttempts < 0) {
       throw new RangeError("maxRecoveryAttempts must be a non-negative safe integer");
     }
+    if (maxFramesInFlight !== null &&
+        (!Number.isSafeInteger(maxFramesInFlight) || maxFramesInFlight < 1)) {
+      throw new RangeError("maxFramesInFlight must be null or a positive safe integer");
+    }
     if (typeof onState !== "function" || typeof onError !== "function") {
       throw new TypeError("onState and onError must be functions");
     }
@@ -40,6 +49,8 @@ export class WebGpuSceneSession {
     this.canvas = canvas;
     this.profile = requiredProfile;
     this.maxRecoveryAttempts = maxRecoveryAttempts;
+    this.maxFramesInFlight = maxFramesInFlight;
+    this.inFlight = new Set();
     this.onState = onState;
     this.onError = onError;
     this.state = "idle";
@@ -65,6 +76,7 @@ export class WebGpuSceneSession {
       width: this.size?.width ?? this.canvas.width,
       height: this.size?.height ?? this.canvas.height,
       submittedFrames: this.submittedFrames,
+      framesInFlight: this.inFlight.size,
       recoveryAttempts: this.recoveryAttempts,
       lastError: this.lastError,
     });
@@ -105,6 +117,8 @@ export class WebGpuSceneSession {
       const frame = scene?.frame;
       if (!frame) return this.snapshot();
       try {
+        // Acquire GPU credit before calling source code or producing packet bytes.
+        await this.waitForFrameCredit(token);
         const packet = await waitFor(
           Promise.resolve().then(() => {
             this.check(token);
@@ -115,7 +129,7 @@ export class WebGpuSceneSession {
         this.check(token);
         if (packet != null) {
           validatePacket(packet);
-          await waitFor(this.host.executePacket(packet, this.context), token.signal);
+          await waitFor(this.submitPacket(packet, token), token.signal);
           this.check(token);
           this.submittedFrames++;
         }
@@ -134,6 +148,7 @@ export class WebGpuSceneSession {
     this.generation++;
     this.state = "closed";
     this.observedDevice = null;
+    this.inFlight.clear();
     // Publish the close promise before dispatching abort or observer callbacks:
     // those callbacks may synchronously request close again.
     this.closePromise = this.enqueue(async () => {
@@ -184,6 +199,7 @@ export class WebGpuSceneSession {
         const completion = this.host.device?.queue.onSubmittedWorkDone();
         if (completion) await waitFor(completion, token.signal);
         this.check(token);
+        this.inFlight.clear();
         this.clearResidency();
         await waitFor(disposal, token.signal);
         this.check(token);
@@ -195,6 +211,7 @@ export class WebGpuSceneSession {
         }
         this.watchDevice();
         this.validateSize(size.width, size.height);
+        await this.waitForFrameCredit(token);
         const build = Promise.resolve().then(() => {
           this.check(token);
           return factory(this.sceneContext(token));
@@ -215,7 +232,7 @@ export class WebGpuSceneSession {
           format: this.host.capabilityRecord.preferredCanvasFormat,
           alphaMode: "premultiplied",
         });
-        await waitFor(this.host.executePacket(candidate.packet, this.context), token.signal);
+        await waitFor(this.submitPacket(candidate.packet, token), token.signal);
         this.check(token);
         this.scene = candidate;
         candidate = null;
@@ -231,14 +248,60 @@ export class WebGpuSceneSession {
     });
   }
 
+  async waitForFrameCredit(token) {
+    for (;;) {
+      this.check(token);
+      if (this.maxFramesInFlight === null) return;
+      const pending = [...this.inFlight].filter(({ device }) => device === this.host.device);
+      if (pending.length < this.maxFramesInFlight) return;
+      await waitFor(Promise.race(pending.map(({ completion }) => completion)), token.signal);
+    }
+  }
+
+  submitPacket(packet, token) {
+    const device = this.host.device;
+    return this.host.executePacket(packet, this.context, () => {
+      // Capture the queue high-water mark at actual submission, before awaiting
+      // the host's validation receipt. Validation does not release GPU credit.
+      const completion = device.queue.onSubmittedWorkDone();
+      const frame = { device, completion: null };
+      this.inFlight.add(frame);
+      frame.completion = Promise.resolve(completion).then(
+        () => {
+          if (!this.inFlight.has(frame)) return;
+          // One acknowledgement also retires earlier submissions to this queue.
+          for (const prior of this.inFlight) {
+            if (prior.device === device) this.inFlight.delete(prior);
+            if (prior === frame) break;
+          }
+        },
+        (error) => {
+          if (!this.inFlight.has(frame)) return;
+          // A failed queue acknowledgement terminates its outstanding credits;
+          // it does not count those frames as successfully completed.
+          for (const pending of this.inFlight) {
+            if (pending.device === device) this.inFlight.delete(pending);
+          }
+          this.failCurrent(token, error);
+          throw error;
+        },
+      );
+      // Completion may fail before anyone waits for another frame, or after
+      // cancellation. Its rejection is always owned; it never retries a producer.
+      void frame.completion.catch(() => {});
+    });
+  }
+
   watchDevice() {
     const device = this.host.device;
     if (device === this.observedDevice) return;
     this.observedDevice = device;
+    this.inFlight.clear();
     device.lost
       .then((info) => {
         if (this.state === "closed" || this.observedDevice !== device) return;
         this.observedDevice = null;
+        this.inFlight.clear();
         const error = new Error(
           `WebGPU device lost: ${info?.message || info?.reason || "unknown reason"}`,
         );

@@ -102,9 +102,10 @@ function fixture(options = {}) {
       this.clearDeviceResources();
       device?.destroy();
     },
-    async executePacket(bytes) {
+    async executePacket(bytes, _context, onSubmitted) {
       assert.ok(this.device, "No submission without a live device");
       log.push(["submit", bytes[16], this.device.id]);
+      onSubmitted?.();
       if (this.submitGate) await this.submitGate.promise;
     },
   };
@@ -118,6 +119,205 @@ function fixture(options = {}) {
 }
 const submissions = (f) => f.log.filter((e) => e[0] === "submit").map((e) => e[1]);
 const aborts = (promise) => assert.rejects(promise, { name: "AbortError" });
+
+test("frame credit limits must be null or positive safe integers", async () => {
+  for (const maxFramesInFlight of [false, 0, -1, NaN, Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => fixture({ maxFramesInFlight }), /positive safe integer/);
+  }
+  for (const maxFramesInFlight of [null, 1, 2, Number.MAX_SAFE_INTEGER]) {
+    await fixture({ maxFramesInFlight }).session.close();
+  }
+});
+
+test("default on-screen scheduling never waits for GPU completion or drops requested frames", async () => {
+  const f = fixture(), gpu = deferred();
+  const times = [];
+  f.host.queueGate = gpu;
+  await f.session.load(() => ({
+    packet: packet(1),
+    frame: ({ time }) => { times.push(time); return packet(times.length + 1); },
+  }));
+  const requested = [10, 20, 30, 40].map((time) => f.session.render(time));
+  await until(() => submissions(f).length === 5);
+  await Promise.all(requested);
+  assert.deepEqual(times, [10, 20, 30, 40]);
+  assert.deepEqual(submissions(f), [1, 2, 3, 4, 5]);
+  assert.equal(f.session.snapshot().framesInFlight, 5);
+  gpu.resolve();
+  await until(() => f.session.snapshot().framesInFlight === 0);
+  await f.session.close();
+});
+
+test("two opt-in GPU credits bound producers and a high-water acknowledgement retires earlier frames", async () => {
+  const f = fixture({ maxFramesInFlight: 2 }), initial = deferred(), second = deferred(), next = deferred();
+  let calls = 0;
+  f.host.queueGate = initial;
+  await f.session.load(() => ({ packet: packet(1), frame: () => packet(++calls + 1) }));
+  f.host.queueGate = second;
+  await f.session.render(1);
+  f.host.queueGate = next;
+  const blocked = f.session.render(2);
+  await tick();
+  assert.equal(calls, 1, "Successful validation receipts do not release GPU credits");
+  assert.deepEqual(submissions(f), [1, 2]);
+  second.resolve();
+  await blocked;
+  const fourth = f.session.render(3);
+  await until(() => calls === 3);
+  await fourth;
+  assert.deepEqual(submissions(f), [1, 2, 3, 4]);
+  next.resolve();
+  initial.resolve();
+  await f.session.close();
+});
+
+test("load captures completion at submission instead of after its validation receipt", async () => {
+  const f = fixture({ maxFramesInFlight: 1 }), gpu = deferred(), validation = deferred();
+  let calls = 0;
+  f.host.queueGate = gpu;
+  f.host.submitGate = validation;
+  const loading = f.session.load(() => ({ packet: packet(1), frame: () => packet(++calls + 1) }));
+  await until(() => submissions(f).length === 1);
+  f.host.queueGate = null;
+  validation.resolve();
+  await loading;
+  const rendering = f.session.render();
+  await tick();
+  assert.equal(calls, 0, "The initial packet still owns its GPU credit");
+  gpu.resolve();
+  await rendering;
+  assert.equal(calls, 1);
+  await f.session.close();
+});
+
+test("replacement cancels a blocked producer and drains old GPU work before its factory", async () => {
+  const f = fixture({ maxFramesInFlight: 1 }), gpu = deferred();
+  let frames = 0, builds = 0;
+  f.host.queueGate = gpu;
+  await f.session.load(() => ({ packet: packet(1), frame: () => { frames++; return packet(2); } }));
+  const blocked = f.session.render(), rejected = aborts(blocked);
+  await tick();
+  const replacing = f.session.load(() => { builds++; return { packet: packet(3) }; });
+  await rejected;
+  await tick();
+  assert.equal(frames, 0);
+  assert.equal(builds, 0);
+  gpu.resolve();
+  await replacing;
+  assert.equal(builds, 1);
+  assert.deepEqual(submissions(f), [1, 3]);
+  await f.session.close();
+});
+
+test("close releases a credit wait and owns a later completion rejection", async () => {
+  const f = fixture({ maxFramesInFlight: 1 }), gpu = deferred();
+  let calls = 0;
+  f.host.queueGate = gpu;
+  await f.session.load(() => ({ packet: packet(1), frame: () => { calls++; return packet(2); } }));
+  const rendering = f.session.render(), rejected = aborts(rendering);
+  await tick();
+  await f.session.close();
+  await rejected;
+  gpu.reject(new Error("completion rejected after shutdown"));
+  await tick();
+  assert.equal(calls, 0);
+  assert.equal(f.session.state, "closed");
+  assert.deepEqual(f.errors, []);
+});
+
+test("device loss cancels credit waits and old completions cannot fail a successor", async () => {
+  const f = fixture({ maxFramesInFlight: 1 }), oldGpu = deferred();
+  const builds = [];
+  let frames = 0;
+  f.host.queueGate = oldGpu;
+  await f.session.load(({ capabilities }) => {
+    builds.push(capabilities.deviceId);
+    return { packet: packet(capabilities.deviceId), frame: () => { frames++; return packet(3); } };
+  });
+  const rendering = f.session.render(), rejected = aborts(rendering);
+  await tick();
+  f.host.queueGate = null;
+  f.devices[0].lose({ message: "loss while waiting for GPU credit" });
+  await rejected;
+  await until(() => f.session.state === "ready" && f.devices.length === 2);
+  oldGpu.reject(new Error("old device completion"));
+  await tick();
+  assert.equal(frames, 0);
+  assert.equal(f.session.state, "ready");
+  assert.deepEqual(builds, [1, 2]);
+  assert.equal(f.errors.length, 1);
+  await f.session.render();
+  assert.equal(frames, 1);
+  await f.session.close();
+});
+
+test("a rejected GPU completion fails the scene without replaying source callbacks", async () => {
+  const f = fixture({ maxFramesInFlight: 1 }), gpu = deferred();
+  let frames = 0;
+  f.host.queueGate = gpu;
+  await f.session.load(() => ({ packet: packet(1), frame: () => { frames++; return packet(2); } }));
+  const blocked = f.session.render(), rejected = aborts(blocked);
+  await tick();
+  gpu.reject(new Error("GPU completion failed"));
+  await rejected;
+  assert.equal(f.session.state, "failed");
+  assert.equal(frames, 0);
+  assert.match(f.session.lastError, /GPU completion failed/);
+  assert.equal(f.errors.length, 1);
+  assert.deepEqual(submissions(f), [1]);
+  await f.session.close();
+});
+
+test("a failed queue acknowledgement terminates every outstanding credit on that device", async () => {
+  const f = fixture({ maxFramesInFlight: 2 }), first = deferred(), second = deferred();
+  let frames = 0;
+  f.host.queueGate = first;
+  await f.session.load(() => ({ packet: packet(1), frame: () => packet(++frames + 1) }));
+  f.host.queueGate = second;
+  await f.session.render(1);
+  const blocked = f.session.render(2), rejected = aborts(blocked);
+  await tick();
+  assert.equal(f.session.snapshot().framesInFlight, 2);
+  first.reject(new Error("queue completion failed"));
+  await rejected;
+  assert.equal(f.session.state, "failed");
+  assert.equal(f.session.snapshot().framesInFlight, 0);
+  assert.equal(frames, 1);
+  second.reject(new Error("later failure on the terminal queue"));
+  await tick();
+  assert.equal(f.errors.length, 1);
+  assert.match(f.session.lastError, /queue completion failed/);
+  assert.deepEqual(submissions(f), [1, 2]);
+  await f.session.close();
+});
+
+test("failed validation stops queued callbacks and replacement still waits for submitted GPU work", async () => {
+  const f = fixture(), gpu = deferred(), validation = deferred();
+  let frames = 0, builds = 0;
+  await f.session.load(() => {
+    builds++;
+    return { packet: packet(1), frame: () => packet(++frames + 1) };
+  });
+  f.host.queueGate = gpu;
+  f.host.submitGate = validation;
+  const first = f.session.render(), second = f.session.render();
+  const failures = Promise.all([assert.rejects(first, /validation failed/), aborts(second)]);
+  await until(() => submissions(f).length === 2);
+  validation.reject(new Error("validation failed"));
+  await failures;
+  assert.equal(frames, 1);
+  assert.equal(f.session.state, "failed");
+  f.host.submitGate = null;
+  const reloading = f.session.reload();
+  await tick();
+  assert.equal(builds, 1, "Failed validation does not cancel issued GPU work");
+  gpu.resolve();
+  await reloading;
+  assert.equal(builds, 2);
+  assert.equal(frames, 1);
+  assert.deepEqual(submissions(f), [1, 2, 1]);
+  await f.session.close();
+});
 
 test("initializes a scene and submits explicit frames with negotiated capabilities", async () => {
   const f = fixture();

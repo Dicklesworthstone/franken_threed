@@ -366,3 +366,28 @@ for (const [name, command, payload] of [
     assert.equal(f.serial, before); assert.deepEqual(f.scopes, []);
   });
 }
+
+test("shutdown drains both current and older devices even when retirement fences never settle", async () => {
+  const f = fixture();
+  await f.host.executePacket(packet([buffer(1), texture(10)]));
+  const old = [f.host.buffers.get(1), f.host.textures.get(10)];
+  const next = deviceFixture();
+  f.host.installDeviceForTest({}, next.device);
+  await f.host.executePacket(packet([buffer(1)]));
+  const current = f.host.buffers.get(1);
+  await f.host.executePacket(packet([release(0, 1)]));
+  for (const resource of [...old, current]) assert.equal(resource.destroys, 0);
+  f.host.destroyDevice();
+  assert.equal(f.host.device, null);
+  assert.equal(f.host.retiringResources.size, 0);
+  assert.equal(f.events.filter(([name]) => name === "device-destroy").length, 1);
+  assert.equal(next.events.filter(([name]) => name === "device-destroy").length, 1);
+  for (const resource of [...old, current]) assert.equal(resource.destroys, 1);
+  f.complete();
+  next.failCompletion(new Error("late completion after shutdown"));
+  await tick();
+  f.host.destroyDevice();
+  for (const resource of [...old, current]) assert.equal(resource.destroys, 1);
+  assert.equal(f.events.filter(([name]) => name === "device-destroy").length, 1);
+  assert.equal(next.events.filter(([name]) => name === "device-destroy").length, 1);
+});
