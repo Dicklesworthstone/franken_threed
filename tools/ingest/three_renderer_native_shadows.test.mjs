@@ -89,6 +89,36 @@ function fixture(t) {
     light, deformation, acquired: () => acquired};
 }
 
+for (const scope of ['renderer', 'material'])
+test(`native ${scope} shadow contexts retain real caster passes and queued shadow uniforms`, async t => {
+  const f = fixture(t), updates = [];
+  f.renderer.outputColorSpace = T.LinearSRGBColorSpace;
+  const first = N.uniform(.375).setName('firstShadowContext'), next = N.uniform(.625).setName('nextShadowContext');
+  for (const node of [first, next]) node.onObjectUpdate(frame => { updates.push(frame.object); return node.value; });
+  f[scope].contextNode = N.builtinShadowContext(first, f.light);
+  await f.renderer.init();
+  let release; const pending = new Promise(resolve => { release = resolve; }), create = f.device.createRenderPipelineAsync;
+  f.device.createRenderPipelineAsync = async descriptor => { await pending; return create(descriptor); };
+  const render = () => { f.renderer._advanceAnimationFrame(); f.renderer.render(f.scene, f.camera); };
+  try {
+    render(); first.value = .875; render();
+    f[scope].contextNode = N.builtinShadowContext(next, f.light);
+    if (scope === 'material') f.material.needsUpdate = true;
+    render(); first.value = next.value = 99;
+  } finally { release(); }
+  await drain(f.renderer);
+  const receivers = receiverDraws(f.device), shadows = targetPasses(f.device).filter(pass => pass.draws.length);
+  assert.equal(receivers.length, 3); assert.equal(shadows.length, 3);
+  const depths = new Set(shadows.map(pass => pass.desc.depthStencilAttachment.view.texture));
+  for (const [index, value] of [.375, .875, .625].entries()) {
+    assert.match(shader(receivers[index]), /textureSampleCompare/);
+    assert.ok(uniformValues(receivers[index]).includes(value)); assert.ok(!uniformValues(receivers[index]).includes(99));
+    assert.ok(textureResources(receivers[index]).some(resource => depths.has(resource.texture)));
+  }
+  assert.match(shader(receivers[0]), /firstShadowContext/); assert.match(shader(receivers[2]), /nextShadowContext/);
+  assert.deepEqual(updates, [f.receiver, f.receiver, f.receiver]); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 const softShadowWarning = 'THREE.WebGPURenderer: PCFSoftShadowMap has been removed. Using PCFShadowMap instead.';
 function warningLog(t, observe = () => {}) {
   const previous = T.getConsoleFunction(), messages = [];

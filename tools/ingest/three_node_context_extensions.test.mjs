@@ -99,6 +99,70 @@ function fixture(t, family = 'MeshStandard', ownership = 'inherited') {
 }
 
 for (const ownership of ['inherited', 'registered', 'custom-key'])
+for (const family of ['MeshBasic', 'MeshStandard'])
+test(`${ownership} ${family} output contexts preserve source shared construction and live uniform histories`, t => {
+  const f = fixture(t, family, ownership), a = f.add(), b = f.add();
+  const gain = N.uniform(.375).setName('contextOutputGain');
+  f.renderer.contextNode = N.context({getOutput(output, builder) {
+    assert.equal(builder.renderer, f.renderer); assert.ok([a.object, b.object].includes(builder.object));
+    f.trace.push('output'); return N.vec4(output.rgb.mul(gain), output.a);
+  }});
+  f.programs.inspect(f.material, a.object, f.context(a)); assert.deepEqual(f.trace, []);
+  const first = f.compare(a), shared = f.compare(b);
+  assert.equal(shared.reference, first.reference, 'source output construction remains shared');
+  assert.match(first.descriptor.fragment, /contextOutputGain/);
+  const accepted = f.capture(a, first), saved = accepted.uniforms.map(bytes => bytes.slice());
+  gain.value = .875; f.renderer.info.calls++;
+  assert.equal(f.compare(a).descriptor, first.descriptor); assert.ok(values(f.capture(a, first)).includes(.875));
+  f.renderer.contextNode.value.getOutput = null;
+  assert.equal(f.compare(a).descriptor, first.descriptor, 'unversioned source renderer context changes retain construction');
+  f.renderer.contextNode.needsUpdate = true;
+  const plain = f.compare(a); assert.notEqual(plain.descriptor, first.descriptor);
+  assert.doesNotMatch(plain.descriptor.fragment, /contextOutputGain/); f.capture(a, plain);
+  assert.deepEqual(accepted.uniforms, saved);
+});
+
+for (const Light of [T.DirectionalLight, T.PointLight])
+test(`${Light.name} builtin shadow contexts preserve source selected-light composition and shared graphs`, t => {
+  const run = reference => {
+    // AnalyticLightNode owns mutable shadow construction. Give the source and
+    // candidate independent lights so neither prewarms the other's graph.
+    const f = fixture(t, 'MeshStandard'), item = f.add(), selected = new Light(), other = new Light();
+    const lights = [selected, other], gain = N.uniform(.375).setName('contextShadowGain');
+    for (const [index, light] of lights.entries()) {
+      light.castShadow = true; light.position.set(index + 1, 3, 2);
+      light.shadow.shadowNode = N.float(.75 - index * .25); f.scene.add(light);
+    }
+    item.object.receiveShadow = true; f.renderer.shadowMap.enabled = true; f.lights.setLights(lights); f.matrices();
+    f.renderer.contextNode = N.builtinShadowContext(gain, selected);
+    const hook = f.renderer.contextNode.value.getShadow;
+    f.renderer.contextNode.value.getShadow = (node, builder) => {
+      assert.equal(builder.renderer, f.renderer); assert.ok(lights.includes(node.light)); assert.ok(node.shadowColorNode);
+      f.trace.push(node.light === selected ? 'selected-shadow' : 'other-shadow'); return hook(node, builder);
+    };
+    const context = () => ({...f.context(item), lights});
+    if (!reference) { f.programs.inspect(f.material, item.object, context()); assert.deepEqual(f.trace, []); }
+    const select = () => reference ? f.reference(item) : {descriptor: f.programs.compile(f.material, item.object, context())};
+    const capture = entry => reference ? f.referenceDraw(entry.source) :
+      unpack(entry.descriptor, f.programs.captureDraw(entry.descriptor, context()));
+    const first = select(), firstGraph = first.reference ?? first.descriptor;
+    const initial = capture(first), saved = initial.map(bytes => bytes.slice());
+    gain.value = .875; f.renderer.info.calls++;
+    const warm = select(); assert.equal(warm.reference ?? warm.descriptor, firstGraph);
+    const changed = capture(warm);
+    f.renderer.contextNode.value.getShadow = null; f.renderer.contextNode.needsUpdate = true;
+    const plain = select(), plainGraph = plain.reference ?? plain.descriptor, plainBytes = capture(plain);
+    assert.notEqual(plainGraph, firstGraph); assert.deepEqual(initial, saved);
+    assert.match(firstGraph.fragmentShader ?? firstGraph.fragment, /contextShadowGain/);
+    assert.doesNotMatch(plainGraph.fragmentShader ?? plainGraph.fragment, /contextShadowGain/);
+    return {trace: f.trace, shaders: [firstGraph, plainGraph].map(graph =>
+      [canonical(graph.vertexShader ?? graph.vertex), canonical(graph.fragmentShader ?? graph.fragment)]),
+      uniforms: [initial, changed, plainBytes]};
+  };
+  assert.deepEqual(run(false), run(true));
+});
+
+for (const ownership of ['inherited', 'registered', 'custom-key'])
 for (const family of ['MeshBasic', 'MeshToon', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical'])
 test(`${ownership} ${family} materials compose source AO/GI contexts and shared live uniforms`, t => {
   const f = fixture(t, family, ownership), a = f.add(), b = f.add();
@@ -185,7 +249,7 @@ test(`${ownership} highPrecision contexts retain source matrix lifetimes at larg
 
 test('context admission retains unsupported-field, accessor and material-context boundaries before callbacks', t => {
   const f = fixture(t), item = f.add(); let reads = 0;
-  for (const data of [{getOutput: output => output}, {forceUVContext: 1}, {getAO: N.float(1)},
+  for (const data of [{getOutput: 1}, {getShadow: 1}, {forceUVContext: 1}, {getAO: N.float(1)},
     Object.defineProperty({}, 'getAO', {enumerable: true, get() { reads++; return () => N.float(1); }})]) {
     f.renderer.contextNode = N.context(data);
     assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_GRAPH'});

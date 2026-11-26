@@ -33,6 +33,60 @@ function compareSource(f){
   return actual;
 }
 
+for (const scope of ['renderer', 'material'])
+test(`native ${scope} output contexts preserve source output-node ordering, MRT composition and fragment bypass`, t => {
+  const f = fixture(t), output = N.vec4(.125, .375, .625, .875), calls = [];
+  const gain = N.uniform(.5).setName('authoredOutputGain');
+  f.material.outputNode = output;
+  f[scope].contextNode = N.context({getOutput(node, builder) {
+    calls.push([node, builder.object, builder.material]);
+    assert.equal(node, output, 'the authored output node precedes the context hook');
+    return N.vec4(node.rgb.mul(gain), node.a);
+  }});
+  f.owner.inspect(f.material, f.object, f.context); assert.deepEqual(calls, []);
+  const descriptor = f.owner.compile(f.material, f.object, f.context), expected = calls.splice(0);
+  const source = new T.WGSLNodeBuilder(f.object, f.renderer); source.scene = f.scene; source.camera = f.camera; source.build();
+  assert.deepEqual(calls, expected); assert.equal(descriptor.fragment, source.fragmentShader);
+  assert.match(descriptor.fragment, /authoredOutputGain/);
+  const target = new T.RenderTarget(8, 8, {count: 2}); target.textures[0].name = 'output'; target.textures[1].name = 'extra';
+  const mrt = N.mrt({output: N.output, extra: N.vec4(.25)}); t.after(() => target.dispose());
+  f.renderer.getRenderTarget = () => target; f.renderer.getMRT = () => mrt;
+  f.material.needsUpdate = true;
+  const multiple = compareSource(f); assert.equal(multiple.colorCount, 2);
+  assert.match(multiple.fragment, /authoredOutputGain/); assert.match(multiple.fragment, /@location\(\s*1\s*\)/);
+  f.material.fragmentNode = N.vec4(.75); f.material.needsUpdate = true; calls.length = 0;
+  const fragment = compareSource(f);
+  assert.deepEqual(calls, [], 'the fragmentNode branch bypasses getOutput');
+  assert.doesNotMatch(fragment.fragment, /authoredOutputGain/);
+});
+
+test('native output context chains retain child precedence and material null masking', t => {
+  const f = fixture(t), calls = [];
+  const child = N.context({getOutput: node => { calls.push('child'); return node.mul(.75); }});
+  f.renderer.contextNode = N.context(child, {getOutput: node => { calls.push('parent'); return node.mul(.25); }});
+  compareSource(f); assert.deepEqual(calls, ['child', 'child']); calls.length = 0;
+  f.material.contextNode = N.context({getOutput: node => { calls.push('material'); return node.mul(.5); }});
+  f.material.needsUpdate = true; compareSource(f); assert.deepEqual(calls, ['material', 'material']); calls.length = 0;
+  f.material.contextNode = N.context({getOutput: null}); f.material.needsUpdate = true;
+  compareSource(f); assert.deepEqual(calls, []);
+});
+
+for (const inactive of ['renderer', 'light', 'receiver'])
+test(`native shadow context stays inert when the source ${inactive} disables shadows`, t => {
+  const f = fixture(t), light = new T.DirectionalLight();
+  f.material = new T.MeshStandardNodeMaterial(); f.material.colorNode = N.vec3(.5);
+  f.object.material = f.context.material = f.material; t.after(() => f.material.dispose());
+  light.castShadow = inactive !== 'light'; light.shadow.shadowNode = N.float(.75);
+  f.object.receiveShadow = inactive !== 'receiver'; f.renderer.shadowMap = {enabled: inactive !== 'renderer', type: T.PCFShadowMap};
+  f.context.lights = [light]; f.scene.add(light);
+  f.renderer.contextNode = N.context({getShadow() { assert.fail('inactive shadow context executed'); }});
+  const descriptor = f.owner.compile(f.material, f.object, f.context);
+  const source = new T.WGSLNodeBuilder(f.object, f.renderer); source.scene = f.scene; source.camera = f.camera;
+  source.lightsNode = N.lights([light]); source.build();
+  assert.equal(descriptor.vertex, source.vertexShader);
+  assert.equal(descriptor.fragment, source.fragmentShader);
+});
+
 for(const scope of ['renderer','material'])
 test(`native ${scope} UV and mip-level contexts retain pinned construction and cache behavior`,t=>{
   const f=fixture(t,scope==='material'),calls=[];
@@ -161,6 +215,81 @@ function containsUniform(draw,pair){
 function sampledTextures(draw){
   return [...draw.groups.values()].flatMap(({group})=>group.entries.map(entry=>entry.resource?.texture).filter(Boolean));
 }
+
+for (const scope of ['renderer', 'material', 'pass'])
+test(`native ${scope} output contexts retain queued uniforms, graph replacement and source context ownership`, async t => {
+  const f = rendererFixture(t), updates = [], global = f.renderer.contextNode;
+  f.renderer.outputColorSpace = T.LinearSRGBColorSpace;
+  if (scope === 'material') {
+    f.material = new T.MeshBasicNodeMaterial({map: f.texture}); f.object.material = f.material; t.after(() => f.material.dispose());
+  }
+  let scene = f.scene, pass = null;
+  if (scope === 'pass') {
+    pass = N.pass(f.scene, f.camera);
+    const material = new T.MeshBasicNodeMaterial(); material.fragmentNode = pass.getTextureNode();
+    scene = new T.Scene(); scene.add(new T.Mesh(f.object.geometry, material));
+    t.after(() => { pass.dispose(); material.dispose(); });
+  }
+  const first = N.uniform(.375).setName('queuedOutputFirst'), next = N.uniform(.5).setName('queuedOutputNext');
+  for (const node of [first, next]) node.onObjectUpdate(frame => {
+    updates.push([frame.object, frame.renderer]); return node.value;
+  });
+  let builds = 0;
+  const context = gain => N.context({getOutput(output) { builds++; return N.vec4(output.rgb.mul(gain), output.a); }});
+  const setContext = value => { if (pass) pass.contextNode = value; else f[scope].contextNode = value; };
+  setContext(context(first)); await f.renderer.init();
+  let release; const pending = new Promise(resolve => { release = resolve; }), create = f.device.createRenderPipelineAsync;
+  f.device.createRenderPipelineAsync = async descriptor => { await pending; return create(descriptor); };
+  const render = () => {
+    f.renderer._advanceAnimationFrame(); f.renderer.render(scene, f.camera);
+    if (pass) assert.equal(f.renderer.contextNode, global, 'recursive scene passes restore the renderer context');
+  };
+  try {
+    render(); first.value = .875; render(); setContext(context(next));
+    if (scope === 'material') f.material.needsUpdate = true;
+    if (pass) { render(); pass.needsUpdate = true; }
+    render(); first.value = next.value = 99;
+  } finally { release(); }
+  await drain(f.renderer);
+  const draws = nativeDraws(f.device).filter(draw => /queuedOutputFirst|queuedOutputNext/.test(draw.pipeline.fragment.module.code));
+  const expected = pass ? [.375, .875, .875, .5] : [.375, .875, .5];
+  assert.equal(draws.length, expected.length); assert.equal(builds, 2);
+  for (const [index, value] of expected.entries()) {
+    assert.ok(containsUniform(draws[index], [value])); assert.ok(!containsUniform(draws[index], [99]));
+  }
+  assert.match(draws[0].pipeline.fragment.module.code, /queuedOutputFirst/);
+  assert.match(draws.at(-1).pipeline.fragment.module.code, /queuedOutputNext/);
+  assert.deepEqual(updates, expected.map(() => [f.object, f.renderer]));
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('native output context graphs retain generated resource admission before node updates', t => {
+  const f = fixture(t); let updates = 0;
+  f.material.opacityNode = N.uniform(.5).onObjectUpdate(() => { updates++; return .5; });
+  const attribute = new T.StorageBufferAttribute(new Uint32Array(4), 1), input = N.storage(attribute, 'uint', 4);
+  f.renderer.contextNode = N.context({getOutput: output => N.Fn(() => {
+    input.element(0).assign(N.uint(1)); return output;
+  })()});
+  assert.throws(() => f.owner.compile(f.material, f.object, f.context), {code: 'THREE_NODE_PROGRAM_STORAGE'});
+  assert.equal(updates, 0); assert.equal(f.owner.diagnostics.programs, 0);
+});
+
+test('a throwing native pass output hook restores source renderer state and permits the next graph', async t => {
+  const f = rendererFixture(t), global = f.renderer.contextNode;
+  f.renderer.outputColorSpace = T.LinearSRGBColorSpace;
+  const pass = N.pass(f.scene, f.camera), material = new T.MeshBasicNodeMaterial(), outer = new T.Scene();
+  material.fragmentNode = pass.getTextureNode(); outer.add(new T.Mesh(f.object.geometry, material));
+  pass.contextNode = N.context({getOutput() { throw new Error('application output hook failed'); }});
+  t.after(() => { pass.dispose(); material.dispose(); }); await f.renderer.init();
+  f.renderer._advanceAnimationFrame();
+  assert.throws(() => f.renderer.render(outer, f.camera), /application output hook failed/);
+  assert.equal(f.renderer.contextNode, global); assert.equal(f.renderer.getRenderTarget(), null);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+  pass.contextNode = N.context({getOutput: output => output.mul(N.uniform(.625).setName('recoveredOutput'))});
+  pass.needsUpdate = true; f.renderer._advanceAnimationFrame(); f.renderer.render(outer, f.camera); await drain(f.renderer);
+  assert.ok(nativeDraws(f.device).some(draw => /recoveredOutput/.test(draw.pipeline.fragment.module.code)));
+  assert.equal(f.renderer.contextNode, global); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
 
 for(const scope of ['renderer','material'])
 test(`native ${scope} texture contexts capture live uniforms and queued context replacements`,async t=>{

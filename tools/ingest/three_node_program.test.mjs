@@ -138,7 +138,7 @@ test('lighting contexts retain nested source precedence and reject arbitrary con
   assert.notEqual(inspectThreeLightingContext(THREE, nested), null);
   assert.equal(inspectThreeLightingContext(THREE, N.context()), null);
   assert.equal(inspectThreeLightingContext(THREE, N.context(N.context())), null);
-  for (const context of [N.context({getOutput: output => output}), N.context({getAO: ao}),
+  for (const context of [N.context({getOutput: 1}), N.context({getShadow: 1}), N.context({getAO: ao}),
     N.builtinAOContext(ao, N.float(1)), N.context(Object.defineProperty({}, 'getAO', {get() { assert.fail('accessor evaluated'); }}))])
     assert.throws(() => inspectThreeLightingContext(THREE, context), {code: 'THREE_NODE_PROGRAM_GRAPH'});
   const cycle = N.context(); cycle.node = cycle;
@@ -1945,7 +1945,7 @@ for (const [name, change, code] of [
   ['output struct exceeding canvas attachments', f => { f.material.fragmentNode = N.outputStruct(N.vec4(1), N.vec4(.5)); }, 'MRT'],
   ['lighting slot', f => { f.material.lightsNode = N.vec3(1); }, 'GRAPH'],
   ['transparent double side', f => { f.material.side = THREE.DoubleSide; f.material.transparent = true; }, 'RASTER'],
-  ['custom renderer context', f => { f.renderer.contextNode = N.context({getOutput: output => output}); }, 'GRAPH'],
+  ['custom renderer context', f => { f.renderer.contextNode = N.context({unsupportedContextField: true}); }, 'GRAPH'],
   ['spoofed instancing', f => { f.object.isInstancedMesh = true; }, 'OBJECT'],
   ['invalid scene fog graph', f => { f.scene.fogNode = {fog: true}; }, 'FOG'],
 ]) test(`${name} is explicitly refused`, t => {
