@@ -45,6 +45,8 @@ export const OPCODE_COPY_TEXTURE_TO_TEXTURE = 30;
 export const OPCODE_SET_INDEXED_DRAW_PARAMETERS = 31;
 export const OPCODE_RELEASE_RESOURCE = 32;
 export const OPCODE_DISPATCH_COMPUTE_INDIRECT = 33;
+export const OPCODE_SET_INDIRECT_DRAW_PARAMETERS = 34;
+export const OPCODE_SET_INDEXED_INDIRECT_DRAW_PARAMETERS = 35;
 
 export const BINDING_TYPE_UNIFORM = 0;
 export const BINDING_TYPE_STORAGE_READ = 1;
@@ -681,6 +683,9 @@ export class WebGpuBridgeHost {
         let frameCanvasView = null;
         let pendingDrawParameters = null;
         let pendingIndexedDrawParameters = null;
+        let pendingIndirectDrawParameters = null;
+        const pendingParameterName = () => pendingIndirectDrawParameters?.name ||
+          (pendingIndexedDrawParameters ? "SetIndexedDrawParameters" : "SetDrawParameters");
         let passState = {
           pipelineId: null,
           uniformBufferId: null,
@@ -692,14 +697,33 @@ export class WebGpuBridgeHost {
         // Descriptors use buffer offset 0 with dynamicOffset supplied at setBindGroup time.
         const packetBindGroups = new Map();
 
-        const issueDraw = (count, parameters, indexed) => {
+        const indirectDrawParameters = (bufferId, offsetBig, argumentBytes, name) => {
+          if (offsetBig + BigInt(argumentBytes) > BigInt(Number.MAX_SAFE_INTEGER)) {
+            throw new RangeError(`${name}: argument range exceeds Number.MAX_SAFE_INTEGER`);
+          }
+          const offset = Number(offsetBig);
+          if (offset % 4 !== 0) throw new RangeError(`${name}: argument offset must be aligned to 4 bytes`);
+          const buffer = usePrepared(this.buffers.get(bufferId));
+          if (bufferId === 0 || !buffer) throw new Error(`${name}: unknown indirect bufferId ${bufferId}`);
+          if (!(buffer.usage & 0x0100) ||
+              (buffer.mapState !== undefined && buffer.mapState !== "unmapped")) {
+            throw new Error(`${name}: argument buffer requires INDIRECT usage and an unmapped state`);
+          }
+          if (offset + argumentBytes > buffer.size) throw new RangeError(`${name}: argument range exceeds the buffer bounds`);
+          return { name, buffer, offset };
+        };
+        const issueDraw = (count, parameters, indexed, indirect) => {
+          // Argument counts stay on the GPU. WebGPU requires firstInstance = 0
+          // unless the device negotiated "indirect-first-instance"; retain its
+          // native behavior without inspecting arguments or a CPU fallback.
           if (!indexed) {
-            currentPassEncoder.draw(count, ...parameters);
+            if (indirect) currentPassEncoder.drawIndirect(indirect.buffer, indirect.offset);
+            else currentPassEncoder.draw(count, ...parameters);
             return;
           }
           // Both operands are u32, so this calculation is exact in a JS number.
           // The index binding size may contain a trailing partial index.
-          if ((indexed.firstIndex + count) * indexed.indexWidth > indexed.size) {
+          if (!indirect && (indexed.firstIndex + count) * indexed.indexWidth > indexed.size) {
             throw new RangeError("DrawIndexed: index range exceeds the bound buffer slice");
           }
           // Bind on every indexed draw: executeBundles resets index bindings,
@@ -707,10 +731,14 @@ export class WebGpuBridgeHost {
           currentPassEncoder.setIndexBuffer(
             indexed.buffer, indexed.format, indexed.offset, indexed.size,
           );
-          currentPassEncoder.drawIndexed(
-            count, indexed.instanceCount, indexed.firstIndex,
-            indexed.baseVertex, indexed.firstInstance,
-          );
+          if (indirect) {
+            currentPassEncoder.drawIndexedIndirect(indirect.buffer, indirect.offset);
+          } else {
+            currentPassEncoder.drawIndexed(
+              count, indexed.instanceCount, indexed.firstIndex,
+              indexed.baseVertex, indexed.firstInstance,
+            );
+          }
         };
 
         const getCanvasView = () => {
@@ -744,14 +772,14 @@ export class WebGpuBridgeHost {
           const opcode = dataView.getUint16(cursor, true);
           cursor += 2;
           if (
-            (pendingDrawParameters || pendingIndexedDrawParameters) &&
+            (pendingDrawParameters || pendingIndexedDrawParameters || pendingIndirectDrawParameters) &&
             opcode !== OPCODE_RENDER_PASS &&
             opcode !== OPCODE_RENDER_PASS_DEPTH &&
             opcode !== OPCODE_RENDER_PASS_RESOLVE &&
             opcode !== OPCODE_RENDER_PASS_DEPTH_RESOLVE
           ) {
             throw new Error(
-              `${pendingIndexedDrawParameters ? "SetIndexedDrawParameters" : "SetDrawParameters"} must immediately precede a render-pass draw command`,
+              `${pendingParameterName()} must immediately precede a render-pass draw command`,
             );
           }
 
@@ -1468,11 +1496,14 @@ export class WebGpuBridgeHost {
             case OPCODE_RENDER_PASS_RESOLVE: {
               const hasResolve = opcode === OPCODE_RENDER_PASS_RESOLVE;
               const fieldBytes = hasResolve ? 48 : 44;
-              const indexedParameters = pendingIndexedDrawParameters;
-              const hasDrawParameters = pendingDrawParameters !== null || indexedParameters !== null;
+              const parameterName = pendingParameterName();
+              const indirectParameters = pendingIndirectDrawParameters;
+              const indexedParameters = pendingIndexedDrawParameters || indirectParameters?.indexed || null;
+              const hasDrawParameters = pendingDrawParameters !== null || indexedParameters !== null || indirectParameters !== null;
               const drawParameters = pendingDrawParameters || [1, 0, 0];
               pendingDrawParameters = null;
               pendingIndexedDrawParameters = null;
+              pendingIndirectDrawParameters = null;
               if (cursor + fieldBytes > dataBlockStart) {
                 throw new Error(`Truncated RENDER_PASS fields at command ${i}`);
               }
@@ -1521,7 +1552,7 @@ export class WebGpuBridgeHost {
               const isNewPass = (passFlags & 1) !== 0;
               const targetKey = `${targetKind}:${targetId}:none${hasResolve ? `:resolve:${resolveTargetId}` : ""}`;
               if (hasDrawParameters && (isNewPass || currentPassTargetKey !== targetKey)) {
-                throw new Error(`${indexedParameters ? "SetIndexedDrawParameters" : "SetDrawParameters"} cannot cross a render-pass boundary`);
+                throw new Error(`${parameterName} cannot cross a render-pass boundary`);
               }
               if (!currentPassEncoder || currentPassTargetKey !== targetKey || isNewPass) {
                 closeActivePass();
@@ -1580,7 +1611,7 @@ export class WebGpuBridgeHost {
                 };
               }
 
-              if (vertexCount > 0 || indexedParameters !== null) {
+              if (vertexCount > 0 || indexedParameters !== null || indirectParameters !== null) {
                 const pipelineRecord = usePrepared(this.pipelines.get(pipelineId));
                 if (!pipelineRecord) {
                   throw new Error(`RenderPass: unknown pipelineId ${pipelineId}`);
@@ -1684,7 +1715,7 @@ export class WebGpuBridgeHost {
                   }
                 }
 
-                issueDraw(vertexCount, drawParameters, indexedParameters);
+                issueDraw(vertexCount, drawParameters, indexedParameters, indirectParameters);
               }
               break;
             }
@@ -1693,11 +1724,14 @@ export class WebGpuBridgeHost {
             case OPCODE_RENDER_PASS_DEPTH_RESOLVE: {
               const hasResolve = opcode === OPCODE_RENDER_PASS_DEPTH_RESOLVE;
               const fieldBytes = hasResolve ? 60 : 56;
-              const indexedParameters = pendingIndexedDrawParameters;
-              const hasDrawParameters = pendingDrawParameters !== null || indexedParameters !== null;
+              const parameterName = pendingParameterName();
+              const indirectParameters = pendingIndirectDrawParameters;
+              const indexedParameters = pendingIndexedDrawParameters || indirectParameters?.indexed || null;
+              const hasDrawParameters = pendingDrawParameters !== null || indexedParameters !== null || indirectParameters !== null;
               const drawParameters = pendingDrawParameters || [1, 0, 0];
               pendingDrawParameters = null;
               pendingIndexedDrawParameters = null;
+              pendingIndirectDrawParameters = null;
               if (cursor + fieldBytes > dataBlockStart) {
                 throw new Error(`Truncated RENDER_PASS_DEPTH fields at command ${i}`);
               }
@@ -1769,7 +1803,7 @@ export class WebGpuBridgeHost {
               const isNewPass = (passFlags & 1) !== 0;
               const targetKey = `${targetKind}:${targetId}:depth:${depthTargetId}${hasResolve ? `:resolve:${resolveTargetId}` : ""}`;
               if (hasDrawParameters && (isNewPass || currentPassTargetKey !== targetKey)) {
-                throw new Error(`${indexedParameters ? "SetIndexedDrawParameters" : "SetDrawParameters"} cannot cross a render-pass boundary`);
+                throw new Error(`${parameterName} cannot cross a render-pass boundary`);
               }
 
               if (!currentPassEncoder || currentPassTargetKey !== targetKey || isNewPass) {
@@ -1860,7 +1894,7 @@ export class WebGpuBridgeHost {
                 };
               }
 
-              if (vertexCount > 0 || indexedParameters !== null) {
+              if (vertexCount > 0 || indexedParameters !== null || indirectParameters !== null) {
                 const pipelineRecord = usePrepared(this.pipelines.get(pipelineId));
                 if (!pipelineRecord) {
                   throw new Error(`RenderPassDepth: unknown pipelineId ${pipelineId}`);
@@ -1945,7 +1979,7 @@ export class WebGpuBridgeHost {
                   }
                 }
 
-                issueDraw(vertexCount, drawParameters, indexedParameters);
+                issueDraw(vertexCount, drawParameters, indexedParameters, indirectParameters);
               }
               break;
             }
@@ -2490,6 +2524,10 @@ export class WebGpuBridgeHost {
                     scanCursor += 12;
                   } else if (nextOp === OPCODE_SET_INDEXED_DRAW_PARAMETERS) {
                     scanCursor += 40;
+                  } else if (nextOp === OPCODE_SET_INDIRECT_DRAW_PARAMETERS) {
+                    scanCursor += 12;
+                  } else if (nextOp === OPCODE_SET_INDEXED_INDIRECT_DRAW_PARAMETERS) {
+                    scanCursor += 36;
                   } else if (nextOp === OPCODE_EXECUTE_BUNDLES) {
                     if (scanCursor + 4 <= dataBlockStart) {
                       const cnt = dataView.getUint32(scanCursor, true);
@@ -2618,46 +2656,68 @@ export class WebGpuBridgeHost {
               break;
             }
 
-            case OPCODE_SET_INDEXED_DRAW_PARAMETERS: {
+            case OPCODE_SET_INDIRECT_DRAW_PARAMETERS: {
+              if (!currentPassEncoder) throw new Error("SetIndirectDrawParameters: no active render pass");
+              if (cursor + 12 > dataBlockStart) throw new Error(`Truncated SET_INDIRECT_DRAW_PARAMETERS fields at command ${i}`);
+              pendingIndirectDrawParameters = indirectDrawParameters(
+                dataView.getUint32(cursor, true), dataView.getBigUint64(cursor + 4, true), 16,
+                "SetIndirectDrawParameters",
+              );
+              cursor += 12;
+              break;
+            }
+
+            case OPCODE_SET_INDEXED_DRAW_PARAMETERS:
+            case OPCODE_SET_INDEXED_INDIRECT_DRAW_PARAMETERS: {
+              const indirect = opcode === OPCODE_SET_INDEXED_INDIRECT_DRAW_PARAMETERS;
+              const name = indirect ? "SetIndexedIndirectDrawParameters" : "SetIndexedDrawParameters";
+              const fieldBytes = indirect ? 36 : 40;
               if (!currentPassEncoder) {
-                throw new Error("SetIndexedDrawParameters: no active render pass");
+                throw new Error(`${name}: no active render pass`);
               }
-              if (cursor + 40 > dataBlockStart) {
-                throw new Error(`Truncated SET_INDEXED_DRAW_PARAMETERS fields at command ${i}`);
+              if (cursor + fieldBytes > dataBlockStart) {
+                throw new Error(`Truncated ${indirect ? "SET_INDEXED_INDIRECT_DRAW_PARAMETERS" : "SET_INDEXED_DRAW_PARAMETERS"} fields at command ${i}`);
               }
               const bufferId = dataView.getUint32(cursor, true);
               const formatCode = dataView.getUint32(cursor + 4, true);
               const offsetBig = dataView.getBigUint64(cursor + 8, true);
               const sizeBig = dataView.getBigUint64(cursor + 16, true);
-              const instanceCount = dataView.getUint32(cursor + 24, true);
-              const firstIndex = dataView.getUint32(cursor + 28, true);
-              const baseVertex = dataView.getInt32(cursor + 32, true);
-              const firstInstance = dataView.getUint32(cursor + 36, true);
-              cursor += 40;
+              const instanceCount = indirect ? null : dataView.getUint32(cursor + 24, true);
+              const firstIndex = indirect ? null : dataView.getUint32(cursor + 28, true);
+              const baseVertex = indirect ? null : dataView.getInt32(cursor + 32, true);
+              const firstInstance = indirect ? null : dataView.getUint32(cursor + 36, true);
+              const indirectBufferId = indirect ? dataView.getUint32(cursor + 24, true) : null;
+              const indirectOffsetBig = indirect ? dataView.getBigUint64(cursor + 28, true) : 0n;
+              cursor += fieldBytes;
               if (formatCode !== 0 && formatCode !== 1) {
-                throw new Error(`SetIndexedDrawParameters: unsupported index format ${formatCode}`);
+                throw new Error(`${name}: unsupported index format ${formatCode}`);
               }
               const maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
               if (offsetBig > maxSafe || sizeBig > maxSafe || offsetBig + sizeBig > maxSafe) {
-                throw new RangeError("SetIndexedDrawParameters: index buffer range exceeds Number.MAX_SAFE_INTEGER");
+                throw new RangeError(`${name}: index buffer range exceeds Number.MAX_SAFE_INTEGER`);
               }
               const buffer = usePrepared(this.buffers.get(bufferId));
               if (bufferId === 0 || !buffer) {
-                throw new Error(`SetIndexedDrawParameters: unknown index bufferId ${bufferId}`);
+                throw new Error(`${name}: unknown index bufferId ${bufferId}`);
               }
               const indexWidth = formatCode === 0 ? 2 : 4;
               const offset = Number(offsetBig), size = Number(sizeBig);
               if (!(buffer.usage & 16) ||
                   (buffer.mapState !== undefined && buffer.mapState !== "unmapped")) {
-                throw new Error("SetIndexedDrawParameters: index buffer requires INDEX usage and an unmapped state");
+                throw new Error(`${name}: index buffer requires INDEX usage and an unmapped state`);
               }
               if (offset % indexWidth !== 0 || offset + size > buffer.size) {
-                throw new RangeError("SetIndexedDrawParameters: index buffer alignment or binding bounds are invalid");
+                throw new RangeError(`${name}: index buffer alignment or binding bounds are invalid`);
               }
-              pendingIndexedDrawParameters = {
+              const indexed = {
                 buffer, format: formatCode === 0 ? "uint16" : "uint32",
                 offset, size, indexWidth, instanceCount, firstIndex, baseVertex, firstInstance,
               };
+              if (indirect) {
+                pendingIndirectDrawParameters = {
+                  ...indirectDrawParameters(indirectBufferId, indirectOffsetBig, 20, name), indexed,
+                };
+              } else pendingIndexedDrawParameters = indexed;
               break;
             }
 
@@ -3079,8 +3139,8 @@ export class WebGpuBridgeHost {
           }
         }
 
-        if (pendingDrawParameters || pendingIndexedDrawParameters) {
-          throw new Error(`${pendingIndexedDrawParameters ? "SetIndexedDrawParameters" : "SetDrawParameters"} has no following RenderPass or RenderPassDepth`);
+        if (pendingDrawParameters || pendingIndexedDrawParameters || pendingIndirectDrawParameters) {
+          throw new Error(`${pendingParameterName()} has no following RenderPass or RenderPassDepth`);
         }
         closeActivePass();
         frameCanvasView = null;

@@ -69,6 +69,9 @@ fn validate_render_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
     // 3. Collect all draw uses
     let mut all_uses = attachment_uses.clone();
     for draw in &pass.draws {
+        draw.indirect_buffer_use().map_err(|reason| HazardError::InvalidIndirectDraw {
+            draw_id: draw.draw_id, reason: reason.into(),
+        })?;
         all_uses.extend(draw.uses.clone());
     }
 

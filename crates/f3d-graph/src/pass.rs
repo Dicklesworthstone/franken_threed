@@ -446,6 +446,10 @@ pub struct Draw {
     pub uses: Vec<ResourceUse>,
     /// Command category: direct draw or pre-recorded bundle execution.
     pub kind: DrawKind,
+    /// Optional index into `uses` selecting GPU-provided draw arguments. These
+    /// replace the CPU count, instance, first-element and base-vertex fields.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub indirect_use_index: Option<usize>,
     /// Whether this draw assumes warm/inherited pipeline and binding state from a preceding draw.
     ///
     /// The effective `pipeline_id`, `uses` and `uniform_dynamic_offset` remain
@@ -491,6 +495,7 @@ impl Draw {
             uniform_dynamic_offset,
             uses,
             kind: DrawKind::Direct,
+            indirect_use_index: None,
             assumes_warm_state: false,
             viewport: None,
             scissor: None,
@@ -515,6 +520,7 @@ impl Draw {
             uniform_dynamic_offset: 0,
             uses,
             kind: DrawKind::Bundle { bundle_id },
+            indirect_use_index: None,
             assumes_warm_state: false,
             viewport: None,
             scissor: None,
@@ -540,6 +546,7 @@ impl Draw {
             uniform_dynamic_offset,
             uses,
             kind: DrawKind::Direct,
+            indirect_use_index: None,
             assumes_warm_state: true,
             viewport: None,
             scissor: None,
@@ -573,6 +580,55 @@ impl Draw {
     ) -> Self {
         self.kind = DrawKind::Indexed { index_use_index, index_format, base_vertex };
         self
+    }
+
+    /// Use GPU arguments: four u32 words for non-indexed draws, five for indexed
+    /// draws (whose base-vertex word is i32). Bundles cannot select arguments.
+    /// Native WebGPU requires firstInstance zero unless indirect-first-instance
+    /// was negotiated. This path neither reads counts back nor provides a bucket-base fallback.
+    #[must_use]
+    pub const fn with_indirect_buffer(mut self, use_index: usize) -> Self {
+        self.indirect_use_index = Some(use_index);
+        self
+    }
+
+    /// Resolve and validate the selected index-buffer slice, without inspecting draw counts.
+    pub fn index_buffer_use(&self) -> Result<&ResourceUse, &'static str> {
+        let DrawKind::Indexed { index_use_index, index_format, .. } = self.kind else {
+            return Err("Draw does not select an index-buffer declaration");
+        };
+        let usage = self.uses.get(index_use_index)
+            .ok_or("Index use is outside the draw's declarations")?;
+        if usage.kind != ResourceKind::Buffer || usage.access != ResourceAccess::IndexBuffer
+            || usage.subresource != SubresourceRange::WholeBuffer
+        {
+            return Err("Selected index use must be a whole-buffer IndexBuffer read");
+        }
+        if usage.resource_id.get() == 0 { return Err("Index-buffer ID must not be zero"); }
+        let size = usage.byte_size.ok_or("Index-buffer byte size must be explicit")?;
+        let offset = usage.byte_offset.unwrap_or(0);
+        if offset % index_format.byte_width() != 0 {
+            return Err("Index-buffer offset must be aligned to its element width");
+        }
+        if offset.checked_add(size).is_none_or(|end| end > (1u64 << 53) - 1) {
+            return Err("Index-buffer byte range exceeds JavaScript's exact integer range");
+        }
+        Ok(usage)
+    }
+
+    /// Resolve the canonical indirect argument read for this draw's native command.
+    pub fn indirect_buffer_use(&self) -> Result<Option<&ResourceUse>, &'static str> {
+        let Some(use_index) = self.indirect_use_index else { return Ok(None) };
+        let required_bytes = match self.kind {
+            DrawKind::Direct => 16,
+            DrawKind::Indexed { .. } => { self.index_buffer_use()?; 20 }
+            DrawKind::Bundle { .. } => return Err("Render bundles cannot select indirect draw arguments"),
+        };
+        if self.pipeline_id == 0 { return Err("Indirect draw pipeline ID must be non-zero"); }
+        let usage = self.uses.get(use_index)
+            .ok_or("Indirect use index is outside the draw's declarations")?;
+        usage.validate_indirect_arguments(required_bytes)?;
+        Ok(Some(usage))
     }
 
     /// Draw index within the pass.
@@ -878,26 +934,8 @@ impl Dispatch {
         let Some(use_index) = self.indirect_use_index else { return Ok(None) };
         let usage = self.uses.get(use_index)
             .ok_or("Indirect use index is outside the dispatch's declarations")?;
-        if usage.kind != ResourceKind::Buffer
-            || usage.access != ResourceAccess::IndirectBuffer
-            || usage.subresource != SubresourceRange::WholeBuffer
-        {
-            return Err("Selected indirect use must be a whole-buffer IndirectBuffer read");
-        }
-        if self.pipeline_id == 0 || usage.resource_id.get() == 0 {
-            return Err("Indirect dispatch pipeline and buffer IDs must be non-zero");
-        }
-        let size = usage.byte_size.ok_or("Indirect-buffer byte size must be explicit")?;
-        if size < 12 {
-            return Err("Indirect-buffer range must contain three u32 workgroup counts");
-        }
-        let offset = usage.byte_offset.unwrap_or(0);
-        if offset % 4 != 0 {
-            return Err("Indirect-buffer byte offset must be a multiple of four");
-        }
-        if offset.checked_add(size).is_none_or(|end| end > (1u64 << 53) - 1) {
-            return Err("Indirect-buffer byte range exceeds JavaScript's exact integer range");
-        }
+        if self.pipeline_id == 0 { return Err("Indirect dispatch pipeline ID must be non-zero"); }
+        usage.validate_indirect_arguments(12)?;
         Ok(Some(usage))
     }
 }

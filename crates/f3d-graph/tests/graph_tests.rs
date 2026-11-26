@@ -179,6 +179,60 @@ fn indexed_draw_preserves_whole_buffer_hazards_and_copy_dependencies() {
 }
 
 #[test]
+fn indirect_draws_preserve_zero_count_dependencies_and_whole_buffer_hazards() {
+    for indexed in [false, true] {
+        let version = DataVersion::new(9);
+        let mut draw = Draw::new(7, 100, 0, 0, vec![
+            ResourceUse::buffer_indirect(ResourceId::new(55), version, Some(256), Some(20)),
+            ResourceUse::buffer_index(ResourceId::new(66), version, Some(4), Some(0)),
+        ]).with_indirect_buffer(0);
+        if indexed { draw = draw.with_indexed(1, IndexFormat::Uint32, i32::MIN); }
+        let pass = Pass::new_render(PassId::new(1), "indirect_draw")
+            .with_color_attachment(ColorAttachment::new_clear(ResourceId::new(10), [0.0; 4]))
+            .with_draw(draw);
+        let mut conflict = pass.clone();
+        conflict.draws[0].uses.push(ResourceUse::buffer_storage_write(ResourceId::new(55), version, Some(0), Some(4)));
+        assert!(matches!(validate_pass_hazards(&conflict), Err(HazardError::WholeBufferConflict { buffer_id: 55, .. })));
+        let mut warm = pass.clone();
+        warm.draws[0].assumes_warm_state = true;
+        warm.draws.insert(0, Draw::new_bundle(6, 42, 100, Vec::new()));
+        assert!(matches!(validate_pass_hazards(&warm), Err(HazardError::BundleDirectDrawRequiresRebind { draw_id: 7, .. })));
+        let mut graph = PassGraph::new();
+        graph.add_pass(Pass::new_copy(PassId::new(30), "write_arguments").with_dependency(PassId::new(50))
+            .with_copy(CopyCommand::BufferToBuffer {
+                src: ResourceId::new(99), src_offset: 0, dst: ResourceId::new(55), dst_offset: 0, size: 4,
+            })).unwrap();
+        graph.add_pass(pass).unwrap();
+        graph.add_pass(Pass::new_copy(PassId::new(50), "prerequisite")).unwrap();
+        let plan = graph.compile(None).unwrap();
+        assert_eq!(plan.segments.iter().map(|s| s.pass_id.get()).collect::<Vec<_>>(), vec![50, 30, 1]);
+        assert!(plan.segments[2].versioned_reads.contains(&(ResourceId::new(55), version)));
+        assert_eq!(plan.segments[2].draws[0].indirect_use_index, Some(0));
+    }
+}
+
+#[test]
+fn graph_rejects_short_indirect_draw_records_and_bundle_or_wrong_index_selection() {
+    let args = ResourceUse::buffer_indirect(ResourceId::new(55), DataVersion::INITIAL, Some(4), Some(20));
+    let base = Draw::new(7, 100, u32::MAX, 0, vec![args]).with_indirect_buffer(0);
+    for bad in [
+        Draw { uses: vec![ResourceUse { byte_size: Some(15), ..base.uses[0].clone() }], ..base.clone() },
+        base.clone().with_indexed(0, IndexFormat::Uint32, 0),
+        Draw::new_bundle(7, 42, 100, base.uses.clone()).with_indirect_buffer(0),
+        base.clone().with_indirect_buffer(1),
+    ] {
+        let pass = Pass::new_render(PassId::new(1), "bad_indirect").with_draw(bad);
+        assert!(matches!(validate_pass_hazards(&pass), Err(HazardError::InvalidIndirectDraw { draw_id: 7, .. })));
+    }
+    let mut indexed = base.with_indexed(1, IndexFormat::Uint16, 0);
+    indexed.uses.push(ResourceUse::buffer_index(ResourceId::new(66), DataVersion::INITIAL, Some(2), Some(1)));
+    indexed.uses[0].byte_size = Some(19);
+    assert!(indexed.indirect_buffer_use().is_err());
+    indexed.uses[0].byte_size = Some(20);
+    assert!(indexed.indirect_buffer_use().is_ok(), "GPU counts must not be checked against CPU fields");
+}
+
+#[test]
 fn indexed_draw_after_bundle_requires_explicit_rebind() {
     let draw = Draw::new(1, 100, 3, 0, vec![ResourceUse::buffer_index(
         ResourceId::new(55), DataVersion::INITIAL, Some(0), Some(6),

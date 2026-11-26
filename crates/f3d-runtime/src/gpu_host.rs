@@ -405,6 +405,10 @@ pub const OPCODE_SET_INDEXED_DRAW_PARAMETERS: u16 = 31;
 pub const OPCODE_RELEASE_RESOURCE: u16 = 32;
 /// Dispatch compute workgroups from three u32 counts stored in a GPU buffer.
 pub const OPCODE_DISPATCH_COMPUTE_INDIRECT: u16 = 33;
+/// Configure the following render command to read non-indexed GPU draw arguments.
+pub const OPCODE_SET_INDIRECT_DRAW_PARAMETERS: u16 = 34;
+/// Configure the following render command with an index slice and GPU draw arguments.
+pub const OPCODE_SET_INDEXED_INDIRECT_DRAW_PARAMETERS: u16 = 35;
 
 /// Compute binding type: uniform buffer (`GPUBufferBindingType.uniform`).
 pub const BINDING_TYPE_UNIFORM: u32 = 0;
@@ -953,6 +957,31 @@ pub enum GpuCommand {
         base_vertex: i32,
         /// First instance to draw.
         first_instance: u32,
+    },
+    /// Configure the immediately following render command as drawIndirect.
+    /// Requires an open pass. The GPU owns all draw counts and firstInstance;
+    /// native WebGPU requires firstInstance zero without indirect-first-instance.
+    SetIndirectDrawParameters {
+        /// Nonzero buffer identity with INDIRECT usage.
+        indirect_buffer_id: u32,
+        /// Four-byte-aligned offset of the sixteen-byte argument record.
+        indirect_offset: u64,
+    },
+    /// Configure the immediately following render command as drawIndexedIndirect.
+    /// Requires an open pass; GPU arguments own counts, baseVertex and firstInstance.
+    SetIndexedIndirectDrawParameters {
+        /// Nonzero index-buffer identity.
+        index_buffer_id: u32,
+        /// Uint16 or Uint32 element representation.
+        index_format: IndexFormat,
+        /// Byte offset, aligned to the index element width.
+        index_offset: u64,
+        /// Explicit byte length; empty and odd trailing-byte ranges remain legal.
+        index_size: u64,
+        /// Nonzero buffer identity with INDIRECT usage.
+        indirect_buffer_id: u32,
+        /// Four-byte-aligned offset of the twenty-byte argument record.
+        indirect_offset: u64,
     },
     /// Command to compile and create a render pipeline from WGSL shader text with depth testing/writing state.
     CreatePipelineDepth {
@@ -1621,6 +1650,29 @@ impl GpuSubmissionPacket {
                     command_records.extend_from_slice(&base_vertex.to_le_bytes());
                     command_records.extend_from_slice(&first_instance.to_le_bytes());
                 }
+                GpuCommand::SetIndirectDrawParameters { indirect_buffer_id, indirect_offset } => {
+                    validate_indirect_buffer_range(*indirect_buffer_id, *indirect_offset, 16)
+                        .map_err(PacketEncodeError::InvalidDimensions)?;
+                    command_records.extend_from_slice(&OPCODE_SET_INDIRECT_DRAW_PARAMETERS.to_le_bytes());
+                    command_records.extend_from_slice(&indirect_buffer_id.to_le_bytes());
+                    command_records.extend_from_slice(&indirect_offset.to_le_bytes());
+                }
+                GpuCommand::SetIndexedIndirectDrawParameters {
+                    index_buffer_id, index_format, index_offset, index_size,
+                    indirect_buffer_id, indirect_offset,
+                } => {
+                    validate_index_buffer_range(*index_buffer_id, *index_format, *index_offset, *index_size)
+                        .map_err(PacketEncodeError::InvalidDimensions)?;
+                    validate_indirect_buffer_range(*indirect_buffer_id, *indirect_offset, 20)
+                        .map_err(PacketEncodeError::InvalidDimensions)?;
+                    command_records.extend_from_slice(&OPCODE_SET_INDEXED_INDIRECT_DRAW_PARAMETERS.to_le_bytes());
+                    command_records.extend_from_slice(&index_buffer_id.to_le_bytes());
+                    command_records.extend_from_slice(&(*index_format as u32).to_le_bytes());
+                    command_records.extend_from_slice(&index_offset.to_le_bytes());
+                    command_records.extend_from_slice(&index_size.to_le_bytes());
+                    command_records.extend_from_slice(&indirect_buffer_id.to_le_bytes());
+                    command_records.extend_from_slice(&indirect_offset.to_le_bytes());
+                }
                 GpuCommand::CreatePipelineDepth {
                     pipeline_id,
                     wgsl_code,
@@ -2114,18 +2166,13 @@ impl GpuSubmissionPacket {
                         GpuCommand::DispatchComputeIndirect {
                             pipeline_id, indirect_buffer_id, indirect_offset, ..
                         } => {
-                            if *pipeline_id == 0 || *indirect_buffer_id == 0 {
+                            if *pipeline_id == 0 {
                                 return Err(PacketEncodeError::InvalidDimensions(
-                                    "Indirect dispatch pipeline and buffer IDs must be non-zero".to_string(),
+                                    "Indirect dispatch pipeline ID must be non-zero".to_string(),
                                 ));
                             }
-                            if indirect_offset % 4 != 0
-                                || indirect_offset.checked_add(12).is_none_or(|end| end > (1u64 << 53) - 1)
-                            {
-                                return Err(PacketEncodeError::InvalidDimensions(
-                                    "Indirect dispatch offset must be four-byte aligned and its twelve-byte range must fit JavaScript's exact integers".to_string(),
-                                ));
-                            }
+                            validate_indirect_buffer_range(*indirect_buffer_id, *indirect_offset, 12)
+                                .map_err(PacketEncodeError::InvalidDimensions)?;
                             if bindings.iter().any(|b| b.buffer_id == *indirect_buffer_id
                                 && b.binding_type == BINDING_TYPE_STORAGE_READ_WRITE)
                             {
@@ -2273,6 +2320,15 @@ pub enum PlanLoweringError {
         /// Exact declaration or range error.
         reason: String,
     },
+    /// Indirect draw selects invalid arguments, index input, or a render bundle.
+    InvalidIndirectDraw {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+        /// Draw whose selected declarations are invalid.
+        draw_id: u32,
+        /// Exact declaration or byte-range error.
+        reason: String,
+    },
     /// Indirect dispatch has an invalid selected argument declaration.
     InvalidIndirectDispatch {
         /// Diagnostic name of the pass segment.
@@ -2415,6 +2471,9 @@ impl core::fmt::Display for PlanLoweringError {
             Self::InvalidIndexedDraw { segment_name, draw_id, reason } => {
                 write!(f, "Render segment '{segment_name}' indexed draw {draw_id}: {reason}")
             }
+            Self::InvalidIndirectDraw { segment_name, draw_id, reason } => {
+                write!(f, "Render segment '{segment_name}' indirect draw {draw_id}: {reason}")
+            }
             Self::InvalidIndirectDispatch { segment_name, dispatch_id, reason } => {
                 write!(f, "Compute segment '{segment_name}' indirect dispatch {dispatch_id}: {reason}")
             }
@@ -2500,29 +2559,41 @@ fn validate_index_buffer_range(
     Ok(())
 }
 
-fn lower_indexed_draw(
+fn validate_indirect_buffer_range(buffer_id: u32, offset: u64, required_bytes: u64) -> Result<(), String> {
+    if buffer_id == 0 { return Err("Indirect-buffer ID must be non-zero".to_string()); }
+    if offset % 4 != 0 { return Err("Indirect-buffer offset must be four-byte aligned".to_string()); }
+    if offset.checked_add(required_bytes).is_none_or(|end| end > (1u64 << 53) - 1) {
+        return Err("Indirect argument range exceeds JavaScript's exact integer range".to_string());
+    }
+    Ok(())
+}
+
+fn lower_draw_parameters(
     segment_name: &str,
     draw: &Draw,
 ) -> Result<Option<GpuCommand>, PlanLoweringError> {
-    let DrawKind::Indexed { index_use_index, index_format, base_vertex } = draw.kind() else {
-        return Ok(None);
+    let indirect = draw.indirect_buffer_use().map_err(|reason| PlanLoweringError::InvalidIndirectDraw {
+        segment_name: segment_name.to_string(), draw_id: draw.draw_id(), reason: reason.to_string(),
+    })?;
+    let DrawKind::Indexed { index_format, base_vertex, .. } = draw.kind() else {
+        return Ok(indirect.map(|usage| GpuCommand::SetIndirectDrawParameters {
+            indirect_buffer_id: usage.resource_id.get(), indirect_offset: usage.byte_offset.unwrap_or(0),
+        }));
     };
     let invalid = |reason: String| PlanLoweringError::InvalidIndexedDraw {
         segment_name: segment_name.to_string(), draw_id: draw.draw_id(), reason,
     };
-    let usage = draw.uses().get(index_use_index)
-        .ok_or_else(|| invalid(format!("Index use {index_use_index} is outside the draw's declarations")))?;
-    if usage.kind != ResourceKind::Buffer
-        || usage.access != ResourceAccess::IndexBuffer
-        || usage.subresource != SubresourceRange::WholeBuffer
-    {
-        return Err(invalid("Selected index use must be a whole-buffer IndexBuffer read".to_string()));
-    }
+    let usage = draw.index_buffer_use().map_err(|reason| invalid(reason.to_string()))?;
     let index_size = usage.byte_size
         .ok_or_else(|| invalid("Index-buffer byte size must be explicit".to_string()))?;
     let index_offset = usage.byte_offset.unwrap_or(0);
-    validate_index_buffer_range(usage.resource_id.get(), index_format, index_offset, index_size)
-        .map_err(invalid)?;
+    if let Some(arguments) = indirect {
+        return Ok(Some(GpuCommand::SetIndexedIndirectDrawParameters {
+            index_buffer_id: usage.resource_id.get(), index_format, index_offset, index_size,
+            indirect_buffer_id: arguments.resource_id.get(),
+            indirect_offset: arguments.byte_offset.unwrap_or(0),
+        }));
+    }
     let required = (u64::from(draw.first_vertex()) + u64::from(draw.vertex_count()))
         * index_format.byte_width();
     if required > index_size {
@@ -2822,7 +2893,7 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                 }
 
                 for draw in segment.draws() {
-                    let indexed_parameters = lower_indexed_draw(segment.name(), draw)?;
+                    let explicit_parameters = lower_draw_parameters(segment.name(), draw)?;
                     let needs_viewport_update = match draw.viewport() {
                         Some(vp) => current_viewport != Some(vp),
                         None => false,
@@ -2851,7 +2922,7 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                             (false, None, current_scissor)
                         };
 
-                    let needs_draw_parameters = indexed_parameters.is_some()
+                    let needs_draw_parameters = explicit_parameters.is_some()
                         || (matches!(draw.kind(), DrawKind::Direct)
                             && (draw.instance_count() != 1
                                 || draw.first_vertex() != 0
@@ -2898,7 +2969,7 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                             });
                         }
                         DrawKind::Direct | DrawKind::Indexed { .. } => {
-                            if let Some(parameters) = indexed_parameters {
+                            if let Some(parameters) = explicit_parameters {
                                 commands.push(parameters);
                             } else if needs_draw_parameters {
                                 commands.push(GpuCommand::SetDrawParameters {
@@ -9273,6 +9344,82 @@ mod tests {
             assert!(matches!(GpuSubmissionPacket::from_commands(vec![command]).encode(),
                 Err(PacketEncodeError::InvalidDimensions(_))));
         }
+    }
+
+    #[test]
+    fn indirect_draw_wire_layout_preserves_full_width_fields_and_checks_ranges() {
+        let encode = |command| GpuSubmissionPacket::from_commands(vec![command]).encode();
+        let offset = 0x3_0000_0004;
+        let direct = encode(GpuCommand::SetIndirectDrawParameters {
+            indirect_buffer_id: 55, indirect_offset: offset,
+        }).unwrap();
+        assert_eq!(direct.len(), 16 + 2 + 12);
+        assert_eq!(&direct[16..22], &[34, 0, 55, 0, 0, 0]);
+        assert_eq!(&direct[22..30], &offset.to_le_bytes());
+        let indexed = encode(GpuCommand::SetIndexedIndirectDrawParameters {
+            index_buffer_id: 66, index_format: IndexFormat::Uint32,
+            index_offset: 0x1_0000_0004, index_size: 0x2_0000_0007,
+            indirect_buffer_id: 55, indirect_offset: offset,
+        }).unwrap();
+        assert_eq!(indexed.len(), 16 + 2 + 36);
+        assert_eq!(&indexed[16..26], &[35, 0, 66, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(&indexed[26..34], &0x1_0000_0004u64.to_le_bytes());
+        assert_eq!(&indexed[34..42], &0x2_0000_0007u64.to_le_bytes());
+        assert_eq!(&indexed[42..46], &55u32.to_le_bytes());
+        assert_eq!(&indexed[46..54], &offset.to_le_bytes());
+        for (id, offset) in [(0, 0), (55, 2), (55, (1u64 << 53) - 16), (55, u64::MAX - 3)] {
+            assert!(encode(GpuCommand::SetIndirectDrawParameters { indirect_buffer_id: id, indirect_offset: offset }).is_err());
+            assert!(encode(GpuCommand::SetIndexedIndirectDrawParameters {
+                index_buffer_id: 66, index_format: IndexFormat::Uint32, index_offset: 4, index_size: 0,
+                indirect_buffer_id: id, indirect_offset: offset,
+            }).is_err());
+        }
+        assert!(encode(GpuCommand::SetIndexedIndirectDrawParameters {
+            index_buffer_id: 66, index_format: IndexFormat::Uint32, index_offset: 2, index_size: 4,
+            indirect_buffer_id: 55, indirect_offset: 0,
+        }).is_err());
+    }
+
+    #[test]
+    fn indirect_draw_lowering_preserves_pass_variants_and_ignores_cpu_counts() {
+        for depth in [false, true] { for resolve in [false, true] { for indexed in [false, true] {
+            for bundle_first in [false, true] { for count in [0, u32::MAX] {
+                let mut plan = attachment_view_test_plan(SubresourceRange::full_texture(), depth);
+                let segment = &mut plan.segments[0];
+                if resolve { segment.color_attachments[0].resolve_target = Some(ResourceId::new(11)); }
+                if bundle_first { segment.draws.push(Draw::new_bundle(6, 42, 100, Vec::new())); }
+                let size = if count == 0 { 0 } else { 7 };
+                let mut draw = Draw::new(7, 100, count, 0, vec![
+                    ResourceUse::buffer_indirect(ResourceId::new(55), DataVersion::new(9), Some(4), Some(20)),
+                    ResourceUse::buffer_index(ResourceId::new(66), DataVersion::new(8), Some(4), Some(size)),
+                ]).with_range([count, 0, u32::MAX, u32::MAX]).with_indirect_buffer(0);
+                if indexed { draw = draw.with_indexed(1, IndexFormat::Uint32, i32::MIN); }
+                if resolve { draw = draw.with_viewport_rect([1, 2, 3, 4]).with_scissor_rect([0, 0, 2, 3]); }
+                segment.draws.extend([draw, Draw::new(8, 100, 3, 0, Vec::new())]);
+                let commands = lower_plan(&plan).unwrap();
+                let expected = if indexed { GpuCommand::SetIndexedIndirectDrawParameters {
+                    index_buffer_id: 66, index_format: IndexFormat::Uint32, index_offset: 4, index_size: size,
+                    indirect_buffer_id: 55, indirect_offset: 4,
+                } } else { GpuCommand::SetIndirectDrawParameters { indirect_buffer_id: 55, indirect_offset: 4 } };
+                let position = commands.iter().position(|command| *command == expected).unwrap();
+                assert!(position > 0, "indirect arguments require an open pass");
+                let (variant, flags) = match commands[position + 1] {
+                    GpuCommand::RenderPass { pass_flags, .. } => (0, pass_flags),
+                    GpuCommand::RenderPassResolve { pass_flags, .. } => (1, pass_flags),
+                    GpuCommand::RenderPassDepth { pass_flags, .. } => (2, pass_flags),
+                    GpuCommand::RenderPassDepthResolve { pass_flags, .. } => (3, pass_flags),
+                    ref other => panic!("indirect setter must immediately precede its draw: {other:?}"),
+                };
+                assert_eq!((variant, flags), (2 * u32::from(depth) + u32::from(resolve), PASS_FLAG_NONE));
+                assert!(!commands.iter().any(|c| matches!(c, GpuCommand::SetDrawParameters { .. } | GpuCommand::SetIndexedDrawParameters { .. })));
+                GpuSubmissionPacket::from_commands(commands).encode().unwrap();
+            } }
+        } } }
+        let mut invalid = attachment_view_test_plan(SubresourceRange::full_texture(), false);
+        invalid.segments[0].draws.push(Draw::new_bundle(7, 42, 100, vec![
+            ResourceUse::buffer_indirect(ResourceId::new(55), DataVersion::INITIAL, Some(0), Some(20)),
+        ]).with_indirect_buffer(0));
+        assert!(matches!(lower_plan(&invalid), Err(PlanLoweringError::InvalidIndirectDraw { draw_id: 7, .. })));
     }
 
     #[test]

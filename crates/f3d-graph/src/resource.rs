@@ -418,6 +418,31 @@ impl ResourceUse {
         }
     }
 
+    /// Validate a canonical indirect argument read for a command's record size.
+    pub fn validate_indirect_arguments(&self, required_bytes: u64) -> Result<(), &'static str> {
+        if self.kind != ResourceKind::Buffer
+            || self.access != ResourceAccess::IndirectBuffer
+            || self.subresource != SubresourceRange::WholeBuffer
+        {
+            return Err("Selected indirect use must be a whole-buffer IndirectBuffer read");
+        }
+        if self.resource_id.get() == 0 {
+            return Err("Indirect-buffer ID must be non-zero");
+        }
+        let size = self.byte_size.ok_or("Indirect-buffer byte size must be explicit")?;
+        if size < required_bytes {
+            return Err("Indirect-buffer range is smaller than its command's argument record");
+        }
+        let offset = self.byte_offset.unwrap_or(0);
+        if offset % 4 != 0 {
+            return Err("Indirect-buffer byte offset must be a multiple of four");
+        }
+        if offset.checked_add(size).is_none_or(|end| end > (1u64 << 53) - 1) {
+            return Err("Indirect-buffer byte range exceeds JavaScript's exact integer range");
+        }
+        Ok(())
+    }
+
     /// Create a sampled texture read usage.
     pub fn texture_sampled(
         resource_id: ResourceId,

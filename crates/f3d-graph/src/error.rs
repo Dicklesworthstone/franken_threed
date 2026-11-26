@@ -209,6 +209,13 @@ pub enum HazardError {
         /// Exact declaration or byte-range error.
         reason: String,
     },
+    /// An indirect draw selects invalid argument or index declarations, or a bundle.
+    InvalidIndirectDraw {
+        /// Draw whose selected declarations are invalid.
+        draw_id: u32,
+        /// Exact declaration or byte-range error.
+        reason: String,
+    },
     /// Compute dispatch binding references an invalid use_index out of bounds of `dispatch.uses`.
     InvalidUseIndex {
         /// Dispatch index where the error occurred.
@@ -362,6 +369,9 @@ impl fmt::Display for HazardError {
             }
             Self::InvalidIndirectBuffer { dispatch_id, reason } => {
                 write!(f, "compute dispatch {dispatch_id} has invalid indirect arguments: {reason}")
+            }
+            Self::InvalidIndirectDraw { draw_id, reason } => {
+                write!(f, "draw {draw_id} has invalid indirect arguments: {reason}")
             }
             Self::InvalidUseIndex {
                 dispatch_id,
