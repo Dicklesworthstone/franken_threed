@@ -148,6 +148,8 @@ export class WebGpuBridgeHost {
     this.bundles = new Map();
     this.computePipelines = new Map();
     this.pendingPreparations = new WeakMap();
+    this.pendingWrites = new WeakMap();
+    this.bundleResources = new WeakMap();
     this.bufferEpochs = new Map();
     this.errorScopeActive = false;
     this.lastRenderTargetId = null;
@@ -163,6 +165,8 @@ export class WebGpuBridgeHost {
     this.bundles.clear();
     this.computePipelines.clear();
     this.pendingPreparations = new WeakMap();
+    this.pendingWrites = new WeakMap();
+    this.bundleResources = new WeakMap();
     this.bufferEpochs.clear();
     this.lastRenderTargetId = null;
   }
@@ -484,22 +488,44 @@ export class WebGpuBridgeHost {
     const device = this.device;
     const deviceGeneration = this.deviceGeneration;
     const preparations = this.pendingPreparations;
+    const writes = this.pendingWrites;
     const preparation = { promise: null };
     const dependencies = new Set();
     const created = [];
+    const written = new Set();
+    const encodedWrites = new Set();
     const publishPrepared = (cache, id, value) => {
       cache.set(id, value);
       preparations.set(value, preparation);
       created.push({ cache, id, value });
     };
-    const usePrepared = (value) => {
+    const usePrepared = (value, consumesContent = true) => {
       const producer = preparations.get(value);
       if (producer && producer !== preparation) dependencies.add(producer.promise);
+      // Earlier encoded writes in this packet already captured any dependency
+      // on old contents. A following read sees those writes, including a full
+      // overwrite that intentionally recovered from a failed prior writer.
+      const writer = consumesContent && !encodedWrites.has(value) && writes.get(value);
+      if (writer && writer !== preparation) dependencies.add(writer.promise);
       return value;
     };
+    const publishWrite = (value) => {
+      writes.set(value, preparation);
+      written.add(value);
+    };
+    // A full independent overwrite can recover valid storage after a failed
+    // writer. Partial writes still depend on the untouched contents. Allocation
+    // validity is always required, even when no old texels or bytes are read.
+    const fullTextureWrite = (texture, mip, layer, width, height, layers) =>
+      width > 0 && height > 0 && layers > 0 && mip === 0 && layer === 0 &&
+      texture?.mipLevelCount === 1 && width === texture.width && height === texture.height &&
+      layers === texture.depthOrArrayLayers;
+    const fullBufferWrite = (buffer, offset, size) => size > 0 && offset === 0 && size === buffer?.size;
     const finishPreparation = (failed) => {
       for (const { cache, id, value } of created) {
-        preparations.delete(value);
+        // Keep failed native identities invalid through aliases after the
+        // original numeric ID is removed or reused for a new allocation.
+        if (!failed && preparations.get(value) === preparation) preparations.delete(value);
         if (failed && this.device === device && this.deviceGeneration === deviceGeneration &&
             cache.get(id) === value) {
           cache.delete(id);
@@ -508,6 +534,11 @@ export class WebGpuBridgeHost {
         }
       }
       created.length = 0;
+      for (const value of written) {
+        // A later overwrite may already own this object. Never erase its receipt.
+        if (!failed && writes.get(value) === preparation) writes.delete(value);
+      }
+      written.clear();
     };
 
     // Synchronous execution block inside error scopes
@@ -612,10 +643,11 @@ export class WebGpuBridgeHost {
               const dataLength = dataView.getUint32(cursor + 12, true);
               cursor += 16;
 
-              const buffer = usePrepared(this.buffers.get(bufferId));
+              const buffer = this.buffers.get(bufferId);
               if (!buffer) {
                 throw new Error(`WriteBuffer: unknown bufferId ${bufferId}`);
               }
+              usePrepared(buffer, !fullBufferWrite(buffer, offset, dataLength));
               if (dataOffset + dataLength > dataPayload.byteLength) {
                 throw new Error(
                   `WriteBuffer: data slice out of bounds (offset ${dataOffset} + len ${dataLength} > payload ${dataPayload.byteLength})`,
@@ -628,7 +660,10 @@ export class WebGpuBridgeHost {
               }
               if (!commandEncoder) {
                 device.queue.writeBuffer(buffer, offset, chunk);
-                if (dataLength) this.bufferEpochs.delete(bufferId);
+                if (dataLength) {
+                  this.bufferEpochs.delete(bufferId);
+                  publishWrite(buffer);
+                }
               } else {
                 if (offset % 4 !== 0 || dataLength % 4 !== 0 || offset + dataLength > buffer.size)
                   throw new RangeError("WriteBuffer: copy must be aligned and fit in the destination");
@@ -641,7 +676,10 @@ export class WebGpuBridgeHost {
                 new Uint8Array(stagingBuffer.getMappedRange()).set(chunk);
                 stagingBuffer.unmap();
                 commandEncoder.copyBufferToBuffer(stagingBuffer, 0, buffer, offset, dataLength);
-                if (dataLength) encodedEpochs.set(bufferId, { epochHi: 0, epochLo: 0, preparation });
+                if (dataLength) {
+                  encodedEpochs.set(bufferId, { epochHi: 0, epochLo: 0, preparation });
+                  encodedWrites.add(buffer);
+                }
               }
               break;
             }
@@ -707,10 +745,11 @@ export class WebGpuBridgeHost {
               const dataLength = dataView.getUint32(cursor + 20, true);
               cursor += 24;
 
-              const texture = usePrepared(this.textures.get(textureId));
+              const texture = this.textures.get(textureId);
               if (!texture) {
                 throw new Error(`WriteTexture: unknown textureId ${textureId}`);
               }
+              usePrepared(texture, !fullTextureWrite(texture, 0, 0, width, height, 1));
 
               const format = texture.format;
               if (format !== "rgba8unorm" && format !== "bgra8unorm") {
@@ -773,6 +812,7 @@ export class WebGpuBridgeHost {
                 { texture: texture },
                 [width, height, 1],
               );
+              if (width > 0 && height > 0) encodedWrites.add(texture);
               break;
             }
 
@@ -1125,7 +1165,7 @@ export class WebGpuBridgeHost {
               }
               const addressMode = ADDRESS_MODE_NAMES[addressModeCode];
 
-              const texture = usePrepared(this.textures.get(textureId));
+              const texture = usePrepared(this.textures.get(textureId), false);
               if (!texture) {
                 throw new Error(`CreatePipelineTextured: unknown textureId ${textureId}`);
               }
@@ -1327,10 +1367,12 @@ export class WebGpuBridgeHost {
                   // Canvas swapchain view is acquired at most once per packet execution (§8.5, [S48])
                   targetView = getCanvasView();
                 } else if (targetKind === TARGET_OFFSCREEN) {
-                  const texture = usePrepared(this.textures.get(targetId));
+                  const texture = this.textures.get(targetId);
                   if (!texture) {
                     throw new Error(`RenderPass: unknown offscreen targetId ${targetId}`);
                   }
+                  usePrepared(texture, loadOpCode === 1 ||
+                    !fullTextureWrite(texture, 0, 0, texture.width, texture.height, 1));
                   sourceTexture = texture;
                   targetView = texture.createView();
                 } else {
@@ -1347,13 +1389,18 @@ export class WebGpuBridgeHost {
                 if (loadOp === "clear") {
                   colorAttachmentDesc.clearValue = { r: cr, g: cg, b: cb, a: ca };
                 }
+                const resolveTexture = hasResolve ? this.textures.get(resolveTargetId) : null;
                 if (hasResolve) {
-                  colorAttachmentDesc.resolveTarget = colorResolveView(sourceTexture, usePrepared(this.textures.get(resolveTargetId)));
+                  usePrepared(resolveTexture, !fullTextureWrite(resolveTexture, 0, 0,
+                    sourceTexture.width, sourceTexture.height, 1));
+                  colorAttachmentDesc.resolveTarget = colorResolveView(sourceTexture, resolveTexture);
                 }
 
                 currentPassEncoder = encoder().beginRenderPass({
                   colorAttachments: [colorAttachmentDesc],
                 });
+                if (sourceTexture) encodedWrites.add(sourceTexture);
+                if (resolveTexture) encodedWrites.add(resolveTexture);
                 currentPassTargetKey = targetKey;
                 currentPassSampleCount = sourceTexture?.sampleCount ?? 1;
                 passState = {
@@ -1390,6 +1437,7 @@ export class WebGpuBridgeHost {
                 const isTextured = Boolean(
                   pipelineRecord.isTextured || (pipelineRecord.texture && pipelineRecord.sampler),
                 );
+                if (isTextured) usePrepared(pipelineRecord.texture);
                 if (hasUniform || isTextured) {
                   const needsRebind = hasUniform
                     ? passState.uniformBufferId !== uniformBufferId ||
@@ -1565,20 +1613,24 @@ export class WebGpuBridgeHost {
                   // Canvas swapchain view is acquired at most once per packet execution (§8.5, [S48])
                   targetView = getCanvasView();
                 } else if (targetKind === TARGET_OFFSCREEN) {
-                  const texture = usePrepared(this.textures.get(targetId));
+                  const texture = this.textures.get(targetId);
                   if (!texture) {
                     throw new Error(`RenderPassDepth: unknown offscreen targetId ${targetId}`);
                   }
+                  usePrepared(texture, loadOpCode === 1 ||
+                    !fullTextureWrite(texture, 0, 0, texture.width, texture.height, 1));
                   sourceTexture = texture;
                   targetView = texture.createView();
                 } else {
                   throw new Error(`Invalid render pass targetKind: ${targetKind}`);
                 }
 
-                const depthTexture = usePrepared(this.textures.get(depthTargetId));
+                const depthTexture = this.textures.get(depthTargetId);
                 if (!depthTexture) {
                   throw new Error(`RenderPassDepth: unknown depthTargetId ${depthTargetId}`);
                 }
+                usePrepared(depthTexture, depthReadOnlyCode === 1 || depthLoadOpCode === 1 ||
+                  !fullTextureWrite(depthTexture, 0, 0, depthTexture.width, depthTexture.height, 1));
                 const sampleCount = sourceTexture?.sampleCount ?? 1;
                 if (depthTexture.sampleCount !== sampleCount ||
                     (sourceTexture && (sourceTexture.width !== depthTexture.width ||
@@ -1597,8 +1649,11 @@ export class WebGpuBridgeHost {
                 if (loadOp === "clear") {
                   colorAttachmentDesc.clearValue = { r: cr, g: cg, b: cb, a: ca };
                 }
+                const resolveTexture = hasResolve ? this.textures.get(resolveTargetId) : null;
                 if (hasResolve) {
-                  colorAttachmentDesc.resolveTarget = colorResolveView(sourceTexture, usePrepared(this.textures.get(resolveTargetId)));
+                  usePrepared(resolveTexture, !fullTextureWrite(resolveTexture, 0, 0,
+                    sourceTexture.width, sourceTexture.height, 1));
+                  colorAttachmentDesc.resolveTarget = colorResolveView(sourceTexture, resolveTexture);
                 }
 
                 const depthReadOnly = depthReadOnlyCode === 1;
@@ -1621,6 +1676,9 @@ export class WebGpuBridgeHost {
                   colorAttachments: [colorAttachmentDesc],
                   depthStencilAttachment: depthAttachmentDesc,
                 });
+                if (sourceTexture) encodedWrites.add(sourceTexture);
+                if (resolveTexture) encodedWrites.add(resolveTexture);
+                if (!depthReadOnly) encodedWrites.add(depthTexture);
                 currentPassTargetKey = targetKey;
                 currentPassSampleCount = sampleCount;
                 passState = {
@@ -1653,6 +1711,7 @@ export class WebGpuBridgeHost {
                 const isTextured = Boolean(
                   pipelineRecord.isTextured || (pipelineRecord.texture && pipelineRecord.sampler),
                 );
+                if (isTextured) usePrepared(pipelineRecord.texture);
                 if (hasUniform || isTextured) {
                   const needsRebind = hasUniform
                     ? passState.uniformBufferId !== uniformBufferId ||
@@ -1740,10 +1799,13 @@ export class WebGpuBridgeHost {
               cursor += fieldBytes;
 
               const texture = usePrepared(this.textures.get(textureId));
-              const buffer = usePrepared(this.buffers.get(bufferId));
+              const buffer = this.buffers.get(bufferId);
               if (!texture || !buffer) {
                 throw new Error("CopyTextureToBuffer: invalid texture or buffer id");
               }
+              const replacesContents = height > 0 && (height === 1 || bytesPerRow === width * 4) &&
+                fullBufferWrite(buffer, 0, width * height * 4);
+              usePrepared(buffer, !replacesContents);
 
               if (explicitLayout) {
                 const rowBytes = width * 4;
@@ -1772,6 +1834,7 @@ export class WebGpuBridgeHost {
               );
               if (width > 0 && height > 0) {
                 encodedEpochs.set(bufferId, { epochHi, epochLo, preparation });
+                encodedWrites.add(buffer);
               }
               break;
             }
@@ -1788,8 +1851,9 @@ export class WebGpuBridgeHost {
               const bytesPerRow = dataView.getUint32(cursor + 16, true);
               cursor += 20;
               const buffer = usePrepared(this.buffers.get(bufferId));
-              const texture = usePrepared(this.textures.get(textureId));
+              const texture = this.textures.get(textureId);
               if (!buffer || !texture) throw new Error("CopyBufferToTexture: invalid buffer or texture id");
+              usePrepared(texture, !fullTextureWrite(texture, 0, 0, width, height, 1));
               const rowBytes = width * 4;
               const requiredBytes = height > 0 ? (height - 1) * bytesPerRow + rowBytes : 0;
               if (bytesPerRow % 256 !== 0 || bytesPerRow < rowBytes ||
@@ -1809,6 +1873,7 @@ export class WebGpuBridgeHost {
                 { buffer, bytesPerRow, rowsPerImage: height },
                 { texture }, [width, height, 1],
               );
+              if (width > 0 && height > 0) encodedWrites.add(texture);
               break;
             }
 
@@ -1828,8 +1893,9 @@ export class WebGpuBridgeHost {
               const layers = dataView.getUint32(cursor + 32, true);
               cursor += 36;
               const source = usePrepared(this.textures.get(sourceId));
-              const destination = usePrepared(this.textures.get(destinationId));
+              const destination = this.textures.get(destinationId);
               if (!source || !destination) throw new Error("CopyTextureToTexture: invalid source or destination texture id");
+              usePrepared(destination, !fullTextureWrite(destination, destinationMip, destinationLayer, width, height, layers));
               const formats = ["rgba8unorm", "rgba8unorm-srgb", "bgra8unorm", "bgra8unorm-srgb", "depth24plus", "depth32float"];
               if (source.dimension !== "2d" || destination.dimension !== "2d" ||
                   !formats.includes(source.format) || !formats.includes(destination.format) ||
@@ -1865,6 +1931,7 @@ export class WebGpuBridgeHost {
                 { texture: destination, mipLevel: destinationMip, origin: [0, 0, destinationLayer] },
                 [width, height, layers],
               );
+              if (width > 0 && height > 0 && layers > 0) encodedWrites.add(destination);
               break;
             }
 
@@ -1940,12 +2007,13 @@ export class WebGpuBridgeHost {
               if (!srcBuffer) {
                 throw new Error(`CopyBufferToBuffer: unknown source bufferId ${sourceBufferId}`);
               }
-              const dstBuffer = usePrepared(this.buffers.get(destinationBufferId));
+              const dstBuffer = this.buffers.get(destinationBufferId);
               if (!dstBuffer) {
                 throw new Error(
                   `CopyBufferToBuffer: unknown destination bufferId ${destinationBufferId}`,
                 );
               }
+              usePrepared(dstBuffer, !fullBufferWrite(dstBuffer, destinationOffset, size));
 
               const COPY_SRC =
                 typeof GPUBufferUsage !== "undefined" && GPUBufferUsage.COPY_SRC
@@ -1984,8 +2052,6 @@ export class WebGpuBridgeHost {
                 );
               }
 
-              encodedEpochs.set(destinationBufferId, { epochHi, epochLo, preparation });
-
               encoder().copyBufferToBuffer(
                 srcBuffer,
                 sourceOffset,
@@ -1993,6 +2059,10 @@ export class WebGpuBridgeHost {
                 destinationOffset,
                 size,
               );
+              if (size > 0) {
+                encodedEpochs.set(destinationBufferId, { epochHi, epochLo, preparation });
+                encodedWrites.add(dstBuffer);
+              }
               break;
             }
 
@@ -2040,7 +2110,7 @@ export class WebGpuBridgeHost {
                 throw new Error(`RecordBundle: unsupported sample count ${sampleCount}`);
               }
               const uniformBuf = pipelineRecord.hasUniformBuffer
-                ? usePrepared(this.buffers.get(uniformBufferId))
+                ? usePrepared(this.buffers.get(uniformBufferId), false)
                 : null;
               if (pipelineRecord.hasUniformBuffer && !uniformBuf) {
                 throw new Error(
@@ -2078,6 +2148,11 @@ export class WebGpuBridgeHost {
               const isTextured = Boolean(
                 pipelineRecord.isTextured || (pipelineRecord.texture && pipelineRecord.sampler),
               );
+              // Bundles retain native objects, not their numeric IDs. Revisit
+              // their current content receipts whenever the bundle executes.
+              const resources = [];
+              if (uniformBuf) resources.push(uniformBuf);
+              if (isTextured) resources.push(usePrepared(pipelineRecord.texture, false));
               let bindGroup = null;
               if (hasUniform || isTextured) {
                 const bindGroupEntries = [];
@@ -2115,11 +2190,12 @@ export class WebGpuBridgeHost {
               }
 
               if (vertexBufferId > 0) {
-                const vb = usePrepared(this.buffers.get(vertexBufferId));
+                const vb = usePrepared(this.buffers.get(vertexBufferId), false);
                 if (!vb) {
                   throw new Error(`RecordBundle: unknown vertexBufferId ${vertexBufferId}`);
                 }
                 bundleEncoder.setVertexBuffer(0, vb);
+                resources.push(vb);
               }
 
               for (let draw = 0; draw < drawCount; draw++) {
@@ -2130,6 +2206,7 @@ export class WebGpuBridgeHost {
               }
 
               const bundle = bundleEncoder.finish();
+              this.bundleResources.set(bundle, resources);
               publishPrepared(this.bundles, bundleId, bundle);
               break;
             }
@@ -2263,21 +2340,23 @@ export class WebGpuBridgeHost {
                   throw new Error("ExecuteBundles: no active render pass and no target found");
                 }
 
-                let targetView;
+                let targetView, sourceTexture = null;
                 if (targetType === TARGET_CANVAS) {
                   if (!canvasContext) {
                     throw new Error("ExecuteBundles: canvas target requires a canvas context");
                   }
                   targetView = getCanvasView();
                 } else {
-                  const texture = usePrepared(this.textures.get(targetId));
+                  const texture = this.textures.get(targetId);
                   if (!texture) {
                     throw new Error(`ExecuteBundles: unknown offscreen targetId ${targetId}`);
                   }
+                  usePrepared(texture, !fullTextureWrite(texture, 0, 0, texture.width, texture.height, 1));
                   if (texture.sampleCount !== 1) {
                     throw new Error("ExecuteBundles: multisampled attachments require an explicit render-pass opener");
                   }
                   targetView = texture.createView();
+                  sourceTexture = texture;
                 }
 
                 currentPassEncoder = encoder().beginRenderPass({
@@ -2295,6 +2374,7 @@ export class WebGpuBridgeHost {
                     },
                   ],
                 });
+                if (sourceTexture) encodedWrites.add(sourceTexture);
                 currentPassTargetKey = `${targetType}:${targetId}:none`;
                 passState = {
                   pipelineId: null,
@@ -2311,6 +2391,7 @@ export class WebGpuBridgeHost {
                 if (!b) {
                   throw new Error(`ExecuteBundles: unknown bundleId ${bId}`);
                 }
+                for (const resource of this.bundleResources.get(b) || []) usePrepared(resource);
                 bundleList.push(b);
               }
 
@@ -2710,6 +2791,7 @@ export class WebGpuBridgeHost {
                 const pb = parsedBindings[b];
                 if (pb.bindingType === BINDING_TYPE_STORAGE_READ_WRITE) {
                   encodedEpochs.set(pb.bufferId, { epochHi: pb.epochHi, epochLo: pb.epochLo, preparation });
+                  encodedWrites.add(pb.buffer);
                 }
               }
 
@@ -2749,6 +2831,7 @@ export class WebGpuBridgeHost {
         const commandBuffer = encoder().finish();
         this.device.queue.submit([commandBuffer]);
         submitted = true;
+        for (const value of encodedWrites) publishWrite(value);
         // Recording can fail after a copy or dispatch. Publish its epoch only
         // after submit returns, and retain the validation receipt for readback.
         for (const [id, epoch] of encodedEpochs) this.bufferEpochs.set(id, epoch);
@@ -2796,14 +2879,18 @@ export class WebGpuBridgeHost {
     // Capture metadata with this buffer: a later packet can reuse its numeric ID
     // while mapAsync is pending, but must not relabel these older GPU bytes.
     const allocation = this.pendingPreparations.get(buffer);
+    const content = this.pendingWrites.get(buffer);
     const { epochHi, epochLo, preparation } = this.bufferEpochs.get(bufferId) || { epochHi: 0, epochLo: 0 };
-    await buffer.mapAsync(GPUMapMode.READ, 0, byteLength);
     let copy;
     try {
       // mapAsync can succeed on an older buffer value when an invalid command
       // buffer was discarded. Never stamp those bytes with the failed writer's epoch.
-      if (allocation) await allocation.promise;
-      if (preparation && preparation !== allocation) await preparation.promise;
+      // Observe failures concurrently so a stalled map cannot hide a rejected
+      // producer; the finally block also cancels a still-pending mapping.
+      await Promise.all([
+        buffer.mapAsync(GPUMapMode.READ, 0, byteLength),
+        allocation?.promise, content?.promise, preparation?.promise,
+      ]);
       if (
         !this.wrongImplSkipReadbackDeviceCheck &&
         (this.device !== device || this.deviceGeneration !== deviceGeneration)

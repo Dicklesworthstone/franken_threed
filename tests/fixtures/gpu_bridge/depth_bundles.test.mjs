@@ -352,7 +352,9 @@ test("bundle preparation and execution inherit pending pipeline validation", asy
   assert.equal(f.host.pipelines.has(100), false);
   assert.equal(f.host.bundles.has(42), false);
   await assert.rejects(f.host.executePacket(packet([recordBundle()])), /unknown pipelineId/);
-  await assert.rejects(f.host.executePacket(packet([depthPass(), executeBundles()])), /unknown bundleId/);
+  // The loaded target also retains the failed writer's receipt. Either failure
+  // may settle first; removal of the bundle is independently asserted above.
+  await assert.rejects(f.host.executePacket(packet([depthPass(), executeBundles()])), /unknown bundleId|producer pipeline invalid/);
 });
 
 for (const kind of ["color", "depth", "compute"]) {

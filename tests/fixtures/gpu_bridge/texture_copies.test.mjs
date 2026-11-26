@@ -8,16 +8,17 @@ const dataUrl = source => "data:text/javascript;base64," + Buffer.from(source).t
 const memorySource = await readFile(new URL("./memory_transport.js", import.meta.url), "utf8");
 const bridgeSource = await readFile(new URL("./bridge_runtime.js", import.meta.url), "utf8");
 const { WebGpuBridgeHost } = await import(dataUrl(
-  "const GPUMapMode = { READ: 1 };\n" +
+  "const GPUMapMode = { READ: 1 }, GPUBufferUsage = { COPY_SRC: 4, COPY_DST: 8 }, GPUShaderStage = { VERTEX: 1, FRAGMENT: 2 };\n" +
   bridgeSource.replace('"./memory_transport.js"', JSON.stringify(dataUrl(memorySource))),
 ));
 
-function packet(commands) {
-  const size = 16 + commands.reduce((bytes, [, fields]) => bytes + 2 + fields.length * 4, 0);
+function packet(commands, payload = new Uint8Array()) {
+  const size = 16 + commands.reduce((bytes, [, fields]) => bytes + 2 + fields.length * 4, 0) + payload.length;
   const bytes = new Uint8Array(size), view = new DataView(bytes.buffer);
   view.setUint32(0, 0x50443346, true);
   view.setUint16(4, 1, true);
   view.setUint32(8, commands.length, true);
+  view.setUint32(12, payload.length, true);
   let offset = 16;
   for (const [opcode, fields] of commands) {
     view.setUint16(offset, opcode, true);
@@ -27,6 +28,7 @@ function packet(commands) {
       offset += 4;
     }
   }
+  bytes.set(payload, offset);
   return bytes;
 }
 
@@ -50,6 +52,7 @@ function fixture({ bufferSize = 520, texture = {}, bufferUsage = 9, scopeError =
     width: 2, height: 2, depthOrArrayLayers: 1, mipLevelCount: 1,
     dimension: "2d", sampleCount: 1, format: "rgba8unorm", usage: 3,
     data: sourceBytes.slice(),
+    createView() { return { texture: this }; },
     ...texture,
   });
   host.device = {
@@ -59,9 +62,39 @@ function fixture({ bufferSize = 520, texture = {}, bufferUsage = 9, scopeError =
       events.push("pop:" + kind);
       return Promise.resolve(kind === "validation" ? scopeError : null);
     },
+    createBuffer({ size, usage, mappedAtCreation = false }) {
+      const data = new Uint8Array(size);
+      return {
+        size, usage, data, mapState: mappedAtCreation ? "mapped" : "unmapped",
+        getMappedRange() { return data.buffer; },
+        unmap() { this.mapState = "unmapped"; },
+        destroy() {},
+      };
+    },
+    createBindGroup() { return {}; },
+    createShaderModule() { return {}; },
+    createSampler() { return {}; },
+    createBindGroupLayout() { return {}; },
+    createPipelineLayout() { return {}; },
+    createRenderPipeline() { return {}; },
+    createRenderBundleEncoder() {
+      return {
+        setPipeline() {}, setBindGroup() {}, setVertexBuffer() {}, draw() {},
+        finish() { return {}; },
+      };
+    },
     createCommandEncoder() {
       const work = [];
       return {
+        beginRenderPass() {
+          return {
+            setPipeline() {}, setBindGroup() {}, setVertexBuffer() {}, draw() {},
+            executeBundles() {}, end() {},
+          };
+        },
+        copyBufferToBuffer(source, sourceOffset, destination, destinationOffset, size) {
+          work.push(() => destination.data.set(source.data.subarray(sourceOffset, sourceOffset + size), destinationOffset));
+        },
         copyBufferToTexture(source, destination, extent) {
           copies.push({ source, destination, extent });
           events.push("upload");
@@ -94,7 +127,7 @@ function fixture({ bufferSize = 520, texture = {}, bufferUsage = 9, scopeError =
           work.push(() => {
             for (let row = 0; row < extent[1]; row++) {
               const start = row * source.texture.width * 4;
-              bytes.set(source.texture.data.subarray(start, start + extent[0] * 4),
+              destination.buffer.data.set(source.texture.data.subarray(start, start + extent[0] * 4),
                 row * destination.bytesPerRow);
             }
           });
@@ -103,6 +136,7 @@ function fixture({ bufferSize = 520, texture = {}, bufferUsage = 9, scopeError =
       };
     },
     queue: {
+      writeBuffer(buffer, offset, data) { buffer.data.set(data, offset); },
       submit(commands) {
         events.push("submit");
         for (const command of commands) for (const apply of command) apply();
@@ -340,4 +374,226 @@ test("copy consumers retain pending allocation validation before readback public
   await assert.rejects(result, /staging allocation failed/);
   await assert.rejects(f.host.readbackBuffer(20, 520), /staging allocation failed/);
   assert.equal(f.events.at(-1), "unmap");
+});
+
+function deferNextValidation(f) {
+  const previous = f.host.device.popErrorScope;
+  let release, captured = false;
+  const pending = new Promise(resolve => { release = resolve; });
+  f.host.device.popErrorScope = function () {
+    const kind = f.scopes.at(-1), normal = previous.call(this);
+    if (kind === "validation" && !captured) {
+      captured = true;
+      return pending;
+    }
+    return normal;
+  };
+  return release;
+}
+
+function observe(promise) {
+  let settled = false;
+  promise.then(() => { settled = true; }, () => { settled = true; });
+  return { promise, settled: () => settled };
+}
+
+const nextTurn = () => new Promise(resolve => setImmediate(resolve));
+const readTexture = (id, bufferId = 20) => {
+  const command = readback();
+  command[1][0] = id;
+  command[1][1] = bufferId;
+  return command;
+};
+const bufferCopy = (source = 22, destination = 21, size = 520) =>
+  [20, [source, 0, 0, destination, 0, 0, size, 0, 31, 37]];
+const render = (target = 10, pipeline = 0, count = 0) =>
+  [4, [0x01000000, target, 0, 0, 0, 0, pipeline, 0, count, 0, 0]];
+
+for (const [name, command, target] of [
+  ["upload", upload(), 10], ["texture copy", imageCopy(), 11],
+]) {
+  test(name + " failure propagates across packets and native texture aliases", async () => {
+    const f = transferFixture(), release = deferNextValidation(f);
+    const producer = observe(f.host.executePacket(packet([command])));
+    const consumer = observe(f.host.executePacket(packet([readTexture(target)])));
+    const mapping = observe(f.host.readbackBuffer(20, 520));
+    await nextTurn();
+    assert.equal(consumer.settled(), false);
+    assert.equal(mapping.settled(), false);
+    release({ message: "producer validation failed" });
+    for (const result of [producer, consumer, mapping])
+      await assert.rejects(result.promise, /producer validation failed/);
+    assert.equal(f.events.at(-1), "unmap");
+
+    // An alias and a fresh readback allocation cannot hide a settled failure.
+    f.host.textures.set(12, f.host.textures.get(target));
+    f.host.buffers.set(23, { ...f.target, data: new Uint8Array(520) });
+    await assert.rejects(f.host.executePacket(packet([readTexture(12, 23)])), /producer validation failed/);
+  });
+
+  test(name + " full overwrite recovers after failure while a partial overwrite cannot", async () => {
+    const f = transferFixture(), release = deferNextValidation(f);
+    const failed = observe(f.host.executePacket(packet([command])));
+    release({ message: "failed prior writer" });
+    await assert.rejects(failed.promise, /failed prior writer/);
+    const partial = name === "upload" ? upload(512, 1, 2) : imageCopy({ width: 1 });
+    await assert.rejects(f.host.executePacket(packet([partial])), /failed prior writer/);
+    await f.host.executePacket(packet([command]));
+    await f.host.executePacket(packet([readTexture(target)]));
+    const result = await f.host.readbackBuffer(20, 520);
+    assert.deepEqual([...result.slice(0, 8), ...result.slice(512)], [...sourceBytes]);
+  });
+}
+
+test("successful upload-copy-readback chains await earlier packets and release their receipts", async () => {
+  const f = transferFixture(), release = deferNextValidation(f);
+  const uploadResult = observe(f.host.executePacket(packet([upload()])));
+  const copyResult = observe(f.host.executePacket(packet([imageCopy()])));
+  const readResult = observe(f.host.executePacket(packet([readTexture(11)])));
+  const mapping = observe(f.host.readbackBuffer(20, 520));
+  await nextTurn();
+  assert.equal(mapping.settled(), false);
+  release(null);
+  await Promise.all([uploadResult.promise, copyResult.promise, readResult.promise]);
+  const result = await mapping.promise;
+  assert.deepEqual([...result.slice(0, 8), ...result.slice(512)], [...sourceBytes]);
+  assert.equal(f.host.pendingWrites.get(f.host.textures.get(10)), undefined);
+  assert.equal(f.host.pendingWrites.get(f.host.textures.get(11)), undefined);
+  await f.host.executePacket(packet([readTexture(11)]));
+});
+
+test("earlier successful completion cannot erase a newer texture writer receipt", async () => {
+  const f = transferFixture(), releaseFirst = deferNextValidation(f);
+  const first = observe(f.host.executePacket(packet([upload()])));
+  const releaseSecond = deferNextValidation(f);
+  const second = observe(f.host.executePacket(packet([upload(512, 1, 2)])));
+  releaseFirst(null);
+  await first.promise;
+  const consumer = observe(f.host.executePacket(packet([readTexture(10)])));
+  await nextTurn();
+  assert.equal(consumer.settled(), false);
+  releaseSecond({ message: "newer writer failed" });
+  await assert.rejects(second.promise, /newer writer failed/);
+  await assert.rejects(consumer.promise, /newer writer failed/);
+});
+
+for (const kind of ["queue write", "buffer copy"]) {
+  test(kind + " failure follows source buffer contents through texture upload", async () => {
+    const f = transferFixture();
+    f.host.buffers.get(21).usage = 12;
+    f.host.buffers.set(22, { ...f.host.buffers.get(21), data: f.host.buffers.get(21).data.slice() });
+    const release = deferNextValidation(f);
+    const command = kind === "queue write" ? [2, [21, 0, 0, 520]] : bufferCopy();
+    const producer = observe(f.host.executePacket(packet([command], f.host.buffers.get(22).data)));
+    const consumer = observe(f.host.executePacket(packet([upload(), imageCopy(), readTexture(11)])));
+    await nextTurn();
+    assert.equal(consumer.settled(), false);
+    release({ message: "source buffer contents failed" });
+    await assert.rejects(producer.promise, /source buffer contents failed/);
+    await assert.rejects(consumer.promise, /source buffer contents failed/);
+    await assert.rejects(f.host.readbackBuffer(20, 520), /source buffer contents failed/);
+  });
+}
+
+test("failed allocation aliases remain invalid after cleanup and new native allocations recover", async () => {
+  const f = transferFixture(), data = f.host.buffers.get(21).data.slice();
+  const release = deferNextValidation(f);
+  const allocation = observe(f.host.executePacket(packet([[1, [21, 520, 12]]])));
+  f.host.buffers.set(22, f.host.buffers.get(21));
+  release({ message: "native allocation failed" });
+  await assert.rejects(allocation.promise, /native allocation failed/);
+  assert.equal(f.host.buffers.has(21), false);
+  const aliasedUpload = upload();
+  aliasedUpload[1][0] = 22;
+  await assert.rejects(f.host.executePacket(packet([aliasedUpload])), /native allocation failed/);
+  await f.host.executePacket(packet([[1, [21, 520, 12]], [2, [21, 0, 0, 520]]], data));
+  await f.host.executePacket(packet([upload(), readTexture(10)]));
+  const result = await f.host.readbackBuffer(20, 520);
+  assert.deepEqual([...result.slice(0, 8), ...result.slice(512)], [...sourceBytes]);
+});
+
+test("failed producer rejects a stalled mapping promptly and unmaps it", async () => {
+  const f = transferFixture(), release = deferNextValidation(f);
+  f.target.mapAsync = () => new Promise(() => {});
+  const producer = observe(f.host.executePacket(packet([upload()])));
+  const consumer = observe(f.host.executePacket(packet([readTexture(10)])));
+  const mapping = observe(f.host.readbackBuffer(20, 520));
+  release({ message: "upstream rejected during mapping" });
+  await assert.rejects(producer.promise, /upstream rejected/);
+  await assert.rejects(consumer.promise, /upstream rejected/);
+  await nextTurn();
+  assert.equal(mapping.settled(), true);
+  await assert.rejects(mapping.promise, /upstream rejected/);
+  assert.equal(f.events.at(-1), "unmap");
+});
+
+test("zero-size buffer copy preserves previous readback epoch and content receipt", async () => {
+  const f = transferFixture(), release = deferNextValidation(f);
+  const writer = observe(f.host.executePacket(packet([readTexture(10)])));
+  const epoch = f.host.bufferEpochs.get(20), receipt = f.host.pendingWrites.get(f.target);
+  const empty = observe(f.host.executePacket(packet([bufferCopy(21, 20, 0)])));
+  assert.equal(f.host.bufferEpochs.get(20), epoch);
+  assert.equal(f.host.pendingWrites.get(f.target), receipt);
+  release(null);
+  await Promise.all([writer.promise, empty.promise]);
+});
+
+for (const kind of ["WriteTexture", "clear render pass"]) {
+  test(kind + " output retains validation across a later texture readback packet", async () => {
+    const f = transferFixture(), release = deferNextValidation(f);
+    f.host.textures.get(10).usage |= 16;
+    const command = kind === "WriteTexture" ? [17, [10, 2, 2, 8, 0, 16]] : render();
+    const producer = observe(f.host.executePacket(packet([command], sourceBytes)));
+    const consumer = observe(f.host.executePacket(packet([readTexture(10)])));
+    await nextTurn();
+    assert.equal(consumer.settled(), false);
+    release({ message: "texture output failed" });
+    await assert.rejects(producer.promise, /texture output failed/);
+    await assert.rejects(consumer.promise, /texture output failed/);
+  });
+}
+
+for (const kind of ["cached textured draw", "cached textured bundle", "cached uniform bundle"]) {
+  test(kind + " consumes current native resource receipts", async () => {
+    const f = transferFixture(), uniform = kind === "cached uniform bundle";
+    f.host.textures.get(10).usage |= 4;
+    f.host.textures.get(11).usage |= 16;
+    f.host.buffers.get(21).usage |= 72;
+    f.host.pipelines.set(7, {
+      pipeline: {}, bindGroupLayout: {}, hasUniformBuffer: uniform,
+      ...(uniform ? { uniformSize: 16 } : { isTextured: true, texture: f.host.textures.get(10), sampler: {} }),
+    });
+    const bundled = kind !== "cached textured draw";
+    if (bundled) await f.host.executePacket(packet([[7, [9, 7, 0, 3, 0, 21, 2]]]));
+    const release = deferNextValidation(f);
+    const producerCommand = uniform ? [2, [21, 0, 0, 520]] : upload();
+    const producer = observe(f.host.executePacket(packet([producerCommand], f.host.buffers.get(21).data)));
+    const drawCommands = bundled ? [render(11), [8, [1, 9]]] : [render(11, 7, 3)];
+    const draw = observe(f.host.executePacket(packet(drawCommands)));
+    const consumer = observe(f.host.executePacket(packet([readTexture(11)])));
+    await nextTurn();
+    assert.equal(consumer.settled(), false);
+    release({ message: "bound resource write failed" });
+    for (const result of [producer, draw, consumer])
+      await assert.rejects(result.promise, /bound resource write failed/);
+  });
+}
+
+test("pipeline creation and bundle recording can precede recovery of valid resource contents", async () => {
+  const f = transferFixture(), release = deferNextValidation(f);
+  f.host.textures.get(10).usage |= 4;
+  f.host.textures.get(11).usage |= 16;
+  f.host.buffers.get(21).usage |= 104;
+  const data = f.host.buffers.get(21).data.slice();
+  const producer = observe(f.host.executePacket(packet([[2, [21, 0, 0, 520]], upload()], data)));
+  release({ message: "recoverable content failure" });
+  await assert.rejects(producer.promise, /recoverable content failure/);
+  const shader = new TextEncoder().encode(
+    "@vertex fn vs_main() -> @builtin(position) vec4f { return vec4f(0,0,0,1); } " +
+    "@fragment fn fs_main() -> @location(0) vec4f { return vec4f(1); }");
+  await f.host.executePacket(packet([[18, [7, 0, shader.length, 2, 1, 1, 16, 20, 10, 0, 0]]], shader));
+  await f.host.executePacket(packet([[7, [9, 7, 21, 3, 0, 21, 2]]]));
+  await f.host.executePacket(packet([[2, [21, 0, 0, 520]], upload()], data));
+  await f.host.executePacket(packet([render(11), [8, [1, 9]], readTexture(11)]));
+  await f.host.readbackBuffer(20, 520);
 });
