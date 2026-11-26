@@ -43,6 +43,7 @@ export const OPCODE_COPY_TEXTURE_TO_BUFFER_LAYOUT = 28;
 export const OPCODE_COPY_BUFFER_TO_TEXTURE = 29;
 export const OPCODE_COPY_TEXTURE_TO_TEXTURE = 30;
 export const OPCODE_SET_INDEXED_DRAW_PARAMETERS = 31;
+export const OPCODE_RELEASE_RESOURCE = 32;
 
 export const BINDING_TYPE_UNIFORM = 0;
 export const BINDING_TYPE_STORAGE_READ = 1;
@@ -151,6 +152,10 @@ export class WebGpuBridgeHost {
     this.pendingPreparations = new WeakMap();
     this.pendingWrites = new WeakMap();
     this.bundleResources = new WeakMap();
+    this.retiringResources = new Map();
+    this.destroyedResources = new WeakSet();
+    this.retiredDevices = new WeakSet();
+    this.readbackPins = new WeakMap();
     this.bufferEpochs = new Map();
     this.errorScopeActive = false;
     this.lastRenderTargetId = null;
@@ -170,6 +175,83 @@ export class WebGpuBridgeHost {
     this.bundleResources = new WeakMap();
     this.bufferEpochs.clear();
     this.lastRenderTargetId = null;
+    this.flushRetirements();
+  }
+
+  // Logical release detaches a numeric ID. Cached native bindings and active
+  // mappings can continue owning that exact residency independently of the ID.
+  resourceIsPinned(resource) {
+    if (this.readbackPins.get(resource)) return true;
+    for (const value of this.buffers.values()) if (value === resource) return true;
+    for (const value of this.textures.values()) if (value === resource) return true;
+    for (const pipeline of this.pipelines.values()) if (pipeline.texture === resource) return true;
+    for (const bundle of this.bundles.values()) {
+      if (this.bundleResources.get(bundle)?.includes(resource)) return true;
+    }
+    return false;
+  }
+
+  retireResource(resource, device = this.device, generation = this.deviceGeneration) {
+    if (!resource || typeof resource.destroy !== "function" ||
+        this.destroyedResources.has(resource) || this.retiringResources.has(resource)) return;
+    const record = { resource, device, generation, waiting: false, destroyed: false, lastUse: 0 };
+    this.retiringResources.set(resource, record);
+    if (this.retiredDevices.has(device)) this.destroyRetiredResource(record);
+  }
+
+  destroyRetiredResource(record) {
+    if (record.destroyed) return;
+    record.destroyed = true;
+    this.destroyedResources.add(record.resource);
+    if (this.retiringResources.get(record.resource) === record) this.retiringResources.delete(record.resource);
+    record.resource.destroy();
+  }
+
+  finishDeviceRetirements(device, generation) {
+    for (const record of this.retiringResources.values()) {
+      if (record.device === device && record.generation === generation) this.destroyRetiredResource(record);
+    }
+  }
+
+  // Call after synchronous packet recording/submission, never at a release
+  // opcode. The queue high-water mark also covers earlier writes when a later
+  // command fails before submit. One acknowledgement covers each eligible batch.
+  flushRetirements() {
+    if (this.errorScopeActive) return;
+    const batches = new Map();
+    for (const record of this.retiringResources.values()) {
+      if (record.waiting || record.destroyed || this.resourceIsPinned(record.resource)) continue;
+      // Without a completion observation, destruction cannot be authorized.
+      if (typeof record.device?.queue?.onSubmittedWorkDone !== "function") continue;
+      let batch = batches.get(record.device);
+      if (!batch) batches.set(record.device, batch = []);
+      record.waiting = true;
+      batch.push({ record, lastUse: record.lastUse });
+    }
+    for (const [device, batch] of batches) {
+      const finish = () => {
+        for (const { record, lastUse } of batch) {
+          record.waiting = false;
+          if (!record.destroyed && record.lastUse === lastUse &&
+              !this.resourceIsPinned(record.resource)) this.destroyRetiredResource(record);
+        }
+        // A native alias may have been used again after this high-water mark.
+        // Its next acknowledgement must include that later submission.
+        this.flushRetirements();
+      };
+      let completion;
+      try {
+        completion = device.queue.onSubmittedWorkDone();
+      } catch {
+        for (const { record } of batch) record.waiting = false;
+        // A missing acknowledgement cannot authorize destruction. Device
+        // teardown can still terminally reclaim these captured identities.
+        continue;
+      }
+      // Rejection is terminal cleanup, not successful GPU completion. Both
+      // paths only act on captured objects, including a replaced live device.
+      Promise.resolve(completion).then(finish, finish);
+    }
   }
 
   /** Stop owned work before requesting destruction; device.lost is asynchronous. */
@@ -177,12 +259,17 @@ export class WebGpuBridgeHost {
     // Also cancel a pending request that has not published a device yet.
     this.deviceRequest++;
     const device = this.device;
+    const generation = this.deviceGeneration;
     this.clearDeviceResources();
     this.device = null;
     this.adapter = null;
     this.capabilityRecord = null;
     this.deviceGeneration++;
     device?.destroy();
+    if (device) {
+      this.retiredDevices.add(device);
+      this.finishDeviceRetirements(device, generation);
+    }
   }
 
   /**
@@ -339,12 +426,18 @@ export class WebGpuBridgeHost {
   }
 
   publishDevice(adapter, device, capabilityRecord) {
+    // Replacing a live device is different from losing it: its submitted work
+    // and active mappings still own the old allocations until completion.
+    for (const buffer of this.buffers.values()) this.retireResource(buffer);
+    for (const texture of this.textures.values()) this.retireResource(texture);
     this.clearDeviceResources();
     this.adapter = adapter;
     this.device = device;
     this.capabilityRecord = capabilityRecord;
     const generation = ++this.deviceGeneration;
     device.lost.then(() => {
+      this.retiredDevices.add(device);
+      this.finishDeviceRetirements(device, generation);
       // A late loss notification from a retired device must not clear its successor.
       if (this.device !== device || this.deviceGeneration !== generation) return;
       this.clearDeviceResources();
@@ -496,11 +589,20 @@ export class WebGpuBridgeHost {
     const written = new Set();
     const encodedWrites = new Set();
     const publishPrepared = (cache, id, value) => {
+      const previous = cache.get(id);
+      if (previous !== value && (cache === this.buffers || cache === this.textures)) {
+        this.retireResource(previous, device, deviceGeneration);
+      }
       cache.set(id, value);
       preparations.set(value, preparation);
       created.push({ cache, id, value });
     };
     const usePrepared = (value, consumesContent = true) => {
+      if (this.destroyedResources.has(value)) {
+        throw new Error("Resource residency has already been retired");
+      }
+      const retirement = this.retiringResources.get(value);
+      if (retirement) retirement.lastUse++;
       const producer = preparations.get(value);
       if (producer && producer !== preparation) dependencies.add(producer.promise);
       // Earlier encoded writes in this packet already captured any dependency
@@ -533,6 +635,11 @@ export class WebGpuBridgeHost {
           if (cache === this.buffers) this.bufferEpochs.delete(id);
           if (cache === this.textures && this.lastRenderTargetId === id) this.lastRenderTargetId = null;
         }
+        // Even a displaced allocation remains owned by its failed producer.
+        // Detach all failed cache entries before reconsidering their pins.
+        if (failed && (cache === this.buffers || cache === this.textures)) {
+          this.retireResource(value, device, deviceGeneration);
+        }
       }
       created.length = 0;
       for (const value of written) {
@@ -540,6 +647,7 @@ export class WebGpuBridgeHost {
         if (!failed && writes.get(value) === preparation) writes.delete(value);
       }
       written.clear();
+      this.flushRetirements();
     };
 
     // Synchronous execution block inside error scopes
@@ -634,6 +742,27 @@ export class WebGpuBridgeHost {
           }
 
           switch (opcode) {
+            case OPCODE_RELEASE_RESOURCE: {
+              closeActivePass();
+              if (cursor + 8 > dataBlockStart) {
+                throw new Error("Truncated RELEASE_RESOURCE fields at command " + i);
+              }
+              const kind = dataView.getUint32(cursor, true);
+              const id = dataView.getUint32(cursor + 4, true);
+              cursor += 8;
+              const cache = [this.buffers, this.textures, this.pipelines, this.computePipelines, this.bundles][kind];
+              if (!cache) throw new Error("ReleaseResource: invalid resource kind " + kind);
+              const value = cache.get(id);
+              cache.delete(id);
+              if (kind === 0) {
+                this.bufferEpochs.delete(id);
+                encodedEpochs.delete(id);
+              }
+              if (kind === 1 && this.lastRenderTargetId === id) this.lastRenderTargetId = null;
+              if (kind === 0 || kind === 1) this.retireResource(value, device, deviceGeneration);
+              break;
+            }
+
             case OPCODE_CREATE_BUFFER: {
               closeActivePass();
               if (cursor + 12 > dataBlockStart) {
@@ -2917,6 +3046,10 @@ export class WebGpuBridgeHost {
       () => finishPreparation(false),
       (error) => { finishPreparation(true); throw error; },
     );
+    // withErrorScopes already completed its synchronous push/encode/submit/pop
+    // body. A release earlier in the packet can now observe the correct queue
+    // high-water mark, including encoded uses that preceded the release.
+    this.flushRetirements();
     // Keep bookkeeping in queue-effect order even when scope promises settle
     // in another order. Never invoke the observer while device scopes are open.
     try {
@@ -2947,12 +3080,18 @@ export class WebGpuBridgeHost {
     if (!buffer) {
       throw new Error(`readbackBuffer: unknown bufferId ${bufferId}`);
     }
+    if (this.destroyedResources.has(buffer)) {
+      throw new Error("readbackBuffer: resource residency has already been retired");
+    }
 
     // Capture metadata with this buffer: a later packet can reuse its numeric ID
     // while mapAsync is pending, but must not relabel these older GPU bytes.
     const allocation = this.pendingPreparations.get(buffer);
     const content = this.pendingWrites.get(buffer);
     const { epochHi, epochLo, preparation } = this.bufferEpochs.get(bufferId) || { epochHi: 0, epochLo: 0 };
+    this.readbackPins.set(buffer, (this.readbackPins.get(buffer) || 0) + 1);
+    const retirement = this.retiringResources.get(buffer);
+    if (retirement) retirement.lastUse++;
     let copy;
     try {
       // mapAsync can succeed on an older buffer value when an invalid command
@@ -2971,7 +3110,14 @@ export class WebGpuBridgeHost {
       }
       copy = new Uint8Array(buffer.getMappedRange(0, byteLength).slice(0));
     } finally {
-      buffer.unmap();
+      try {
+        buffer.unmap();
+      } finally {
+        const pins = this.readbackPins.get(buffer) - 1;
+        if (pins) this.readbackPins.set(buffer, pins);
+        else this.readbackPins.delete(buffer);
+        this.flushRetirements();
+      }
     }
 
     copy.epochHi = epochHi;

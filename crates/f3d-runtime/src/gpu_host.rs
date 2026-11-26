@@ -401,6 +401,8 @@ pub const OPCODE_COPY_BUFFER_TO_TEXTURE: u16 = 29;
 pub const OPCODE_COPY_TEXTURE_TO_TEXTURE: u16 = 30;
 /// Configure an explicit index-buffer slice and the immediately following indexed draw.
 pub const OPCODE_SET_INDEXED_DRAW_PARAMETERS: u16 = 31;
+/// Release a named residency; the host retains allocations until outstanding uses retire.
+pub const OPCODE_RELEASE_RESOURCE: u16 = 32;
 
 /// Compute binding type: uniform buffer (`GPUBufferBindingType.uniform`).
 pub const BINDING_TYPE_UNIFORM: u32 = 0;
@@ -628,9 +630,41 @@ pub struct GpuBufferBinding {
     pub data_version: DataVersion,
 }
 
+/// Resource namespaces understood by the bridge's residency-release command.
+///
+/// Releasing an ID removes only its current residency. Previously recorded
+/// bundles, submitted work and pending readbacks retain their native objects
+/// until they no longer need them; a later allocation may reuse the numeric ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum GpuResourceKind {
+    /// A GPU buffer allocation.
+    Buffer = 0,
+    /// A GPU texture allocation.
+    Texture = 1,
+    /// A render pipeline and its retained bindings.
+    RenderPipeline = 2,
+    /// A compute pipeline and its layout.
+    ComputePipeline = 3,
+    /// A recorded render bundle and its retained resources.
+    RenderBundle = 4,
+}
+
 /// High-level typed commands serialized into the checked packet.
 #[derive(Clone, Debug, PartialEq)]
 pub enum GpuCommand {
+    /// Remove the current residency from its namespace at this packet position.
+    ///
+    /// Missing IDs are already released. This closes an open render pass, but
+    /// does not wait for GPU completion or cancel prior queue effects. The host
+    /// retires native allocations after submitted uses and retained references
+    /// end, independently of this packet's asynchronous validation receipt.
+    ReleaseResource {
+        /// Resource namespace, encoded as a u32 followed by the resource ID.
+        kind: GpuResourceKind,
+        /// Numeric residency identity; reuse does not resurrect the old object.
+        resource_id: u32,
+    },
     /// Command to allocate a new GPU buffer.
     CreateBuffer {
         /// Unique integer identifier for the buffer.
@@ -1270,6 +1304,11 @@ impl GpuSubmissionPacket {
 
         for (cmd_idx, cmd) in self.commands.iter().enumerate() {
             match cmd {
+                GpuCommand::ReleaseResource { kind, resource_id } => {
+                    command_records.extend_from_slice(&OPCODE_RELEASE_RESOURCE.to_le_bytes());
+                    command_records.extend_from_slice(&(*kind as u32).to_le_bytes());
+                    command_records.extend_from_slice(&resource_id.to_le_bytes());
+                }
                 GpuCommand::CreateBuffer { buffer_id, size, usage } => {
                     command_records.extend_from_slice(&OPCODE_CREATE_BUFFER.to_le_bytes());
                     command_records.extend_from_slice(&buffer_id.to_le_bytes());
@@ -9086,6 +9125,43 @@ mod tests {
         // 5. Freestanding helper also rejects stale epoch
         assert!(!try_publish_readback(&region, Epoch::ZERO));
         assert!(try_publish_readback(&region, next_epoch));
+    }
+
+    #[test]
+    fn resource_release_wire_preserves_namespaces_ids_and_command_order() {
+        let kinds = [
+            GpuResourceKind::Buffer,
+            GpuResourceKind::Texture,
+            GpuResourceKind::RenderPipeline,
+            GpuResourceKind::ComputePipeline,
+            GpuResourceKind::RenderBundle,
+        ];
+        for id in [0, 17, u32::MAX] {
+            let mut packet = GpuSubmissionPacket::new();
+            packet.push(GpuCommand::CreateBuffer {
+                buffer_id: id, size: 16, usage: BUFFER_USAGE_COPY_DST,
+            });
+            for kind in kinds {
+                packet.push(GpuCommand::ReleaseResource { kind, resource_id: id });
+            }
+            // Reallocation is a distinct residency even within the same packet.
+            packet.push(GpuCommand::CreateBuffer {
+                buffer_id: id, size: 32, usage: BUFFER_USAGE_COPY_DST,
+            });
+            let wire = packet.encode_bounded(0).unwrap();
+            assert_eq!(u32::from_le_bytes(wire[8..12].try_into().unwrap()), 7);
+            assert_eq!(u32::from_le_bytes(wire[12..16].try_into().unwrap()), 0);
+            assert_eq!(wire.len(), 16 + 14 + kinds.len() * 10 + 14);
+            for (namespace, _) in kinds.iter().enumerate() {
+                let start = 16 + 14 + namespace * 10;
+                assert_eq!(u16::from_le_bytes(wire[start..start + 2].try_into().unwrap()), 32);
+                assert_eq!(u32::from_le_bytes(wire[start + 2..start + 6].try_into().unwrap()), namespace as u32);
+                assert_eq!(u32::from_le_bytes(wire[start + 6..start + 10].try_into().unwrap()), id);
+            }
+            let replacement = 16 + 14 + kinds.len() * 10;
+            assert_eq!(u16::from_le_bytes(wire[replacement..replacement + 2].try_into().unwrap()), OPCODE_CREATE_BUFFER);
+            assert_eq!(u32::from_le_bytes(wire[replacement + 6..replacement + 10].try_into().unwrap()), 32);
+        }
     }
 
     #[test]
