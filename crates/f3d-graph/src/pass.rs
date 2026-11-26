@@ -808,9 +808,14 @@ pub struct Dispatch {
     pub dispatch_id: u32,
     /// Pipeline ID.
     pub pipeline_id: u32,
-    /// Workgroup dimensions `[x, y, z]`.
+    /// Workgroup dimensions `[x, y, z]`; ignored when `indirect_use_index` is set.
     pub workgroups: [u32; 3],
-    /// Resources bound to this specific dispatch.
+    /// Index into `uses` selecting a whole-buffer `IndirectBuffer` read.
+    /// Its byte offset addresses three GPU-written u32 workgroup counts; its
+    /// explicit byte size must cover at least those twelve bytes.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub indirect_use_index: Option<usize>,
+    /// Resources consumed by this specific dispatch, including indirect arguments.
     pub uses: Vec<ResourceUse>,
     /// Explicit group-0 buffer binding map referencing indices into `uses`.
     pub bindings: Vec<ComputeBufferBinding>,
@@ -828,6 +833,7 @@ impl Dispatch {
             dispatch_id,
             pipeline_id,
             workgroups,
+            indirect_use_index: None,
             uses,
             bindings: Vec::new(),
         }
@@ -845,6 +851,7 @@ impl Dispatch {
             dispatch_id,
             pipeline_id,
             workgroups,
+            indirect_use_index: None,
             uses,
             bindings,
         }
@@ -855,6 +862,43 @@ impl Dispatch {
     pub fn with_bindings(mut self, bindings: Vec<ComputeBufferBinding>) -> Self {
         self.bindings = bindings;
         self
+    }
+
+    /// Read dispatch dimensions from the selected canonical resource declaration.
+    /// This replaces direct `workgroups`; it does not add a shader buffer binding.
+    #[must_use]
+    pub const fn with_indirect_buffer(mut self, use_index: usize) -> Self {
+        self.indirect_use_index = Some(use_index);
+        self
+    }
+
+    /// Resolve the authoritative indirect argument declaration, checking its
+    /// twelve-byte range and the exact integer boundary used by the browser host.
+    pub fn indirect_buffer_use(&self) -> Result<Option<&ResourceUse>, &'static str> {
+        let Some(use_index) = self.indirect_use_index else { return Ok(None) };
+        let usage = self.uses.get(use_index)
+            .ok_or("Indirect use index is outside the dispatch's declarations")?;
+        if usage.kind != ResourceKind::Buffer
+            || usage.access != ResourceAccess::IndirectBuffer
+            || usage.subresource != SubresourceRange::WholeBuffer
+        {
+            return Err("Selected indirect use must be a whole-buffer IndirectBuffer read");
+        }
+        if self.pipeline_id == 0 || usage.resource_id.get() == 0 {
+            return Err("Indirect dispatch pipeline and buffer IDs must be non-zero");
+        }
+        let size = usage.byte_size.ok_or("Indirect-buffer byte size must be explicit")?;
+        if size < 12 {
+            return Err("Indirect-buffer range must contain three u32 workgroup counts");
+        }
+        let offset = usage.byte_offset.unwrap_or(0);
+        if offset % 4 != 0 {
+            return Err("Indirect-buffer byte offset must be a multiple of four");
+        }
+        if offset.checked_add(size).is_none_or(|end| end > (1u64 << 53) - 1) {
+            return Err("Indirect-buffer byte range exceeds JavaScript's exact integer range");
+        }
+        Ok(Some(usage))
     }
 }
 

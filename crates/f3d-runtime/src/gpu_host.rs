@@ -403,6 +403,8 @@ pub const OPCODE_COPY_TEXTURE_TO_TEXTURE: u16 = 30;
 pub const OPCODE_SET_INDEXED_DRAW_PARAMETERS: u16 = 31;
 /// Release a named residency; the host retains allocations until outstanding uses retire.
 pub const OPCODE_RELEASE_RESOURCE: u16 = 32;
+/// Dispatch compute workgroups from three u32 counts stored in a GPU buffer.
+pub const OPCODE_DISPATCH_COMPUTE_INDIRECT: u16 = 33;
 
 /// Compute binding type: uniform buffer (`GPUBufferBindingType.uniform`).
 pub const BINDING_TYPE_UNIFORM: u32 = 0;
@@ -447,6 +449,8 @@ pub const BUFFER_USAGE_VERTEX: u32 = 32;
 pub const BUFFER_USAGE_UNIFORM: u32 = 64;
 /// GPUBufferUsage flag: storage buffer (`GPUBufferUsage.STORAGE`).
 pub const BUFFER_USAGE_STORAGE: u32 = 128;
+/// WebGPU GPUBufferUsage.INDIRECT bit.
+pub const BUFFER_USAGE_INDIRECT: u32 = 256;
 
 /// Default persistent buffer ID for compute AffineRows storage.
 pub const COMPUTE_AFFINE_BUFFER_ID: u32 = 701;
@@ -1210,6 +1214,17 @@ pub enum GpuCommand {
         workgroup_count_y: u32,
         /// Number of workgroups to dispatch in the Z dimension.
         workgroup_count_z: u32,
+        /// Explicit buffer bindings bound to group 0.
+        bindings: Vec<GpuBufferBinding>,
+    },
+    /// Execute compute using GPU-provided workgroup dimensions, without CPU readback.
+    DispatchComputeIndirect {
+        /// Unique integer identifier for the compute pipeline.
+        pipeline_id: u32,
+        /// Buffer allocated with INDIRECT usage, containing three u32 counts.
+        indirect_buffer_id: u32,
+        /// Four-byte-aligned offset of the twelve-byte argument record.
+        indirect_offset: u64,
         /// Explicit buffer bindings bound to group 0.
         bindings: Vec<GpuBufferBinding>,
     },
@@ -2037,13 +2052,8 @@ impl GpuSubmissionPacket {
                         command_records.extend_from_slice(&0u32.to_le_bytes()); // _pad
                     }
                 }
-                GpuCommand::DispatchCompute {
-                    pipeline_id,
-                    workgroup_count_x,
-                    workgroup_count_y,
-                    workgroup_count_z,
-                    bindings,
-                } => {
+                GpuCommand::DispatchCompute { bindings, .. }
+                | GpuCommand::DispatchComputeIndirect { bindings, .. } => {
                     let binding_count = u32::try_from(bindings.len()).map_err(|_| {
                         PacketEncodeError::InvalidDimensions("binding count exceeds u32::MAX".to_string())
                     })?;
@@ -2089,13 +2099,51 @@ impl GpuSubmissionPacket {
                         }
                     }
 
-                    command_records.extend_from_slice(&OPCODE_DISPATCH_COMPUTE.to_le_bytes());
-                    command_records.extend_from_slice(&0u16.to_le_bytes()); // _pad0
-                    command_records.extend_from_slice(&pipeline_id.to_le_bytes());
-                    command_records.extend_from_slice(&workgroup_count_x.to_le_bytes());
-                    command_records.extend_from_slice(&workgroup_count_y.to_le_bytes());
-                    command_records.extend_from_slice(&workgroup_count_z.to_le_bytes());
-                    command_records.extend_from_slice(&binding_count.to_le_bytes());
+                    match cmd {
+                        GpuCommand::DispatchCompute {
+                            pipeline_id, workgroup_count_x, workgroup_count_y, workgroup_count_z, ..
+                        } => {
+                            command_records.extend_from_slice(&OPCODE_DISPATCH_COMPUTE.to_le_bytes());
+                            command_records.extend_from_slice(&0u16.to_le_bytes()); // _pad0
+                            command_records.extend_from_slice(&pipeline_id.to_le_bytes());
+                            command_records.extend_from_slice(&workgroup_count_x.to_le_bytes());
+                            command_records.extend_from_slice(&workgroup_count_y.to_le_bytes());
+                            command_records.extend_from_slice(&workgroup_count_z.to_le_bytes());
+                            command_records.extend_from_slice(&binding_count.to_le_bytes());
+                        }
+                        GpuCommand::DispatchComputeIndirect {
+                            pipeline_id, indirect_buffer_id, indirect_offset, ..
+                        } => {
+                            if *pipeline_id == 0 || *indirect_buffer_id == 0 {
+                                return Err(PacketEncodeError::InvalidDimensions(
+                                    "Indirect dispatch pipeline and buffer IDs must be non-zero".to_string(),
+                                ));
+                            }
+                            if indirect_offset % 4 != 0
+                                || indirect_offset.checked_add(12).is_none_or(|end| end > (1u64 << 53) - 1)
+                            {
+                                return Err(PacketEncodeError::InvalidDimensions(
+                                    "Indirect dispatch offset must be four-byte aligned and its twelve-byte range must fit JavaScript's exact integers".to_string(),
+                                ));
+                            }
+                            if bindings.iter().any(|b| b.buffer_id == *indirect_buffer_id
+                                && b.binding_type == BINDING_TYPE_STORAGE_READ_WRITE)
+                            {
+                                return Err(PacketEncodeError::InvalidDimensions(
+                                    "Indirect argument buffer cannot also be writable in its dispatch".to_string(),
+                                ));
+                            }
+                            // Header: opcode/pad 0..4, pipeline 4..8, buffer 8..12,
+                            // u64 offset 12..20, binding count 20..24.
+                            command_records.extend_from_slice(&OPCODE_DISPATCH_COMPUTE_INDIRECT.to_le_bytes());
+                            command_records.extend_from_slice(&0u16.to_le_bytes());
+                            command_records.extend_from_slice(&pipeline_id.to_le_bytes());
+                            command_records.extend_from_slice(&indirect_buffer_id.to_le_bytes());
+                            command_records.extend_from_slice(&indirect_offset.to_le_bytes());
+                            command_records.extend_from_slice(&binding_count.to_le_bytes());
+                        }
+                        _ => unreachable!("compute command arm only handles dispatches"),
+                    }
 
                     for b in bindings {
                         command_records.extend_from_slice(&b.binding_index.to_le_bytes());
@@ -2223,6 +2271,15 @@ pub enum PlanLoweringError {
         /// Draw whose index-buffer declaration is invalid.
         draw_id: u32,
         /// Exact declaration or range error.
+        reason: String,
+    },
+    /// Indirect dispatch has an invalid selected argument declaration.
+    InvalidIndirectDispatch {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+        /// Dispatch whose argument declaration is invalid.
+        dispatch_id: u32,
+        /// Exact declaration or byte-range error.
         reason: String,
     },
     /// Compute dispatch binding specifies no byte size or a zero byte size.
@@ -2357,6 +2414,9 @@ impl core::fmt::Display for PlanLoweringError {
             }
             Self::InvalidIndexedDraw { segment_name, draw_id, reason } => {
                 write!(f, "Render segment '{segment_name}' indexed draw {draw_id}: {reason}")
+            }
+            Self::InvalidIndirectDispatch { segment_name, dispatch_id, reason } => {
+                write!(f, "Compute segment '{segment_name}' indirect dispatch {dispatch_id}: {reason}")
             }
             Self::UnspecifiedBindingSize {
                 segment_name,
@@ -2982,6 +3042,12 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
             }
             PassKind::Compute => {
                 for dispatch in segment.dispatches() {
+                    let indirect = dispatch.indirect_buffer_use().map_err(|reason|
+                        PlanLoweringError::InvalidIndirectDispatch {
+                            segment_name: segment.name().to_string(),
+                            dispatch_id: dispatch.dispatch_id, reason: reason.to_string(),
+                        }
+                    )?;
                     let mut lowered_bindings = Vec::with_capacity(dispatch.bindings.len());
                     for b in &dispatch.bindings {
                         if b.use_index >= dispatch.uses.len() {
@@ -3055,12 +3121,21 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                         });
                     }
 
-                    commands.push(GpuCommand::DispatchCompute {
-                        pipeline_id: dispatch.pipeline_id,
-                        workgroup_count_x: dispatch.workgroups[0],
-                        workgroup_count_y: dispatch.workgroups[1],
-                        workgroup_count_z: dispatch.workgroups[2],
-                        bindings: lowered_bindings,
+                    commands.push(if let Some(usage) = indirect {
+                        GpuCommand::DispatchComputeIndirect {
+                            pipeline_id: dispatch.pipeline_id,
+                            indirect_buffer_id: usage.resource_id.get(),
+                            indirect_offset: usage.byte_offset.unwrap_or(0),
+                            bindings: lowered_bindings,
+                        }
+                    } else {
+                        GpuCommand::DispatchCompute {
+                            pipeline_id: dispatch.pipeline_id,
+                            workgroup_count_x: dispatch.workgroups[0],
+                            workgroup_count_y: dispatch.workgroups[1],
+                            workgroup_count_z: dispatch.workgroups[2],
+                            bindings: lowered_bindings,
+                        }
                     });
                 }
             }
@@ -16201,6 +16276,108 @@ mod tests {
             .expect("copy builder must succeed");
         let copy_encoded = copy_packet.encode().expect("copy encoding must succeed");
         assert_eq!(copy_encoded.len(), 16 + 14 + 18 + 14 + 42 + 4);
+    }
+
+    #[test]
+    fn indirect_compute_wire_reuses_bindings_and_preserves_direct_header() {
+        let binding = GpuBufferBinding {
+            binding_index: 5, buffer_id: 77, offset: 256, size: 64,
+            binding_type: BINDING_TYPE_STORAGE_READ,
+            epoch: Epoch::new(0x1122334455667788), data_version: DataVersion::new(0x8877665544332211),
+        };
+        let direct = GpuSubmissionPacket::from_commands(alloc::vec![GpuCommand::DispatchCompute {
+            pipeline_id: 300, workgroup_count_x: 7, workgroup_count_y: 2, workgroup_count_z: 0,
+            bindings: alloc::vec![binding],
+        }]).encode().unwrap();
+        let indirect = GpuSubmissionPacket::from_commands(alloc::vec![GpuCommand::DispatchComputeIndirect {
+            pipeline_id: 300, indirect_buffer_id: 55, indirect_offset: 0x1_0000_0004,
+            bindings: alloc::vec![binding],
+        }]).encode().unwrap();
+        assert_eq!(indirect.len(), 16 + 24 + 48);
+        assert_eq!(&direct[..16], &indirect[..16]);
+        assert_eq!(&direct[16..40], &[
+            22, 0, 0, 0, 44, 1, 0, 0, 7, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+        ]);
+        assert_eq!(&indirect[16..40], &[
+            33, 0, 0, 0, 44, 1, 0, 0, 55, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+        ]);
+        assert_eq!(&direct[40..], &indirect[40..]);
+        assert_eq!(&indirect[40..48], &[5, 0, 0, 0, 77, 0, 0, 0]);
+        assert_eq!(&indirect[48..56], &256u64.to_le_bytes());
+        assert_eq!(&indirect[56..64], &64u64.to_le_bytes());
+        assert_eq!(&indirect[64..72], &[1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&indirect[72..80], &binding.epoch.get().to_le_bytes());
+        assert_eq!(&indirect[80..88], &binding.data_version.get().to_le_bytes());
+        assert_eq!(OPCODE_DISPATCH_COMPUTE_INDIRECT, 33);
+        assert_eq!(BUFFER_USAGE_INDIRECT, 256);
+    }
+
+    #[test]
+    fn lower_plan_indirect_dispatch_resolves_canonical_use_and_rechecks_invalid_plans() {
+        let dispatch = Dispatch::new_with_bindings(7, 300, [7, 2, 1], alloc::vec![
+            ResourceUse::buffer_uniform(ResourceId::new(77), DataVersion::new(9), Some(16), Some(64)),
+            ResourceUse::buffer_indirect(ResourceId::new(55), DataVersion::new(10), Some(0x1_0000_0004), Some(13)),
+        ], alloc::vec![ComputeBufferBinding::new(5, 0)]).with_indirect_buffer(1);
+        let mut graph = PassGraph::new();
+        graph.add_pass(Pass::new_compute(PassId::new(1), "indirect").with_dispatch(dispatch)).unwrap();
+        let plan = graph.compile(None).unwrap();
+        let bindings = alloc::vec![GpuBufferBinding {
+            binding_index: 5, buffer_id: 77, offset: 16, size: 64,
+            binding_type: BINDING_TYPE_UNIFORM, epoch: Epoch::ZERO, data_version: DataVersion::new(9),
+        }];
+        assert_eq!(lower_plan(&plan).unwrap(), alloc::vec![GpuCommand::DispatchComputeIndirect {
+            pipeline_id: 300, indirect_buffer_id: 55, indirect_offset: 0x1_0000_0004,
+            bindings: bindings.clone(),
+        }]);
+        let mut direct = plan.clone();
+        direct.segments[0].dispatches[0].indirect_use_index = None;
+        assert_eq!(lower_plan(&direct).unwrap(), alloc::vec![GpuCommand::DispatchCompute {
+            pipeline_id: 300, workgroup_count_x: 7, workgroup_count_y: 2, workgroup_count_z: 1,
+            bindings,
+        }]);
+        for case in 0..5 {
+            let mut invalid = plan.clone();
+            let dispatch = &mut invalid.segments[0].dispatches[0];
+            match case {
+                0 => dispatch.indirect_use_index = Some(2),
+                1 => dispatch.indirect_use_index = Some(0),
+                2 => dispatch.uses[1].byte_size = None,
+                3 => dispatch.uses[1].byte_offset = Some(2),
+                _ => dispatch.uses[1].byte_offset = Some(u64::MAX - 3),
+            }
+            assert!(matches!(lower_plan(&invalid), Err(PlanLoweringError::InvalidIndirectDispatch {
+                dispatch_id: 7, ..
+            })));
+        }
+    }
+
+    #[test]
+    fn indirect_compute_packets_reject_invalid_ranges_and_writable_aliases() {
+        let encode = |pipeline_id, indirect_buffer_id, indirect_offset, bindings| {
+            GpuSubmissionPacket::from_commands(alloc::vec![GpuCommand::DispatchComputeIndirect {
+                pipeline_id, indirect_buffer_id, indirect_offset, bindings,
+            }]).encode()
+        };
+        for (pipeline, buffer, offset) in [
+            (0, 55, 0), (300, 0, 0), (300, 55, 2),
+            (300, 55, u64::MAX - 3), (300, 55, (1u64 << 53) - 12),
+        ] {
+            assert!(matches!(encode(pipeline, buffer, offset, Vec::new()), Err(PacketEncodeError::InvalidDimensions(_))));
+        }
+        assert_eq!(encode(300, 55, (1u64 << 53) - 16, Vec::new()).unwrap().len(), 40);
+        let binding = GpuBufferBinding {
+            binding_index: 0, buffer_id: 55, offset: 256, size: 4,
+            binding_type: BINDING_TYPE_STORAGE_READ_WRITE,
+            epoch: Epoch::ZERO, data_version: DataVersion::INITIAL,
+        };
+        assert!(matches!(encode(300, 55, 0, alloc::vec![binding]), Err(PacketEncodeError::InvalidDimensions(_))));
+        for binding_type in [BINDING_TYPE_UNIFORM, BINDING_TYPE_STORAGE_READ] {
+            encode(300, 55, 0, alloc::vec![GpuBufferBinding { binding_type, ..binding }]).unwrap();
+        }
+        encode(300, 55, 0, alloc::vec![GpuBufferBinding { buffer_id: 77, ..binding }]).unwrap();
+        let readonly = GpuBufferBinding { binding_type: BINDING_TYPE_STORAGE_READ, ..binding };
+        assert!(encode(300, 55, 0, alloc::vec![readonly, readonly]).is_err(), "Shared binding validation rejects duplicates");
+        assert!(encode(300, 55, 0, alloc::vec![GpuBufferBinding { size: 0, ..readonly }]).is_err());
     }
 
     #[test]

@@ -44,6 +44,7 @@ export const OPCODE_COPY_BUFFER_TO_TEXTURE = 29;
 export const OPCODE_COPY_TEXTURE_TO_TEXTURE = 30;
 export const OPCODE_SET_INDEXED_DRAW_PARAMETERS = 31;
 export const OPCODE_RELEASE_RESOURCE = 32;
+export const OPCODE_DISPATCH_COMPUTE_INDIRECT = 33;
 
 export const BINDING_TYPE_UNIFORM = 0;
 export const BINDING_TYPE_STORAGE_READ = 1;
@@ -2474,7 +2475,7 @@ export class WebGpuBridgeHost {
                     } else {
                       break;
                     }
-                  } else if (nextOp === OPCODE_DISPATCH_COMPUTE) {
+                  } else if (nextOp === OPCODE_DISPATCH_COMPUTE || nextOp === OPCODE_DISPATCH_COMPUTE_INDIRECT) {
                     if (scanCursor + 22 <= dataBlockStart) {
                       const bindingCount = dataView.getUint32(scanCursor + 18, true);
                       scanCursor += 22 + bindingCount * 48;
@@ -2796,23 +2797,31 @@ export class WebGpuBridgeHost {
               break;
             }
 
-            case OPCODE_DISPATCH_COMPUTE: {
+            case OPCODE_DISPATCH_COMPUTE:
+            case OPCODE_DISPATCH_COMPUTE_INDIRECT: {
               closeActivePass();
+              const indirect = opcode === OPCODE_DISPATCH_COMPUTE_INDIRECT;
+              const commandName = indirect ? "DISPATCH_COMPUTE_INDIRECT" : "DISPATCH_COMPUTE";
               if (cursor + 22 > dataBlockStart) {
-                throw new RangeError(`Truncated DISPATCH_COMPUTE header at command ${i}`);
+                throw new RangeError(`Truncated ${commandName} header at command ${i}`);
               }
               const _pad0 = dataView.getUint16(cursor, true);
               const pipelineId = dataView.getUint32(cursor + 2, true);
-              const workgroupCountX = dataView.getUint32(cursor + 6, true);
-              const workgroupCountY = dataView.getUint32(cursor + 10, true);
-              const workgroupCountZ = dataView.getUint32(cursor + 14, true);
+              const workgroupCountX = indirect ? null : dataView.getUint32(cursor + 6, true);
+              const workgroupCountY = indirect ? null : dataView.getUint32(cursor + 10, true);
+              const workgroupCountZ = indirect ? null : dataView.getUint32(cursor + 14, true);
+              const indirectBufferId = indirect ? dataView.getUint32(cursor + 6, true) : null;
+              const indirectOffsetBig = indirect ? dataView.getBigUint64(cursor + 10, true) : 0n;
               const bindingCount = dataView.getUint32(cursor + 18, true);
               cursor += 22;
 
               if (cursor + bindingCount * 48 > dataBlockStart) {
                 throw new RangeError(
-                  `Truncated DISPATCH_COMPUTE binding records at command ${i} (needs ${bindingCount * 48} bytes)`,
+                  `Truncated ${commandName} binding records at command ${i} (needs ${bindingCount * 48} bytes)`,
                 );
+              }
+              if (indirect && (pipelineId === 0 || indirectBufferId === 0)) {
+                throw new RangeError("DispatchComputeIndirect: pipeline and indirect buffer IDs must be nonzero");
               }
 
               const pipelineRecord = usePrepared(this.computePipelines.get(pipelineId));
@@ -2821,6 +2830,7 @@ export class WebGpuBridgeHost {
               }
 
               if (
+                !indirect &&
                 this.device.limits &&
                 this.device.limits.maxComputeWorkgroupsPerDimension !== undefined
               ) {
@@ -2837,6 +2847,30 @@ export class WebGpuBridgeHost {
               }
 
               const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+              let indirectBuffer = null;
+              let indirectOffset = 0;
+              if (indirect) {
+                // Argument bytes stay on the GPU. Their contents are validated
+                // by WebGPU at execution; only the buffer slice is decoded here.
+                if (indirectOffsetBig + 12n > MAX_SAFE_INTEGER_BIGINT) {
+                  throw new RangeError("DispatchComputeIndirect: argument range exceeds Number.MAX_SAFE_INTEGER");
+                }
+                indirectOffset = Number(indirectOffsetBig);
+                if (indirectOffset % 4 !== 0) {
+                  throw new RangeError("DispatchComputeIndirect: argument offset must be aligned to 4 bytes");
+                }
+                indirectBuffer = usePrepared(this.buffers.get(indirectBufferId));
+                if (!indirectBuffer) {
+                  throw new Error(`DispatchComputeIndirect: unknown indirect bufferId ${indirectBufferId}`);
+                }
+                if (!(indirectBuffer.usage & 0x0100) ||
+                    (indirectBuffer.mapState !== undefined && indirectBuffer.mapState !== "unmapped")) {
+                  throw new Error("DispatchComputeIndirect: argument buffer requires INDIRECT usage and an unmapped state");
+                }
+                if (indirectOffset + 12 > indirectBuffer.size) {
+                  throw new RangeError("DispatchComputeIndirect: argument range exceeds the buffer bounds");
+                }
+              }
               const parsedBindings = [];
               const seenBindingIndices = new Set();
 
@@ -3004,6 +3038,11 @@ export class WebGpuBridgeHost {
               for (let b = 0; b < parsedBindings.length; b++) {
                 const pb = parsedBindings[b];
                 if (pb.bindingType === BINDING_TYPE_STORAGE_READ_WRITE) {
+                  // A dispatch usage scope covers the whole native buffer,
+                  // including aliases whose bound byte ranges do not overlap.
+                  if (indirect && pb.buffer === indirectBuffer) {
+                    throw new Error("DispatchComputeIndirect: argument buffer cannot also be bound as writable storage");
+                  }
                   encodedEpochs.set(pb.bufferId, { epochHi: pb.epochHi, epochLo: pb.epochLo, preparation });
                   encodedWrites.add(pb.buffer);
                 }
@@ -3026,7 +3065,11 @@ export class WebGpuBridgeHost {
               const pass = encoder().beginComputePass();
               pass.setPipeline(pipelineRecord.pipeline);
               pass.setBindGroup(0, bindGroup);
-              pass.dispatchWorkgroups(workgroupCountX, workgroupCountY, workgroupCountZ);
+              if (indirect) {
+                pass.dispatchWorkgroupsIndirect(indirectBuffer, indirectOffset);
+              } else {
+                pass.dispatchWorkgroups(workgroupCountX, workgroupCountY, workgroupCountZ);
+              }
               pass.end();
               break;
             }

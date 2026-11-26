@@ -221,6 +221,10 @@ fn validate_compute_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
     // Per-dispatch usage-scope hazard check (§8.5, [S51], WebGPU storage exception)
     for dispatch in &pass.dispatches {
         let uses = &dispatch.uses;
+        dispatch.indirect_buffer_use().map_err(|reason| HazardError::InvalidIndirectBuffer {
+            dispatch_id: dispatch.dispatch_id,
+            reason: reason.into(),
+        })?;
 
         // 1. Validate explicit group-0 bindings if present (§6.1, root 21419 / 21498)
         for (b_idx, b) in dispatch.bindings.iter().enumerate() {

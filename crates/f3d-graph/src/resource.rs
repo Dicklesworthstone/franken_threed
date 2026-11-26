@@ -190,6 +190,8 @@ pub enum ResourceAccess {
     VertexBuffer,
     /// Index buffer input.
     IndexBuffer,
+    /// GPU-provided draw or dispatch arguments.
+    IndirectBuffer,
     /// Sampled texture view (`texture_2d<f32>`, etc.).
     SampledTexture,
     /// Color attachment render target.
@@ -391,6 +393,25 @@ impl ResourceUse {
             version,
             subresource: SubresourceRange::WholeBuffer,
             access: ResourceAccess::IndexBuffer,
+            byte_offset,
+            byte_size,
+            canvas_epoch: None,
+        }
+    }
+
+    /// Create an indirect argument read. Byte ranges do not subdivide its hazard scope.
+    pub fn buffer_indirect(
+        resource_id: ResourceId,
+        version: DataVersion,
+        byte_offset: Option<u64>,
+        byte_size: Option<u64>,
+    ) -> Self {
+        Self {
+            resource_id,
+            kind: ResourceKind::Buffer,
+            version,
+            subresource: SubresourceRange::WholeBuffer,
+            access: ResourceAccess::IndirectBuffer,
             byte_offset,
             byte_size,
             canvas_epoch: None,

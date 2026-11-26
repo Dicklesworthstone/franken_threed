@@ -202,6 +202,13 @@ pub enum HazardError {
         /// Execution category of the invalid pass.
         pass_kind: PassKind,
     },
+    /// Indirect compute arguments have a missing, incompatible, or invalid declaration.
+    InvalidIndirectBuffer {
+        /// Dispatch whose selected argument declaration is invalid.
+        dispatch_id: u32,
+        /// Exact declaration or byte-range error.
+        reason: String,
+    },
     /// Compute dispatch binding references an invalid use_index out of bounds of `dispatch.uses`.
     InvalidUseIndex {
         /// Dispatch index where the error occurred.
@@ -352,6 +359,9 @@ impl fmt::Display for HazardError {
                     f,
                     "render bundle cannot be executed inside {pass_kind:?} pass {pass_id}; bundles execute strictly within Render passes"
                 )
+            }
+            Self::InvalidIndirectBuffer { dispatch_id, reason } => {
+                write!(f, "compute dispatch {dispatch_id} has invalid indirect arguments: {reason}")
             }
             Self::InvalidUseIndex {
                 dispatch_id,

@@ -39,6 +39,110 @@ fn single_use_compute_pass(id: u32, usage: ResourceUse) -> Pass {
 }
 
 #[test]
+fn indirect_dispatch_preserves_whole_buffer_hazards_and_writer_dependencies() {
+    let version = DataVersion::new(9);
+    let indirect = ResourceUse::buffer_indirect(ResourceId::new(55), version, Some(512), Some(13));
+    assert!(indirect.access.is_read());
+    assert_eq!(indirect.subresource, SubresourceRange::WholeBuffer);
+    let dispatch = Dispatch::new_with_bindings(7, 300, [1, 1, 1], vec![
+        ResourceUse::buffer_uniform(ResourceId::new(77), version, Some(0), Some(4)),
+        indirect.clone(),
+    ], vec![ComputeBufferBinding::new(0, 0)]).with_indirect_buffer(1);
+    let pass = Pass::new_compute(PassId::new(1), "indirect").with_dispatch(dispatch);
+
+    for offset in [0, 512] {
+        let mut conflict = pass.clone();
+        conflict.dispatches[0].uses.push(ResourceUse::buffer_storage_write(
+            ResourceId::new(55), version, Some(offset), Some(4),
+        ));
+        conflict.dispatches[0].bindings.push(ComputeBufferBinding::new(1, 2));
+        let error = validate_pass_hazards(&conflict).unwrap_err();
+        if offset == 0 {
+            assert!(matches!(error, HazardError::WholeBufferConflict {
+                buffer_id: 55, access_a: ResourceAccess::IndirectBuffer,
+                access_b: ResourceAccess::StorageBufferWrite, ..
+            }));
+        } else {
+            assert!(matches!(error, HazardError::ComputeWritableAlias { resource_id: 55, .. }));
+        }
+    }
+    for read in [
+        ResourceUse::buffer_uniform(ResourceId::new(55), version, Some(0), Some(4)),
+        ResourceUse::buffer_storage_read(ResourceId::new(55), version, Some(512), Some(12)),
+    ] {
+        let mut readonly = pass.clone();
+        readonly.dispatches[0].uses.push(read);
+        readonly.dispatches[0].bindings.push(ComputeBufferBinding::new(1, 2));
+        validate_pass_hazards(&readonly).unwrap();
+    }
+
+    for writer in [
+        Pass::new_copy(PassId::new(30), "copy_arguments").with_copy(CopyCommand::BufferToBuffer {
+            src: ResourceId::new(66), src_offset: 0,
+            dst: ResourceId::new(55), dst_offset: 0, size: 4,
+        }),
+        single_use_compute_pass(30, ResourceUse::buffer_storage_write(
+            ResourceId::new(55), DataVersion::new(8), Some(0), Some(4),
+        )),
+    ] {
+        // A blocked writer must precede the reader despite disjoint offsets and
+        // distinct versions; source-order tie breaking alone cannot ensure this.
+        let mut graph = PassGraph::new();
+        graph.add_pass(writer.with_dependency(PassId::new(50))).unwrap();
+        graph.add_pass(pass.clone()).unwrap();
+        graph.add_pass(Pass::new_copy(PassId::new(50), "prerequisite")).unwrap();
+        let plan = graph.compile(None).unwrap();
+        assert_eq!(plan.segments.iter().map(|s| s.pass_id.get()).collect::<Vec<_>>(), vec![50, 30, 1]);
+        assert!(plan.segments[2].versioned_reads.contains(&(ResourceId::new(55), version)));
+        assert_eq!(plan.segments[2].dispatches[0].indirect_use_index, Some(1));
+        assert_eq!(plan.segments[2].dispatches[0].uses[1], indirect);
+    }
+}
+
+#[test]
+fn graph_rejects_invalid_indirect_declarations_before_certifying_a_plan() {
+    let usage = ResourceUse::buffer_indirect(ResourceId::new(55), DataVersion::INITIAL, Some(4), Some(12));
+    let direct = Dispatch::new(7, 300, [2, 3, 4], vec![usage.clone()]);
+    assert_eq!(direct.indirect_use_index, None);
+    assert_eq!(direct.indirect_buffer_use(), Ok(None));
+    let dispatch = direct.with_indirect_buffer(0);
+    let reject = |dispatch: Dispatch| {
+        let mut graph = PassGraph::new();
+        graph.add_pass(Pass::new_compute(PassId::new(1), "bad_indirect").with_dispatch(dispatch)).unwrap();
+        assert!(matches!(graph.compile(None), Err(GraphError::Hazard(
+            HazardError::InvalidIndirectBuffer { dispatch_id: 7, .. }
+        ))));
+    };
+    reject(dispatch.clone().with_indirect_buffer(1));
+    let mut no_pipeline = dispatch.clone();
+    no_pipeline.pipeline_id = 0;
+    reject(no_pipeline);
+    for invalid in [
+        ResourceUse { resource_id: ResourceId::new(0), ..usage.clone() },
+        ResourceUse { kind: ResourceKind::Texture, ..usage.clone() },
+        ResourceUse { access: ResourceAccess::StorageBufferRead, ..usage.clone() },
+        ResourceUse { subresource: SubresourceRange::full_texture(), ..usage.clone() },
+        ResourceUse { byte_size: None, ..usage.clone() },
+        ResourceUse { byte_size: Some(0), ..usage.clone() },
+        ResourceUse { byte_size: Some(11), ..usage.clone() },
+        ResourceUse { byte_offset: Some(2), ..usage.clone() },
+        ResourceUse { byte_offset: Some(u64::MAX - 3), ..usage.clone() },
+        ResourceUse { byte_offset: Some((1u64 << 53) - 4), ..usage.clone() },
+        ResourceUse { byte_size: Some(u64::MAX), ..usage.clone() },
+    ] {
+        let mut bad = dispatch.clone();
+        bad.uses[0] = invalid;
+        reject(bad);
+    }
+    for (offset, size) in [(None, 13), (Some((1u64 << 53) - 16), 15)] {
+        let mut valid = dispatch.clone();
+        valid.uses[0].byte_offset = offset;
+        valid.uses[0].byte_size = Some(size);
+        validate_pass_hazards(&Pass::new_compute(PassId::new(1), "valid_indirect").with_dispatch(valid)).unwrap();
+    }
+}
+
+#[test]
 fn indexed_draw_preserves_whole_buffer_hazards_and_copy_dependencies() {
     let version = DataVersion::new(9);
     let index_use = ResourceUse::buffer_index(ResourceId::new(55), version, Some(512), Some(7));
