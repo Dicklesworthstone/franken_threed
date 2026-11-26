@@ -39,6 +39,7 @@ export const OPCODE_CREATE_PIPELINE_MULTISAMPLED = 24;
 export const OPCODE_RENDER_PASS_RESOLVE = 25;
 export const OPCODE_CREATE_PIPELINE_DEPTH_MULTISAMPLED = 26;
 export const OPCODE_RENDER_PASS_DEPTH_RESOLVE = 27;
+export const OPCODE_COPY_TEXTURE_TO_BUFFER_LAYOUT = 28;
 
 export const BINDING_TYPE_UNIFORM = 0;
 export const BINDING_TYPE_STORAGE_READ = 1;
@@ -1718,9 +1719,12 @@ export class WebGpuBridgeHost {
               break;
             }
 
-            case OPCODE_COPY_TEXTURE_TO_BUFFER: {
+            case OPCODE_COPY_TEXTURE_TO_BUFFER:
+            case OPCODE_COPY_TEXTURE_TO_BUFFER_LAYOUT: {
               closeActivePass();
-              if (cursor + 24 > dataBlockStart) {
+              const explicitLayout = opcode === OPCODE_COPY_TEXTURE_TO_BUFFER_LAYOUT;
+              const fieldBytes = explicitLayout ? 28 : 24;
+              if (cursor + fieldBytes > dataBlockStart) {
                 throw new Error(`Truncated COPY_TEXTURE_TO_BUFFER fields at command ${i}`);
               }
               const textureId = dataView.getUint32(cursor, true);
@@ -1729,9 +1733,9 @@ export class WebGpuBridgeHost {
               const height = dataView.getUint32(cursor + 12, true);
               const epochHi = dataView.getUint32(cursor + 16, true);
               const epochLo = dataView.getUint32(cursor + 20, true);
-              cursor += 24;
-
-              encodedEpochs.set(bufferId, { epochHi, epochLo, preparation });
+              const bytesPerRow = explicitLayout ? dataView.getUint32(cursor + 24, true)
+                : Math.ceil(width * 4 / 256) * 256;
+              cursor += fieldBytes;
 
               const texture = usePrepared(this.textures.get(textureId));
               const buffer = usePrepared(this.buffers.get(bufferId));
@@ -1739,14 +1743,34 @@ export class WebGpuBridgeHost {
                 throw new Error("CopyTextureToBuffer: invalid texture or buffer id");
               }
 
-              const unalignedBytesPerRow = width * 4;
-              const bytesPerRow = Math.ceil(unalignedBytesPerRow / 256) * 256;
+              if (explicitLayout) {
+                const rowBytes = width * 4;
+                // No padding is required after the last copied row.
+                const requiredBytes = height > 0 ? (height - 1) * bytesPerRow + rowBytes : 0;
+                if (bytesPerRow % 256 !== 0 || bytesPerRow < rowBytes ||
+                    !Number.isSafeInteger(requiredBytes) || requiredBytes > buffer.size) {
+                  throw new Error("CopyTextureToBuffer: invalid row layout or destination buffer bounds");
+                }
+                if (texture.dimension !== "2d" || texture.sampleCount !== 1 ||
+                    width > texture.width || height > texture.height ||
+                    !["rgba8unorm", "rgba8unorm-srgb", "bgra8unorm", "bgra8unorm-srgb", "depth32float"].includes(texture.format) ||
+                    (texture.format === "depth32float" && (width !== texture.width || height !== texture.height))) {
+                  throw new Error("CopyTextureToBuffer: unsupported texture format, sample count, dimension or extent");
+                }
+                if (!(texture.usage & TEXTURE_USAGE_COPY_SRC) || !(buffer.usage & 8) ||
+                    (buffer.mapState !== undefined && buffer.mapState !== "unmapped")) {
+                  throw new Error("CopyTextureToBuffer: source/destination copy usage or buffer map state is invalid");
+                }
+              }
 
               encoder().copyTextureToBuffer(
                 { texture: texture },
                 { buffer: buffer, bytesPerRow: bytesPerRow, rowsPerImage: height },
                 [width, height, 1],
               );
+              if (width > 0 && height > 0) {
+                encodedEpochs.set(bufferId, { epochHi, epochLo, preparation });
+              }
               break;
             }
 
@@ -2091,6 +2115,8 @@ export class WebGpuBridgeHost {
                     scanCursor += 44;
                   } else if (nextOp === OPCODE_COPY_TEXTURE_TO_BUFFER) {
                     scanCursor += 24;
+                  } else if (nextOp === OPCODE_COPY_TEXTURE_TO_BUFFER_LAYOUT) {
+                    scanCursor += 28;
                   } else if (nextOp === OPCODE_RECORD_BUNDLE) {
                     scanCursor += 28;
                   } else if (nextOp === OPCODE_RECORD_BUNDLE_BATCH) {

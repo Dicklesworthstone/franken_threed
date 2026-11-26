@@ -393,6 +393,8 @@ pub const OPCODE_RENDER_PASS_RESOLVE: u16 = 25;
 pub const OPCODE_CREATE_PIPELINE_DEPTH_MULTISAMPLED: u16 = 26;
 /// Render with depth and an offscreen color resolve destination.
 pub const OPCODE_RENDER_PASS_DEPTH_RESOLVE: u16 = 27;
+/// Read texture pixels with an explicit encoder row pitch (legacy payload + u32).
+pub const OPCODE_COPY_TEXTURE_TO_BUFFER_LAYOUT: u16 = 28;
 
 /// Compute binding type: uniform buffer (`GPUBufferBindingType.uniform`).
 pub const BINDING_TYPE_UNIFORM: u32 = 0;
@@ -765,6 +767,21 @@ pub enum GpuCommand {
         width: u32,
         /// Height in pixels to copy.
         height: u32,
+        /// Semantic epoch of the source texture state region.
+        epoch: Epoch,
+    },
+    /// Read texture pixels without replacing the graph's declared row layout.
+    CopyTextureToBufferLayout {
+        /// Source texture identifier.
+        texture_id: u32,
+        /// Destination staging buffer identifier.
+        buffer_id: u32,
+        /// Width in pixels to copy.
+        width: u32,
+        /// Height in pixels to copy.
+        height: u32,
+        /// Explicit encoder row pitch, aligned to 256 bytes.
+        bytes_per_row: u32,
         /// Semantic epoch of the source texture state region.
         epoch: Epoch,
     },
@@ -1339,8 +1356,21 @@ impl GpuSubmissionPacket {
                         command_records.extend_from_slice(&id.to_le_bytes());
                     }
                 }
-                GpuCommand::CopyTextureToBuffer { texture_id, buffer_id, width, height, epoch } => {
-                    command_records.extend_from_slice(&OPCODE_COPY_TEXTURE_TO_BUFFER.to_le_bytes());
+                GpuCommand::CopyTextureToBuffer { texture_id, buffer_id, width, height, epoch }
+                | GpuCommand::CopyTextureToBufferLayout { texture_id, buffer_id, width, height, epoch, .. } => {
+                    let layout = if let GpuCommand::CopyTextureToBufferLayout { bytes_per_row, .. } = cmd {
+                        validate_texture_buffer_layout(*width, *height, *bytes_per_row)
+                            .map_err(PacketEncodeError::InvalidDimensions)?;
+                        Some(*bytes_per_row)
+                    } else {
+                        None
+                    };
+                    let opcode = if layout.is_some() {
+                        OPCODE_COPY_TEXTURE_TO_BUFFER_LAYOUT
+                    } else {
+                        OPCODE_COPY_TEXTURE_TO_BUFFER
+                    };
+                    command_records.extend_from_slice(&opcode.to_le_bytes());
                     command_records.extend_from_slice(&texture_id.to_le_bytes());
                     command_records.extend_from_slice(&buffer_id.to_le_bytes());
                     command_records.extend_from_slice(&width.to_le_bytes());
@@ -1348,6 +1378,9 @@ impl GpuSubmissionPacket {
                     let (epoch_hi, epoch_lo) = epoch.to_words();
                     command_records.extend_from_slice(&epoch_hi.to_le_bytes());
                     command_records.extend_from_slice(&epoch_lo.to_le_bytes());
+                    if let Some(bytes_per_row) = layout {
+                        command_records.extend_from_slice(&bytes_per_row.to_le_bytes());
+                    }
                 }
                 GpuCommand::RecordBundle {
                     bundle_id,
@@ -2220,6 +2253,17 @@ impl core::fmt::Display for PlanLoweringError {
 
 impl core::error::Error for PlanLoweringError {}
 
+// The bridge's buffer-copy formats contain one four-byte texel per block.
+// Encoder row pitch is independent of queue.writeTexture's layout rules.
+fn validate_texture_buffer_layout(width: u32, height: u32, bytes_per_row: u32) -> Result<(), String> {
+    let row_bytes = width.checked_mul(4)
+        .ok_or_else(|| "Texture copy row byte length overflow".to_string())?;
+    if bytes_per_row % 256 != 0 || bytes_per_row < row_bytes {
+        return Err(format!("Invalid texture copy layout: {width}x{height}, bytes_per_row={bytes_per_row}"));
+    }
+    Ok(())
+}
+
 /// Lowers a compiled `f3d_graph::ExecutionPlan` into a sequence of executable `GpuCommand` items.
 ///
 /// Consumes typed accessors on `ExecutionPlan`, `PlanSegment`, `ColorAttachment`, `Draw`, and `CopyCommand`.
@@ -2230,8 +2274,8 @@ impl core::error::Error for PlanLoweringError {}
 ///   The opening command of each render pass segment receives `PASS_FLAG_NEW_PASS` to enforce pass boundaries.
 ///   Each draw is lowered with its bound pipeline, vertex buffer ID (or 0), vertex count, 256-byte aligned
 ///   dynamic uniform offset, and uniform buffer ID (from declared uniform resource use, defaulting to 1).
-/// - **Copy Segments**: `CopyCommand::TextureToBuffer` commands are lowered into `GpuCommand::CopyTextureToBuffer`
-///   with source texture ID, destination readback buffer ID, width, and height.
+/// - **Copy Segments**: Texture readbacks preserve the graph's row pitch, selecting the
+///   explicit-layout opcode when the historical minimum-pitch encoding is insufficient.
 /// - **Compute Segments**: Lowers compute dispatches into `GpuCommand::DispatchCompute` (opcode 22)
 ///   using explicit group-0 buffer binding maps (`ComputeBufferBinding`), mapping resource IDs to
 ///   buffer IDs via the shared `.get()` convention, preserving per-use data versions and epochs.
@@ -2568,14 +2612,23 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                             buffer_id,
                             width,
                             height,
-                            ..
+                            bytes_per_row,
                         } => {
-                            commands.push(GpuCommand::CopyTextureToBuffer {
-                                texture_id: texture_id.get(),
-                                buffer_id: buffer_id.get(),
-                                width: *width,
-                                height: *height,
-                                epoch: plan.canvas_epoch().unwrap_or(Epoch::ZERO),
+                            validate_texture_buffer_layout(*width, *height, *bytes_per_row)
+                                .map_err(|reason| PlanLoweringError::InvalidCopyCommand { reason })?;
+                            let minimum_pitch = (u64::from(*width) * 4).div_ceil(256) * 256;
+                            let epoch = plan.canvas_epoch().unwrap_or(Epoch::ZERO);
+                            commands.push(if u64::from(*bytes_per_row) == minimum_pitch {
+                                // Retain the original ABI when it already represents this layout.
+                                GpuCommand::CopyTextureToBuffer {
+                                    texture_id: texture_id.get(), buffer_id: buffer_id.get(),
+                                    width: *width, height: *height, epoch,
+                                }
+                            } else {
+                                GpuCommand::CopyTextureToBufferLayout {
+                                    texture_id: texture_id.get(), buffer_id: buffer_id.get(),
+                                    width: *width, height: *height, bytes_per_row: *bytes_per_row, epoch,
+                                }
                             });
                         }
                         CopyCommand::BufferToBuffer {
@@ -8261,6 +8314,83 @@ mod tests {
     /// Test-only mutex serializing tests that mutate, reset, advance, or assert `GLOBAL_BORROW_SCOPE` or `GLOBAL_BORROWED_FRAME_PACKET`.
     /// Tolerates lock poisoning across test failures.
     static TEST_BORROW_SCOPE_LOCK: Mutex<()> = Mutex::new(());
+
+
+    #[test]
+    fn texture_readback_lowering_preserves_declared_row_pitch() {
+        use f3d_graph::{CopyCommand, Pass, PassId, PlanSegment, ResourceId};
+        let epoch = Epoch::new(0x1234_5678_9abc_def0);
+        for bytes_per_row in [256, 512, 1024] {
+            let pass = Pass::new_copy(PassId::new(1), "readback_layout").with_copy(
+                CopyCommand::TextureToBuffer {
+                    texture_id: ResourceId::new(10), buffer_id: ResourceId::new(20),
+                    width: 16, height: 2, bytes_per_row,
+                },
+            );
+            let plan = ExecutionPlan {
+                segments: vec![PlanSegment::from_pass(&pass)], canvas_epoch: Some(epoch),
+                pass_count: 1, split_count: 0, split_reasons: Vec::new(),
+            };
+            let commands = lower_plan(&plan).unwrap();
+            let expected = if bytes_per_row == 256 {
+                GpuCommand::CopyTextureToBuffer {
+                    texture_id: 10, buffer_id: 20, width: 16, height: 2, epoch,
+                }
+            } else {
+                GpuCommand::CopyTextureToBufferLayout {
+                    texture_id: 10, buffer_id: 20, width: 16, height: 2, bytes_per_row, epoch,
+                }
+            };
+            assert_eq!(commands, vec![expected]);
+            let bytes = GpuSubmissionPacket::from_commands(commands).encode().unwrap();
+            let word = |at| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            assert_eq!(word(18), 10);
+            assert_eq!(word(22), 20);
+            assert_eq!(word(26), 16);
+            assert_eq!(word(30), 2);
+            assert_eq!(word(34), 0x1234_5678);
+            assert_eq!(word(38), 0x9abc_def0);
+            let opcode = u16::from_le_bytes(bytes[16..18].try_into().unwrap());
+            if bytes_per_row == 256 {
+                assert_eq!(opcode, OPCODE_COPY_TEXTURE_TO_BUFFER);
+                assert_eq!(bytes.len(), 42);
+            } else {
+                assert_eq!(opcode, OPCODE_COPY_TEXTURE_TO_BUFFER_LAYOUT);
+                assert_eq!(word(42), bytes_per_row);
+                assert_eq!(bytes.len(), 46);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_texture_readback_layout_rejects_invalid_stride() {
+        use f3d_graph::{CopyCommand, Pass, PassId, PlanSegment, ResourceId};
+        for (width, height, bytes_per_row) in [
+            (16, 2, 0), (16, 2, 64), (65, 2, 256), (16, 2, 257), (u32::MAX, 2, 256),
+        ] {
+            let pass = Pass::new_copy(PassId::new(1), "invalid_readback").with_copy(
+                CopyCommand::TextureToBuffer {
+                    texture_id: ResourceId::new(10), buffer_id: ResourceId::new(20),
+                    width, height, bytes_per_row,
+                },
+            );
+            let plan = ExecutionPlan {
+                segments: vec![PlanSegment::from_pass(&pass)], canvas_epoch: None,
+                pass_count: 1, split_count: 0, split_reasons: Vec::new(),
+            };
+            assert!(matches!(lower_plan(&plan), Err(PlanLoweringError::InvalidCopyCommand { .. })));
+            let command = GpuCommand::CopyTextureToBufferLayout {
+                texture_id: 10, buffer_id: 20, width, height, bytes_per_row, epoch: Epoch::ZERO,
+            };
+            assert!(matches!(
+                GpuSubmissionPacket::from_commands(vec![command]).encode(),
+                Err(PacketEncodeError::InvalidDimensions(_))
+            ));
+        }
+        // Empty extents are still legal copy commands; they do not write texels.
+        assert!(validate_texture_buffer_layout(0, 2, 256).is_ok());
+        assert!(validate_texture_buffer_layout(16, 0, 256).is_ok());
+    }
 
     #[test]
     fn negotiation_succeeds_when_profile_supported() {
