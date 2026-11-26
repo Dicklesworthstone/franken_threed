@@ -378,6 +378,25 @@ impl ResourceUse {
         }
     }
 
+    /// Create an index buffer read usage. Byte ranges do not subdivide its hazard scope.
+    pub fn buffer_index(
+        resource_id: ResourceId,
+        version: DataVersion,
+        byte_offset: Option<u64>,
+        byte_size: Option<u64>,
+    ) -> Self {
+        Self {
+            resource_id,
+            kind: ResourceKind::Buffer,
+            version,
+            subresource: SubresourceRange::WholeBuffer,
+            access: ResourceAccess::IndexBuffer,
+            byte_offset,
+            byte_size,
+            canvas_epoch: None,
+        }
+    }
+
     /// Create a sampled texture read usage.
     pub fn texture_sampled(
         resource_id: ResourceId,

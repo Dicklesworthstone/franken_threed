@@ -66,8 +66,8 @@ use f3d_core::{
     },
 };
 use f3d_graph::{
-    CanvasEpochTracker, CanvasFormat, CanvasId, ComputeBufferBinding, CopyCommand, Dispatch,
-    DrawKind, ExecutionPlan, LoadOp, Pass, PassGraph, PassId, PassKind, ResourceAccess,
+    CanvasEpochTracker, CanvasFormat, CanvasId, ComputeBufferBinding, CopyCommand, Dispatch, Draw,
+    DrawKind, ExecutionPlan, IndexFormat, LoadOp, Pass, PassGraph, PassId, PassKind, ResourceAccess,
     ResourceId, ResourceKind, ResourceUse, StoreOp, SubresourceRange, TextureAspect,
 };
 use f3d_math::{Matrix4, Quaternion, Vector3};
@@ -399,6 +399,8 @@ pub const OPCODE_COPY_TEXTURE_TO_BUFFER_LAYOUT: u16 = 28;
 pub const OPCODE_COPY_BUFFER_TO_TEXTURE: u16 = 29;
 /// Copy texture subresources, preserving mip levels, layers and extent.
 pub const OPCODE_COPY_TEXTURE_TO_TEXTURE: u16 = 30;
+/// Configure an explicit index-buffer slice and the immediately following indexed draw.
+pub const OPCODE_SET_INDEXED_DRAW_PARAMETERS: u16 = 31;
 
 /// Compute binding type: uniform buffer (`GPUBufferBindingType.uniform`).
 pub const BINDING_TYPE_UNIFORM: u32 = 0;
@@ -435,6 +437,8 @@ pub const BUFFER_USAGE_MAP_READ: u32 = 1;
 pub const BUFFER_USAGE_COPY_SRC: u32 = 4;
 /// GPUBufferUsage flag: copy destination.
 pub const BUFFER_USAGE_COPY_DST: u32 = 8;
+/// GPUBufferUsage flag: index buffer.
+pub const BUFFER_USAGE_INDEX: u32 = 16;
 /// GPUBufferUsage flag: vertex buffer.
 pub const BUFFER_USAGE_VERTEX: u32 = 32;
 /// GPUBufferUsage flag: uniform buffer.
@@ -890,6 +894,26 @@ pub enum GpuCommand {
         /// Index of the first vertex to draw.
         first_vertex: u32,
         /// Index of the first instance to draw.
+        first_instance: u32,
+    },
+    /// Configure the immediately following render command as an indexed draw.
+    /// Its vertex count is the index count; this command requires an open render pass.
+    SetIndexedDrawParameters {
+        /// Nonzero index-buffer identity.
+        index_buffer_id: u32,
+        /// Uint16 or Uint32 element representation (wire codes 0 and 1).
+        index_format: IndexFormat,
+        /// Byte offset, aligned to the index element width.
+        index_offset: u64,
+        /// Explicit byte length; odd trailing bytes and an empty range are permitted.
+        index_size: u64,
+        /// Number of instances to draw.
+        instance_count: u32,
+        /// First index relative to the bound byte range.
+        first_index: u32,
+        /// Signed offset added to each fetched vertex index.
+        base_vertex: i32,
+        /// First instance to draw.
         first_instance: u32,
     },
     /// Command to compile and create a render pipeline from WGSL shader text with depth testing/writing state.
@@ -1527,6 +1551,22 @@ impl GpuSubmissionPacket {
                     command_records.extend_from_slice(&first_vertex.to_le_bytes());
                     command_records.extend_from_slice(&first_instance.to_le_bytes());
                 }
+                GpuCommand::SetIndexedDrawParameters {
+                    index_buffer_id, index_format, index_offset, index_size,
+                    instance_count, first_index, base_vertex, first_instance,
+                } => {
+                    validate_index_buffer_range(*index_buffer_id, *index_format, *index_offset, *index_size)
+                        .map_err(PacketEncodeError::InvalidDimensions)?;
+                    command_records.extend_from_slice(&OPCODE_SET_INDEXED_DRAW_PARAMETERS.to_le_bytes());
+                    command_records.extend_from_slice(&index_buffer_id.to_le_bytes());
+                    command_records.extend_from_slice(&(*index_format as u32).to_le_bytes());
+                    command_records.extend_from_slice(&index_offset.to_le_bytes());
+                    command_records.extend_from_slice(&index_size.to_le_bytes());
+                    command_records.extend_from_slice(&instance_count.to_le_bytes());
+                    command_records.extend_from_slice(&first_index.to_le_bytes());
+                    command_records.extend_from_slice(&base_vertex.to_le_bytes());
+                    command_records.extend_from_slice(&first_instance.to_le_bytes());
+                }
                 GpuCommand::CreatePipelineDepth {
                     pipeline_id,
                     wgsl_code,
@@ -2137,6 +2177,15 @@ pub enum PlanLoweringError {
         /// Diagnostic reason describing why the copy command is invalid.
         reason: String,
     },
+    /// Indexed draw has a missing, incompatible, or out-of-range index-buffer declaration.
+    InvalidIndexedDraw {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+        /// Draw whose index-buffer declaration is invalid.
+        draw_id: u32,
+        /// Exact declaration or range error.
+        reason: String,
+    },
     /// Compute dispatch binding specifies no byte size or a zero byte size.
     UnspecifiedBindingSize {
         /// Diagnostic name of the pass segment.
@@ -2267,6 +2316,9 @@ impl core::fmt::Display for PlanLoweringError {
                     "Invalid copy command during bridge lowering: {reason}"
                 )
             }
+            Self::InvalidIndexedDraw { segment_name, draw_id, reason } => {
+                write!(f, "Render segment '{segment_name}' indexed draw {draw_id}: {reason}")
+            }
             Self::UnspecifiedBindingSize {
                 segment_name,
                 dispatch_id,
@@ -2328,6 +2380,61 @@ impl core::fmt::Display for PlanLoweringError {
 }
 
 impl core::error::Error for PlanLoweringError {}
+
+fn validate_index_buffer_range(
+    buffer_id: u32,
+    format: IndexFormat,
+    offset: u64,
+    size: u64,
+) -> Result<(), String> {
+    if buffer_id == 0 {
+        return Err("Index-buffer ID must not be zero".to_string());
+    }
+    if offset % format.byte_width() != 0 {
+        return Err("Index-buffer offset must be aligned to its element width".to_string());
+    }
+    // The host decodes GPUSize64 into JavaScript numbers. Validate the end as
+    // well as each operand so neither conversion nor range addition loses bits.
+    if offset.checked_add(size).is_none_or(|end| end > (1u64 << 53) - 1) {
+        return Err("Index-buffer byte range exceeds JavaScript's exact integer range".to_string());
+    }
+    Ok(())
+}
+
+fn lower_indexed_draw(
+    segment_name: &str,
+    draw: &Draw,
+) -> Result<Option<GpuCommand>, PlanLoweringError> {
+    let DrawKind::Indexed { index_use_index, index_format, base_vertex } = draw.kind() else {
+        return Ok(None);
+    };
+    let invalid = |reason: String| PlanLoweringError::InvalidIndexedDraw {
+        segment_name: segment_name.to_string(), draw_id: draw.draw_id(), reason,
+    };
+    let usage = draw.uses().get(index_use_index)
+        .ok_or_else(|| invalid(format!("Index use {index_use_index} is outside the draw's declarations")))?;
+    if usage.kind != ResourceKind::Buffer
+        || usage.access != ResourceAccess::IndexBuffer
+        || usage.subresource != SubresourceRange::WholeBuffer
+    {
+        return Err(invalid("Selected index use must be a whole-buffer IndexBuffer read".to_string()));
+    }
+    let index_size = usage.byte_size
+        .ok_or_else(|| invalid("Index-buffer byte size must be explicit".to_string()))?;
+    let index_offset = usage.byte_offset.unwrap_or(0);
+    validate_index_buffer_range(usage.resource_id.get(), index_format, index_offset, index_size)
+        .map_err(invalid)?;
+    let required = (u64::from(draw.first_vertex()) + u64::from(draw.vertex_count()))
+        * index_format.byte_width();
+    if required > index_size {
+        return Err(invalid(format!("Indexed draw needs {required} bytes within a {index_size}-byte index range")));
+    }
+    Ok(Some(GpuCommand::SetIndexedDrawParameters {
+        index_buffer_id: usage.resource_id.get(), index_format, index_offset, index_size,
+        instance_count: draw.instance_count(), first_index: draw.first_vertex(), base_vertex,
+        first_instance: draw.first_instance(),
+    }))
+}
 
 fn validate_attachment_view(
     segment_name: &str,
@@ -2616,6 +2723,7 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                 }
 
                 for draw in segment.draws() {
+                    let indexed_parameters = lower_indexed_draw(segment.name(), draw)?;
                     let needs_viewport_update = match draw.viewport() {
                         Some(vp) => current_viewport != Some(vp),
                         None => false,
@@ -2644,10 +2752,11 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                             (false, None, current_scissor)
                         };
 
-                    let needs_draw_parameters = matches!(draw.kind(), DrawKind::Direct)
-                        && (draw.instance_count() != 1
-                            || draw.first_vertex() != 0
-                            || draw.first_instance() != 0);
+                    let needs_draw_parameters = indexed_parameters.is_some()
+                        || (matches!(draw.kind(), DrawKind::Direct)
+                            && (draw.instance_count() != 1
+                                || draw.first_vertex() != 0
+                                || draw.first_instance() != 0));
 
                     // If a viewport, scissor, or draw parameters command must precede this draw,
                     // ensure the render pass is open first (WebGPU requires an active render pass encoder
@@ -2689,8 +2798,10 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                                 bundle_ids: alloc::vec![bundle_id],
                             });
                         }
-                        DrawKind::Direct => {
-                            if needs_draw_parameters {
+                        DrawKind::Direct | DrawKind::Indexed { .. } => {
+                            if let Some(parameters) = indexed_parameters {
+                                commands.push(parameters);
+                            } else if needs_draw_parameters {
                                 commands.push(GpuCommand::SetDrawParameters {
                                     instance_count: draw.instance_count(),
                                     first_vertex: draw.first_vertex(),
@@ -8975,6 +9086,125 @@ mod tests {
         // 5. Freestanding helper also rejects stale epoch
         assert!(!try_publish_readback(&region, Epoch::ZERO));
         assert!(try_publish_readback(&region, next_epoch));
+    }
+
+    #[test]
+    fn indexed_draw_wire_layout_preserves_full_width_fields() {
+        for index_format in [IndexFormat::Uint16, IndexFormat::Uint32] {
+            for base_vertex in [i32::MIN, -1, 0, i32::MAX] {
+                let command = GpuCommand::SetIndexedDrawParameters {
+                    index_buffer_id: 55, index_format,
+                    index_offset: 0x1_0000_0004, index_size: 0x1_0000_0003,
+                    instance_count: 7, first_index: 11, base_vertex, first_instance: 13,
+                };
+                let wire = GpuSubmissionPacket::from_commands(vec![command]).encode().unwrap();
+                assert_eq!(wire.len(), 16 + 2 + 40);
+                assert_eq!(u32::from_le_bytes(wire[8..12].try_into().unwrap()), 1);
+                assert_eq!(u16::from_le_bytes(wire[16..18].try_into().unwrap()), 31);
+                let body = &wire[18..];
+                assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 55);
+                assert_eq!(u32::from_le_bytes(body[4..8].try_into().unwrap()), index_format as u32);
+                assert_eq!(u64::from_le_bytes(body[8..16].try_into().unwrap()), 0x1_0000_0004);
+                assert_eq!(u64::from_le_bytes(body[16..24].try_into().unwrap()), 0x1_0000_0003);
+                assert_eq!(u32::from_le_bytes(body[24..28].try_into().unwrap()), 7);
+                assert_eq!(u32::from_le_bytes(body[28..32].try_into().unwrap()), 11);
+                assert_eq!(i32::from_le_bytes(body[32..36].try_into().unwrap()), base_vertex);
+                assert_eq!(u32::from_le_bytes(body[36..40].try_into().unwrap()), 13);
+            }
+        }
+        for (index_buffer_id, index_offset, index_size) in [
+            (0, 0, 4), (1, 2, 4), (1, (1u64 << 53) - 4, 4), (1, u64::MAX - 3, 4),
+        ] {
+            let command = GpuCommand::SetIndexedDrawParameters {
+                index_buffer_id, index_format: IndexFormat::Uint32, index_offset, index_size,
+                instance_count: 1, first_index: 0, base_vertex: 0, first_instance: 0,
+            };
+            assert!(matches!(GpuSubmissionPacket::from_commands(vec![command]).encode(),
+                Err(PacketEncodeError::InvalidDimensions(_))));
+        }
+    }
+
+    #[test]
+    fn indexed_draw_lowering_preserves_ranges_and_render_variants() {
+        for depth in [false, true] {
+            for resolve in [false, true] {
+                for bundle_first in [false, true] {
+                    for (count, first_index, size) in [(3, 4, 29), (0, 0, 0)] {
+                        let mut plan = attachment_view_test_plan(SubresourceRange::full_texture(), depth);
+                        let segment = &mut plan.segments[0];
+                        if resolve {
+                            segment.color_attachments[0].resolve_target = Some(ResourceId::new(11));
+                        }
+                        if bundle_first {
+                            segment.draws.push(Draw::new_bundle(0, 42, 100, Vec::new()));
+                        }
+                        let mut draw = Draw::new(7, 100, count, 0, vec![
+                            ResourceUse::buffer_vertex(ResourceId::new(77), DataVersion::INITIAL, None, Some(64)),
+                            ResourceUse::buffer_index(ResourceId::new(55), DataVersion::new(9), Some(4), Some(size)),
+                        ]).with_range([count, 2, first_index, 5])
+                            .with_indexed(1, IndexFormat::Uint32, i32::MIN);
+                        if resolve {
+                            draw = draw.with_viewport_rect([1, 2, 3, 4]).with_scissor_rect([0, 0, 2, 3]);
+                        }
+                        segment.draws.extend([draw, Draw::new(8, 100, 3, 0, Vec::new())]);
+                        let commands = lower_plan(&plan).unwrap();
+                        let position = commands.iter().position(|command| matches!(command,
+                            GpuCommand::SetIndexedDrawParameters { .. })).unwrap();
+                        assert!(position > 0, "indexed parameters require an open pass");
+                        assert_eq!(commands[position], GpuCommand::SetIndexedDrawParameters {
+                            index_buffer_id: 55, index_format: IndexFormat::Uint32,
+                            index_offset: 4, index_size: size, instance_count: 2,
+                            first_index, base_vertex: i32::MIN, first_instance: 5,
+                        });
+                        let (variant, actual_count, flags) = match commands[position + 1] {
+                            GpuCommand::RenderPass { vertex_count, pass_flags, .. } => (0, vertex_count, pass_flags),
+                            GpuCommand::RenderPassResolve { vertex_count, pass_flags, .. } => (1, vertex_count, pass_flags),
+                            GpuCommand::RenderPassDepth { vertex_count, pass_flags, .. } => (2, vertex_count, pass_flags),
+                            GpuCommand::RenderPassDepthResolve { vertex_count, pass_flags, .. } => (3, vertex_count, pass_flags),
+                            ref other => panic!("indexed parameters must immediately precede a draw, got {other:?}"),
+                        };
+                        assert_eq!((variant, actual_count, flags), (2 * u32::from(depth) + u32::from(resolve), count, PASS_FLAG_NONE));
+                        assert_eq!(commands.iter().filter(|c| matches!(c, GpuCommand::SetIndexedDrawParameters { .. })).count(), 1);
+                        assert!(!commands.iter().any(|c| matches!(c, GpuCommand::SetDrawParameters { .. })),
+                            "the following default direct draw must keep its original encoding");
+                        GpuSubmissionPacket::from_commands(commands).encode().unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_draw_lowering_rejects_missing_or_invalid_declarations() {
+        let base = Draw::new(7, 100, 3, 0, vec![
+            ResourceUse::buffer_vertex(ResourceId::new(77), DataVersion::INITIAL, None, Some(64)),
+            ResourceUse::buffer_index(ResourceId::new(55), DataVersion::INITIAL, Some(4), Some(29)),
+        ]).with_range([3, 1, 4, 0]).with_indexed(1, IndexFormat::Uint32, -1);
+        for case in 0..11 {
+            let mut draw = base.clone();
+            let expected = match case {
+                0 => { draw.uses.clear(); "outside" }
+                1 => { draw.kind = DrawKind::Indexed { index_use_index: 0, index_format: IndexFormat::Uint32, base_vertex: 0 }; "IndexBuffer" }
+                2 => { draw.uses[1].kind = ResourceKind::Texture; "IndexBuffer" }
+                3 => { draw.uses[1].subresource = SubresourceRange::full_texture(); "IndexBuffer" }
+                4 => { draw.uses[1].resource_id = ResourceId::new(0); "zero" }
+                5 => { draw.uses[1].byte_size = None; "explicit" }
+                6 => { draw.uses[1].byte_offset = Some(2); "aligned" }
+                7 => { draw.uses[1].byte_size = Some(27); "needs 28 bytes" }
+                8 => { draw.uses[1].byte_offset = Some((1u64 << 53) - 4); "exact integer" }
+                9 => { draw.uses[1].byte_offset = Some(u64::MAX - 3); "exact integer" }
+                _ => { draw.first_vertex = u32::MAX; draw.vertex_count = u32::MAX; "needs" }
+            };
+            let mut plan = attachment_view_test_plan(SubresourceRange::full_texture(), false);
+            plan.segments[0].draws.push(draw);
+            match lower_plan(&plan) {
+                Err(PlanLoweringError::InvalidIndexedDraw { segment_name, draw_id, reason }) => {
+                    assert_eq!((segment_name.as_str(), draw_id), ("attachment_view", 7));
+                    assert!(reason.contains(expected), "case {case}: {reason}");
+                }
+                other => panic!("case {case}: expected indexed declaration rejection, got {other:?}"),
+            }
+        }
     }
 
     fn attachment_view_test_plan(view: SubresourceRange, depth: bool) -> ExecutionPlan {

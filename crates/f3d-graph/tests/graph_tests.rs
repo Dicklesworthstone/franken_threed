@@ -22,7 +22,7 @@ use f3d_graph::error::{CanvasError, GraphError, HazardError};
 use f3d_graph::hazard::{can_split_pass, split_pass_on_hazard, validate_pass_hazards};
 use f3d_graph::pass::{
     ColorAttachment, ComputeBufferBinding, CopyCommand, DepthStencilAttachment, Dispatch, Draw,
-    DrawKind, LoadOp, Pass, PassId, PassKind, RenderBundle, StoreOp,
+    DrawKind, IndexFormat, LoadOp, Pass, PassId, PassKind, RenderBundle, StoreOp,
 };
 use f3d_graph::plan::{
     build_red_a_blue_b_plan, build_red_a_blue_b_render_plan, build_single_pass_bridge_plan,
@@ -36,6 +36,60 @@ use f3d_graph::schedule::PassGraph;
 fn single_use_compute_pass(id: u32, usage: ResourceUse) -> Pass {
     Pass::new_compute(PassId::new(id), format!("compute_{id}"))
         .with_dispatch(Dispatch::new(0, 1, [1, 1, 1], vec![usage]))
+}
+
+#[test]
+fn indexed_draw_preserves_whole_buffer_hazards_and_copy_dependencies() {
+    let version = DataVersion::new(9);
+    let index_use = ResourceUse::buffer_index(ResourceId::new(55), version, Some(512), Some(7));
+    assert_eq!(index_use.subresource, SubresourceRange::WholeBuffer);
+    let draw = Draw::new(0, 1, 3, 0, vec![index_use.clone()])
+        .with_indexed(0, IndexFormat::Uint16, -2);
+    let pass = Pass::new_render(PassId::new(1), "indexed")
+        .with_color_attachment(ColorAttachment::new_clear(ResourceId::new(10), [0.0; 4]))
+        .with_draw(draw);
+    let conflict = pass.clone().with_draw(Draw::new(1, 1, 3, 0, vec![
+        ResourceUse::buffer_storage_write(ResourceId::new(55), version, Some(0), Some(4)),
+    ]));
+    assert!(matches!(validate_pass_hazards(&conflict), Err(HazardError::WholeBufferConflict {
+        buffer_id: 55, access_a: ResourceAccess::IndexBuffer,
+        access_b: ResourceAccess::StorageBufferWrite, ..
+    })));
+
+    // Even a disjoint copy write must precede the index read. Its prerequisite
+    // blocks the writer so source-order tie breaking cannot mask a missing edge.
+    let copy = Pass::new_copy(PassId::new(30), "copy_indices")
+        .with_dependency(PassId::new(50))
+        .with_copy(CopyCommand::BufferToBuffer {
+            src: ResourceId::new(66), src_offset: 0,
+            dst: ResourceId::new(55), dst_offset: 0, size: 4,
+        });
+    let mut graph = PassGraph::new();
+    graph.add_pass(copy).unwrap();
+    graph.add_pass(pass).unwrap();
+    graph.add_pass(Pass::new_copy(PassId::new(50), "prerequisite")).unwrap();
+    let plan = graph.compile(None).unwrap();
+    assert_eq!(plan.segments.iter().map(|s| s.pass_id.get()).collect::<Vec<_>>(), vec![50, 30, 1]);
+    assert!(plan.segments[2].versioned_reads.contains(&(ResourceId::new(55), version)));
+    assert_eq!(plan.segments[2].draws[0].uses, vec![index_use]);
+}
+
+#[test]
+fn indexed_draw_after_bundle_requires_explicit_rebind() {
+    let draw = Draw::new(1, 100, 3, 0, vec![ResourceUse::buffer_index(
+        ResourceId::new(55), DataVersion::INITIAL, Some(0), Some(6),
+    )]).with_indexed(0, IndexFormat::Uint16, i32::MIN).with_assumes_warm_state(true);
+    assert!(draw.is_direct());
+    assert!(!draw.is_bundle());
+    assert_eq!(draw.bundle_id(), None);
+    let mut pass = Pass::new_render(PassId::new(1), "bundle_then_indexed")
+        .with_draw(Draw::new_bundle(0, 42, 100, Vec::new())).with_draw(draw);
+    assert_eq!(validate_pass_hazards(&pass), Err(HazardError::BundleDirectDrawRequiresRebind {
+        pass_id: 1, draw_id: 1,
+    }));
+    pass.draws[1].assumes_warm_state = false;
+    validate_pass_hazards(&pass).unwrap();
+    assert!(f3d_graph::PlanSegment::from_pass(&pass).draw_crosses_bundle_boundary(1));
 }
 
 #[test]

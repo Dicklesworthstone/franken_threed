@@ -352,12 +352,43 @@ impl DepthStencilAttachment {
     }
 }
 
+/// Element width and wire representation of an index buffer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(u32)]
+pub enum IndexFormat {
+    /// Unsigned 16-bit indices.
+    Uint16 = 0,
+    /// Unsigned 32-bit indices.
+    Uint32 = 1,
+}
+
+impl IndexFormat {
+    /// Required offset alignment and number of bytes per index.
+    #[must_use]
+    pub const fn byte_width(self) -> u64 {
+        match self {
+            Self::Uint16 => 2,
+            Self::Uint32 => 4,
+        }
+    }
+}
+
 /// Category of draw command within a render pass (§8.5, AGENTS.md).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DrawKind {
-    /// Direct non-indexed or indexed draw command (`draw` / `drawIndexed`).
+    /// Direct non-indexed draw command (`draw`).
     Direct,
+    /// Indexed draw; the selected use owns the buffer identity, version and byte range.
+    Indexed {
+        /// Index into `Draw::uses`, which must declare a whole-buffer `IndexBuffer` read.
+        index_use_index: usize,
+        /// Element representation within the selected buffer range.
+        index_format: IndexFormat,
+        /// Signed offset added to each fetched vertex index.
+        base_vertex: i32,
+    },
     /// Pre-recorded WebGPU render bundle execution (`executeBundles`).
     Bundle {
         /// Unique bundle identifier.
@@ -401,11 +432,11 @@ pub struct Draw {
     pub draw_id: u32,
     /// Pipeline or shader variant ID.
     pub pipeline_id: u32,
-    /// Number of vertices to draw.
+    /// Number of vertices, or number of indices for `DrawKind::Indexed`.
     pub vertex_count: u32,
     /// Number of instances.
     pub instance_count: u32,
-    /// Index of the first vertex.
+    /// First vertex, or first index within the bound range for `DrawKind::Indexed`.
     pub first_vertex: u32,
     /// Index of the first instance.
     pub first_instance: u32,
@@ -530,6 +561,20 @@ impl Draw {
         self
     }
 
+    /// Use an index-buffer declaration for this draw. Existing count and first-vertex
+    /// fields become index count and first index; instance fields keep their meanings.
+    /// The selected use must have an explicit byte size, including zero for an empty draw.
+    #[must_use]
+    pub const fn with_indexed(
+        mut self,
+        index_use_index: usize,
+        index_format: IndexFormat,
+        base_vertex: i32,
+    ) -> Self {
+        self.kind = DrawKind::Indexed { index_use_index, index_format, base_vertex };
+        self
+    }
+
     /// Draw index within the pass.
     #[inline]
     #[must_use]
@@ -544,7 +589,7 @@ impl Draw {
         self.pipeline_id
     }
 
-    /// Number of vertices to draw.
+    /// Number of vertices, or number of indices for an indexed draw.
     #[inline]
     #[must_use]
     pub const fn vertex_count(&self) -> u32 {
@@ -558,7 +603,7 @@ impl Draw {
         self.instance_count
     }
 
-    /// Index of the first vertex.
+    /// First vertex, or first index within the bound range for an indexed draw.
     #[inline]
     #[must_use]
     pub const fn first_vertex(&self) -> u32 {
@@ -613,7 +658,7 @@ impl Draw {
     #[inline]
     #[must_use]
     pub const fn is_direct(&self) -> bool {
-        matches!(self.kind, DrawKind::Direct)
+        matches!(self.kind, DrawKind::Direct | DrawKind::Indexed { .. })
     }
 
     /// Returns the bundle ID if this is a bundle execution command.
@@ -622,7 +667,7 @@ impl Draw {
     pub const fn bundle_id(&self) -> Option<u32> {
         match self.kind {
             DrawKind::Bundle { bundle_id } => Some(bundle_id),
-            DrawKind::Direct => None,
+            DrawKind::Direct | DrawKind::Indexed { .. } => None,
         }
     }
 
@@ -687,7 +732,8 @@ impl Draw {
         self
     }
 
-    /// Configure direct draw parameters `[vertex_count, instance_count, first_vertex, first_instance]` in WebGPU order (§8.5).
+    /// Configure `[count, instance_count, first_element, first_instance]` (§8.5).
+    /// Count and first element address indices for indexed draws, vertices otherwise.
     #[must_use]
     pub const fn with_range(mut self, range: [u32; 4]) -> Self {
         self.vertex_count = range[0];
