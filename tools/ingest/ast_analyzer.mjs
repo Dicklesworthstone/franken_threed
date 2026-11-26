@@ -806,20 +806,23 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const RENDERER = 1, CANVAS = 2, WEBGL = 4, WEBGPU = 8, NAMESPACE = 16, DOM = 32;
   const ORBIT_CTOR = 64, CONTROLS = 128, BASE_CTOR = 256, ORBIT_NAMESPACE = 512, BASE_NAMESPACE = 1024;
   const COMPOSER_CTOR = 2048, PASS_CTOR = 4096, COMPOSER = 8192, PASS = 16384;
-  const FIRST_PERSON_CTOR = 32768, FIRST_PERSON_NAMESPACE = 65536;
+  // Camera controls share a constructor signature, but each module namespace
+  // keeps its own source proof. Reserve distinct roles for different signatures.
+  const FIRST_PERSON_CTOR = ORBIT_CTOR, FIRST_PERSON_NAMESPACE = 65536;
   const GPGPU_CTOR = 131072, GPGPU = 262144, GPGPU_NAMESPACE = 524288;
-  const MAP_CTOR = 1048576, MAP_NAMESPACE = 2097152;
-  const TRACKBALL_CTOR = 4194304, TRACKBALL_NAMESPACE = 8388608;
-  const FLY_CTOR = 16777216, FLY_NAMESPACE = 33554432;
+  const MAP_CTOR = ORBIT_CTOR, MAP_NAMESPACE = 2097152;
+  const TRACKBALL_CTOR = ORBIT_CTOR, TRACKBALL_NAMESPACE = 8388608;
+  const FLY_CTOR = ORBIT_CTOR, FLY_NAMESPACE = 33554432;
   const INSPECTOR_CTOR = 67108864, INSPECTOR = 134217728, INSPECTOR_NAMESPACE = 268435456;
-  const POINTER_LOCK_CTOR = 536870912, POINTER_LOCK_NAMESPACE = 1073741824;
-  const CONTROL_CONSTRUCTORS = ORBIT_CTOR | FIRST_PERSON_CTOR | MAP_CTOR | TRACKBALL_CTOR | FLY_CTOR | POINTER_LOCK_CTOR;
+  const POINTER_LOCK_CTOR = ORBIT_CTOR, POINTER_LOCK_NAMESPACE = 1073741824;
+  const DRAG_CTOR = 32768, DRAG_NAMESPACE = 1048576;
+  const CONTROL_CONSTRUCTORS = ORBIT_CTOR | DRAG_CTOR;
   const CONSTRUCTOR = WEBGL | WEBGPU, ALL_CONSTRUCTORS = CONSTRUCTOR | CONTROL_CONSTRUCTORS | BASE_CTOR | COMPOSER_CTOR | PASS_CTOR | GPGPU_CTOR | INSPECTOR_CTOR;
   const RESOURCE = RENDERER | CANVAS | ALL_CONSTRUCTORS | NAMESPACE | CONTROLS | COMPOSER | PASS | GPGPU | INSPECTOR;
   const consumerKind = role => role === "orbit" ? ORBIT_CTOR : role === "base" ? BASE_CTOR :
     role === "first-person" ? FIRST_PERSON_CTOR : role === "gpu-computation" ? GPGPU_CTOR :
     role === "map" ? MAP_CTOR : role === "trackball" ? TRACKBALL_CTOR : role === "fly" ? FLY_CTOR :
-    role === "pointer-lock" ? POINTER_LOCK_CTOR :
+    role === "pointer-lock" ? POINTER_LOCK_CTOR : role === "drag" ? DRAG_CTOR :
     role === "renderer-inspector" ? INSPECTOR_CTOR :
     role === "webgpu" ? WEBGPU : role === "webgl" ? WEBGL : role === "composer" ? COMPOSER_CTOR : role === "pass" ? PASS_CTOR : 0;
   const functions = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
@@ -871,7 +874,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
           const cell = scopes.get(ast).get(spec.local.name);
           cell.consumerSource = role === "orbit" ? ORBIT_NAMESPACE : role === "first-person" ? FIRST_PERSON_NAMESPACE :
             role === "map" ? MAP_NAMESPACE : role === "trackball" ? TRACKBALL_NAMESPACE : role === "fly" ? FLY_NAMESPACE :
-            role === "pointer-lock" ? POINTER_LOCK_NAMESPACE :
+            role === "pointer-lock" ? POINTER_LOCK_NAMESPACE : role === "drag" ? DRAG_NAMESPACE :
             role === "renderer-inspector" ? INSPECTOR_NAMESPACE :
             role === "gpu-computation" ? GPGPU_NAMESPACE : role === "base" ? BASE_NAMESPACE : 0;
           cell.kind |= NAMESPACE | cell.consumerSource;
@@ -914,6 +917,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     if (object & TRACKBALL_NAMESPACE && names.includes("TrackballControls")) result |= TRACKBALL_CTOR;
     if (object & FLY_NAMESPACE && names.includes("FlyControls")) result |= FLY_CTOR;
     if (object & POINTER_LOCK_NAMESPACE && names.includes("PointerLockControls")) result |= POINTER_LOCK_CTOR;
+    if (object & DRAG_NAMESPACE && names.includes("DragControls")) result |= DRAG_CTOR;
     if (object & GPGPU_NAMESPACE && names.includes("GPUComputationRenderer")) result |= GPGPU_CTOR;
     if (object & INSPECTOR_NAMESPACE && names.includes("RendererInspector")) result |= INSPECTOR_CTOR;
     if (object & BASE_NAMESPACE && names.some(name =>
@@ -1296,6 +1300,10 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     else if (node.type === "CallExpression" && closedHelpers.has(localHelper(node)))
       helperReturns.get(localHelper(node)).forEach(visit);
   };
+  const controlsCanvasIndex = constructor => {
+    const role = kind(constructor) & CONTROL_CONSTRUCTORS;
+    return role === DRAG_CTOR ? 2 : role === ORBIT_CTOR ? 1 : -1;
+  };
   // A bounded fixpoint covers aliases assigned before their source declaration,
   // closures and later reassignments without simulating application control flow.
   for (let iteration = 0; iteration < 64; iteration++) {
@@ -1317,7 +1325,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         if (node.callee.type === "MemberExpression" && node.callee.object.type === "Identifier")
           mark(node.callee.object, NAMESPACE);
       } else if (node.type === "NewExpression" && kind(node.callee) & CONTROL_CONSTRUCTORS) {
-        markCanvas(node.arguments[1]);
+        const index = controlsCanvasIndex(node.callee);
+        if (index < 0) { markCanvas(node.arguments[1]); markCanvas(node.arguments[2]); }
+        else markCanvas(node.arguments[index]);
       } else if (node.type === "CallExpression" && node.callee.type === "MemberExpression" &&
           kind(node.callee.object) & CONTROLS && staticPropertyNames(node.callee)?.every(name => name === "connect")) {
         markCanvas(node.arguments[0]);
@@ -1389,6 +1399,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     if (node.type === "ConditionalExpression" || node.type === "LogicalExpression")
       return visit(node.consequent ?? node.left) && visit(node.alternate ?? node.right);
     if (node.type === "NewExpression") return expected === CONTROLS ? visit(node.callee, CONTROL_CONSTRUCTORS) :
+      expected === DRAG_CTOR ? visit(node.callee, DRAG_CTOR) :
       expected === COMPOSER ? visit(node.callee, COMPOSER_CTOR) : expected === PASS ? visit(node.callee, PASS_CTOR) :
       expected === GPGPU ? visit(node.callee, GPGPU_CTOR) : expected === INSPECTOR ? visit(node.callee, INSPECTOR_CTOR) :
       expected === WEBGL || expected === WEBGPU ? visit(node.callee, expected) : expected === RENDERER && visit(node.callee, CONSTRUCTOR);
@@ -1400,7 +1411,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         names.every(name => name === "MapControls") && visit(node.object, MAP_NAMESPACE) ||
         names.every(name => name === "TrackballControls") && visit(node.object, TRACKBALL_NAMESPACE) ||
         names.every(name => name === "FlyControls") && visit(node.object, FLY_NAMESPACE) ||
-        names.every(name => name === "PointerLockControls") && visit(node.object, POINTER_LOCK_NAMESPACE);
+        names.every(name => name === "PointerLockControls") && visit(node.object, POINTER_LOCK_NAMESPACE) ||
+        names.every(name => name === "DragControls") && visit(node.object, DRAG_NAMESPACE);
+      if (expected === DRAG_CTOR) return names.every(name => name === "DragControls") && visit(node.object, DRAG_NAMESPACE);
       if (expected === CONSTRUCTOR) return names.every(name => ctorKind(name)) && visit(node.object, BASE_NAMESPACE);
       if (expected === GPGPU_CTOR) return names.every(name => name === "GPUComputationRenderer") && visit(node.object, GPGPU_NAMESPACE);
       if (expected === INSPECTOR_CTOR) return names.every(name => name === "RendererInspector") && visit(node.object, INSPECTOR_NAMESPACE);
@@ -1477,23 +1490,70 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     "movementSpeed", "lookSpeed", "lookVertical", "autoForward", "heightSpeed", "heightCoef", "heightMin", "heightMax",
     "constrainVertical", "verticalMin", "verticalMax", "mouseDragOn", "rollSpeed", "dragToLook",
     "noRotate", "noZoom", "noPan", "multiTouchRoll", "staticMoving", "dynamicDampingFactor", "keys", "mouseButtons", "touches",
-    "pointerSpeed"]);
-  const controlsViews = new Set(["domElement", "target", "cursor", "object", "keys", "mouseButtons", "touches", "screen", "isLocked"]);
+    "pointerSpeed", "objects", "recursive", "transformGroup"]);
+  const controlsViews = new Set(["domElement", "target", "cursor", "object", "keys", "mouseButtons", "touches", "screen", "isLocked", "raycaster"]);
   // EventDispatcher supplies the controls through both `this` and event.target.
-  // A zero-argument callback without receiver/arguments access cannot acquire
-  // that hidden canvas owner. Explicit captures still go through the ordinary
-  // resource-escape proof below; the original callback and dispatch stay intact.
+  // Inline callbacks cannot acquire that hidden canvas owner through their
+  // receiver, arguments, or event target. DragControls' own object/type fields
+  // may be read without exposing the event itself. Explicit captures still go
+  // through the ordinary resource proof; original dispatch and callbacks stay intact.
+  const controlsListenerCall = call => call?.type === "CallExpression" && call.callee.type === "MemberExpression" &&
+    staticPropertyNames(call.callee)?.every(name => ["addEventListener", "removeEventListener"].includes(name)) &&
+    call.arguments.length === 2 && call.arguments[0].type === "Literal" && typeof call.arguments[0].value === "string";
+  const listenerTarget = (node, depth = 0) => {
+    if (node?.type !== "Identifier" || depth > 64 || helperWrites.has(binding(node))) return null;
+    const helper = localHelper({type: "CallExpression", callee: node, arguments: []});
+    if (helper) return helper;
+    const cell = binding(node), values = origins.get(cell);
+    return cell.consumerVariable && values?.length === 1 ? listenerTarget(values[0], depth + 1) : null;
+  };
+  const listenerReferences = new Map();
+  const closedListenerReferences = callback => {
+    if (listenerReferences.has(callback)) return listenerReferences.get(callback);
+    let closed = !["ExportNamedDeclaration", "ExportDefaultDeclaration"].includes(parents.get(callback)?.type);
+    // A named listener cannot expose its call frame through .arguments/.caller
+    // or an escaped alias. Keep every reference inside ordinary direct calls,
+    // immutable local aliases and the same proved DragControls event boundary.
+    for (const node of nodes) {
+      if (node.type === "ExportNamedDeclaration" && !node.source &&
+          (node.specifiers.some(specifier => listenerTarget(specifier.local) === callback) ||
+            node.declaration?.type === "VariableDeclaration" && node.declaration.declarations.some(value => listenerTarget(value.id) === callback)) ||
+          node.type === "ExportDefaultDeclaration" && listenerTarget(node.declaration) === callback) { closed = false; break; }
+      if (node.type !== "Identifier" || listenerTarget(node) !== callback) continue;
+      const parent = parents.get(node);
+      const declaration = node === callback.id || parent?.type === "VariableDeclarator" && parent.id === node;
+      const alias = parent?.type === "VariableDeclarator" && parent.init === node && listenerTarget(parent.id) === callback;
+      const call = parent?.type === "CallExpression" && parent.callee === node && !parent.arguments.some(value => value.type === "SpreadElement");
+      const event = controlsListenerCall(parent) && parent.arguments[1] === node && closedConsumerValue(parent.callee.object, DRAG_CTOR);
+      if (!declaration && !alias && !call && !event) { closed = false; break; }
+    }
+    listenerReferences.set(callback, closed);
+    return closed;
+  };
   const closedControlsListener = call => {
-    if (call?.type !== "CallExpression" || call.callee.type !== "MemberExpression" ||
-        !staticPropertyNames(call.callee)?.every(name => ["addEventListener", "removeEventListener"].includes(name)) ||
-        call.arguments.length !== 2 || call.arguments[0].type !== "Literal" || typeof call.arguments[0].value !== "string") return false;
-    const callback = call.arguments[1];
-    if (!["FunctionExpression", "ArrowFunctionExpression"].includes(callback.type) ||
-        callback.id || callback.params.length || callback.async || callback.generator) return false;
+    if (!controlsListenerCall(call)) return false;
+    const argument = call.arguments[1], named = argument.type === "Identifier";
+    const callback = named ? listenerTarget(argument) : localHelper({type: "CallExpression", callee: argument, arguments: []});
+    if (named && (!callback || !closedConsumerValue(call.callee.object, DRAG_CTOR) || !closedListenerReferences(callback))) return false;
+    if (!functions.has(callback?.type) || callback.id && !named ||
+        callback.params.length > 1 || callback.params.some(parameter => parameter.type !== "Identifier") ||
+        callback.async || callback.generator) return false;
+    if (callback.params.length && !closedConsumerValue(call.callee.object, DRAG_CTOR)) return false;
+    const event = callback.params[0] && binding(callback.params[0]);
+    const fields = new Set(["object", "type"]);
     let closed = true;
     walk.full(callback.body, node => {
       if (node.type === "ThisExpression" || node.type === "Super" ||
           node.type === "Identifier" && node.name === "arguments") closed = false;
+      if (node.type !== "Identifier" || !event || binding(node) !== event) return;
+      const member = parents.get(node), parent = parents.get(member);
+      // Calling event.object() would hand the complete event to a callable as
+      // its receiver. Aliases, destructuring, writes and arbitrary keys likewise
+      // leave the bounded read-only event contract.
+      if (member?.type !== "MemberExpression" || member.object !== node ||
+          !staticPropertyNames(member)?.every(name => fields.has(name)) ||
+          parent?.type === "CallExpression" && parent.callee === member ||
+          parent?.type === "TaggedTemplateExpression" && parent.tag === member || recordWrite(member)) closed = false;
     });
     return closed;
   };
@@ -1574,7 +1634,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     "getRootNode", "getBoundingClientRect", "focus", ...hostMethods, "appendChild", "append", "prepend", "insertBefore", "replaceChild"]);
   const isControlsCanvasInput = (call, argument, index) => (kind(argument) & RESOURCE) === CANVAS &&
     !call.arguments.some(value => value.type === "SpreadElement") && closedDomValue(argument) &&
-    (call.type === "NewExpression" && closedConsumerValue(call.callee, CONTROL_CONSTRUCTORS) && index === 1 ||
+    (call.type === "NewExpression" && closedConsumerValue(call.callee, CONTROL_CONSTRUCTORS) && index === controlsCanvasIndex(call.callee) ||
       call.type === "CallExpression" && call.callee.type === "MemberExpression" && closedConsumerValue(call.callee.object, CONTROLS) &&
       staticPropertyNames(call.callee)?.every(name => name === "connect") && index === 0);
   const isPassInput = (call, argument, index) => index === 0 && !call.arguments.some(value => value.type === "SpreadElement") &&
@@ -1715,8 +1775,8 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
           report(node, "opaque-canvas-input");
       }
       if (node.type === "NewExpression" && kind(node.callee) & CONTROL_CONSTRUCTORS) {
-        const canvas = node.arguments[1];
-        if (!closedConsumerValue(node.callee, CONTROL_CONSTRUCTORS) || node.arguments.some(value => value.type === "SpreadElement"))
+        const index = controlsCanvasIndex(node.callee), canvas = node.arguments[index];
+        if (index < 0 || !closedConsumerValue(node.callee, CONTROL_CONSTRUCTORS) || node.arguments.some(value => value.type === "SpreadElement"))
           report(node, "unclosed-controls-constructor");
         if (canvas && !(canvas.type === "Literal" && canvas.value == null) && !closedDomValue(canvas))
           report(node, "opaque-controls-canvas-input");

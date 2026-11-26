@@ -180,17 +180,24 @@ native backend method from a private record also retains its existing exact-rout
 requirement; the record does not hide that observation.
 
 The graph can prove bounded retained `OrbitControls`, `FirstPersonControls`,
-`MapControls`, `TrackballControls`, `FlyControls` and `PointerLockControls` contracts by verifying the
+`MapControls`, `TrackballControls`, `FlyControls`, `PointerLockControls` and `DragControls` contracts by verifying the
 exact addon, resolved Three build and core bytes. `MapControls` also requires its
 actual resolved `OrbitControls` superclass to pass that proof. The returned
 controls instance continues to carry the canvas reference through local aliases and `domElement`;
 it is not an exemption for arbitrary consumers. Closed updates, camera-control
 methods, configuration and disposal remain eligible. Exports, unknown consumers,
-callbacks that can observe their event or receiver, private hooks, method replacement, reflection and unproved
+callbacks that expose their controls owner, private hooks, method replacement, reflection and unproved
 constructor/receiver origins retain the upstream owner. Changed source bytes,
 redirected base classes and unresolved code invalidate the proof. The original
 H2 application is consequently eligible with `--route-webgl-renderer`, retaining
 its actual OrbitControls and camera identities while using the new GPU backend.
+
+`DragControls` retains its original `(objects, camera, domElement)` constructor,
+object-array identity, raycaster, recursive selection, group transforms, rotation
+speed and mouse/touch mappings. The source analyzer distinguishes its third canvas
+argument from the second argument used by camera controls; ambiguous constructor
+selections retain exact routing. Hover, drag, rotation, current object state and
+disposal remain implemented by the pinned source class.
 
 Map panning, trackball rotation/zoom/damping/multitouch and flight speed/roll/drag
 settings keep their original source implementation. Named and namespace imports,
@@ -221,9 +228,24 @@ Retained controls can use inline, anonymous, synchronous zero-argument event
 listeners for ordinary menu updates and closed rendering callbacks. Such a
 listener cannot read `this`, `arguments` or `super`, including in nested code;
 explicit renderer/control captures still face the existing ownership analysis.
-Event parameters, shared/named callbacks, async/generator listeners and escaping
-resource references retain the exact component. The original EventDispatcher
-still calls the original listener with its source receiver, event and ordering.
+
+DragControls also admits one simple event parameter whose only uses read the
+source's `event.object` or `event.type` fields. This preserves ordinary highlights,
+object updates and render callbacks. Immutable local named listeners and their
+aliases are admitted when every reference is a direct call, a local alias or a
+verified DragControls registration/removal. Exporting or passing the listener to
+an unknown consumer, observing its call frame, changing its binding, or exposing
+the complete event retains exact routing. Parameter redeclarations, event
+destructuring or mutation, dynamic event keys, receiver access and async/generator
+listeners also retain exact routing. The original EventDispatcher still calls
+the original listener with its source receiver, event and ordering.
+
+The expanded `renderer_camera_controls_source.test.mjs` suite checks source
+admission for the complete unchanged pinned `misc_controls_drag` example and
+drives the actual retained DragControls/math implementation with a recording DOM.
+It covers hover, pan, rotation, group/touch gestures, disabled input and disposal.
+These source-analysis and interaction checks ran in V8; emitted-application
+execution, actual browser input and GPU pixels remain unverified for this change.
 
 `node --max-old-space-size=768 --test tools/ingest/renderer_pointer_lock.test.mjs`
 builds source and routed applications and compares camera state, source event

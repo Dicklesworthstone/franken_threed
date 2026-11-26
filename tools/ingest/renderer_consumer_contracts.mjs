@@ -19,6 +19,7 @@ const MAP = 'sha256:5a686152c498914389d1503b60121f484d06f15cb4f7405c15fb6b8ddcc1
 const CONTROL_SOURCES = new Map([
   [ORBIT, {name: 'OrbitControls', role: 'orbit'}],
   [FIRST_PERSON, {name: 'FirstPersonControls', role: 'first-person'}],
+  ['sha256:aa0af1effa5c4e628c461bbb3f51a535ee99289c7350e0fab6fc6812b7fb6d8f', {name: 'DragControls', role: 'drag'}],
   ['sha256:cce95baddf589c16fea901b70f2038eca4557357937e1b03f8c76fe7ffe7457f', {name: 'TrackballControls', role: 'trackball'}],
   ['sha256:8063858389f2ccd5cd6f0968562752dbab4b21a03c7a6e1dcbb5cc746fc06373', {name: 'FlyControls', role: 'fly'}],
   ['sha256:40d58db8018b85038939d4d8bff7112d4b8a0ad0367b37ae6f969eeee4310c25', {name: 'PointerLockControls', role: 'pointer-lock'}],
