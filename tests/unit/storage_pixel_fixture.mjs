@@ -18,6 +18,9 @@ export const compactFormats = [
   [THREE.UnsignedByteType, THREE.RGFormat, 'rg8unorm', 2],
   [THREE.HalfFloatType, THREE.RedFormat, 'r16float', 2],
   [THREE.HalfFloatType, THREE.RGFormat, 'rg16float', 4],
+  [THREE.ByteType, THREE.RedFormat, 'r8snorm', 1],
+  [THREE.ByteType, THREE.RGFormat, 'rg8snorm', 2],
+  [THREE.ByteType, THREE.RGBAFormat, 'rgba8snorm', 4],
 ];
 export function texture(dimension = '2d', width = 3, height = 2, depth = 2, format = formats[0]) {
   const t = new THREE.Texture(width, height);

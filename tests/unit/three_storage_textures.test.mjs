@@ -65,6 +65,9 @@ for (const [type, format, native, bytes] of [
   [THREE.UnsignedByteType, THREE.RGFormat, 'rg8unorm', 2],
   [THREE.HalfFloatType, THREE.RedFormat, 'r16float', 2],
   [THREE.HalfFloatType, THREE.RGFormat, 'rg16float', 4],
+  [THREE.ByteType, THREE.RedFormat, 'r8snorm', 1],
+  [THREE.ByteType, THREE.RGFormat, 'rg8snorm', 2],
+  [THREE.ByteType, THREE.RGBAFormat, 'rgba8snorm', 4],
 ]) {
   test(`compact ${native} storage shares exact 2D/array/volume allocations and mip pipelines`, () => {
     for (const dimension of ['2d', '2d-array', '3d']) {
@@ -105,7 +108,7 @@ for (const [type, format, native, bytes] of [
       const current = setup({features: ['texture-formats-tier1', ...(tier2 ? ['texture-formats-tier2'] : [])]});
       const {device, owner, texture} = current; Object.assign(texture, {type, format});
       const readWrite = {...write(texture), access: 'readWrite'};
-      if (format === THREE.RGFormat) assert.throws(() => owner.captureBinding(readWrite), /ACCESS/);
+      if (type === THREE.ByteType || format === THREE.RGFormat) assert.throws(() => owner.captureBinding(readWrite), /ACCESS/);
       else if (!tier2) assert.throws(() => owner.captureBinding(readWrite), /texture-formats-tier2/);
       else assert.equal(owner.layout(owner.captureBinding(readWrite)).storageTexture.access, 'read-write');
       assert.equal(device.textures.length, 0);
@@ -116,6 +119,36 @@ for (const [type, format, native, bytes] of [
     }
   });
 }
+
+test('signed normalized storage features follow its dimension and actual native usage', () => {
+  for (const dimension of ['2d', '2d-array', '3d']) for (const format of [THREE.RedFormat, THREE.RGFormat, THREE.RGBAFormat]) {
+    const {device, owner, texture} = setup();
+    Object.assign(texture, {type: THREE.ByteType, format});
+    if (dimension !== '2d') {
+      texture.image.depth = 3; texture[dimension === '3d' ? 'is3DTexture' : 'isArrayTexture'] = true;
+      texture.wrapR = THREE.ClampToEdgeWrapping;
+    }
+    try {
+      if (dimension === '2d' || format !== THREE.RGBAFormat) {
+        assert.throws(() => owner.captureBinding(write(texture)), /texture-formats-tier1/);
+        assert.throws(() => owner.layoutOf(sample(texture)), /texture-formats-tier1/);
+        assert.throws(() => owner.ensure(owner.capture(texture)), /texture-formats-tier1/);
+        assert.equal(device.textures.length, 0);
+      } else {
+        // Core rgba8snorm storage needs no optional render-attachment feature
+        // for array/volume mip generation: those levels use compute writes.
+        const output = owner.captureBinding(write(texture)), view = owner.resolve(output);
+        assert.equal(view.texture.descriptor.format, 'rgba8snorm');
+        assert.equal(view.texture.descriptor.usage & 8, 8);
+        assert.equal(view.texture.descriptor.usage & 16, 0);
+        owner.written([output]);
+        assert.ok(device.calls.some(call => call[0] === 'dispatch'));
+        assert.equal(owner.layout(owner.captureBinding(sample(texture))).texture.sampleType, 'float');
+        assert.equal(owner.resolve(owner.captureBinding({...write(texture), access: 'readOnly'})), view);
+      }
+    } finally { owner.dispose(); }
+  }
+});
 
 test('sampler changes are captured at call time without replacing storage', () => {
   const {owner, texture} = setup();

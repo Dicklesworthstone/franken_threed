@@ -16,7 +16,8 @@ export class ThreeStorageTextureError extends Error {
 const fail = (code, message) => { throw new ThreeStorageTextureError(code, message); };
 const positive = n => Number.isSafeInteger(n) && n > 0;
 const accessNames = new Map([['readOnly', 'read-only'], ['writeOnly', 'write-only'], ['readWrite', 'read-write']]);
-const tier1StorageFormats = new Set(['r8unorm', 'rg8unorm', 'r16float', 'rg16float']);
+const tier1StorageFormats = new Set(['r8unorm', 'rg8unorm', 'r8snorm', 'rg8snorm', 'r16float', 'rg16float']);
+const snormStorageFormats = new Set(['r8snorm', 'rg8snorm', 'rgba8snorm']);
 
 export function inspectThreeStorageTexture(texture, three) {
   if (typeof three?.Texture !== 'function' || !(texture instanceof three.Texture) || !texture.isStorageTexture)
@@ -32,11 +33,12 @@ export function inspectThreeStorageTexture(texture, three) {
       ![three.NoColorSpace, three.LinearSRGBColorSpace].includes(texture.colorSpace))
     fail('FORMAT', 'Storage textures require linear GPU-authored data and no internal-format override');
   let format, texelBytes, integerType = null;
-  if (texture.type === three.UnsignedByteType || texture.type === three.HalfFloatType) {
+  const signedByte = three.ByteType !== undefined && texture.type === three.ByteType;
+  if (texture.type === three.UnsignedByteType || signedByte || texture.type === three.HalfFloatType) {
     const channel = [[three.RedFormat, 'r', 1], [three.RGFormat, 'rg', 2], [three.RGBAFormat, 'rgba', 4]]
       .find(([source]) => texture.format === source);
-    if (channel) [format, texelBytes] = texture.type === three.UnsignedByteType
-      ? [`${channel[1]}8unorm`, channel[2]] : [`${channel[1]}16float`, channel[2] * 2];
+    if (channel) [format, texelBytes] = texture.type === three.HalfFloatType
+      ? [`${channel[1]}16float`, channel[2] * 2] : [`${channel[1]}8${signedByte ? 'snorm' : 'unorm'}`, channel[2]];
   } else if (texture.type === three.FloatType) {
     if (texture.format === three.RedFormat) [format, texelBytes] = ['r32float', 4];
     else if (texture.format === three.RGFormat) [format, texelBytes] = ['rg32float', 8];
@@ -52,7 +54,7 @@ export function inspectThreeStorageTexture(texture, three) {
       .find(([ordinary, explicit]) => texture.format !== undefined && (texture.format === ordinary || texture.format === explicit));
     if (channels) [format, texelBytes] = [`${channels[2]}32${integerType}`, channels[3]];
   }
-  if (!format) fail('FORMAT', 'Storage color must be R/RG/RGBA8 unorm, 16F or 32-bit float, sint or uint');
+  if (!format) fail('FORMAT', 'Storage color must be R/RG/RGBA8 unorm/snorm, 16F or 32-bit float, sint or uint');
   // r186 StorageArrayTexture/Storage3DTexture omit mipmapsAutoUpdate. Undefined
   // is disabled there; preserve the source object rather than inventing a flag.
   if (typeof texture.generateMipmaps !== 'boolean' ||
@@ -199,10 +201,12 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
       ? entry.proof : null;
   }
   function checkFormat(shape) {
-    // These source formats are filterable images, but storage usage needs
-    // tier1 even for copies and sampled consumers of a StorageTexture.
-    if (tier1StorageFormats.has(shape.format) && !device().features?.has?.('texture-formats-tier1'))
-      fail('FEATURE', 'Compact storage textures require texture-formats-tier1');
+    // R/RG compact storage needs tier1. Core rgba8snorm storage is sufficient
+    // for array/volume compute mips, but our 2D allocation also has render
+    // attachment usage, which requires tier1 for every signed normalized format.
+    const renderSnorm = shape.viewDimension === '2d' && snormStorageFormats.has(shape.format);
+    if ((tier1StorageFormats.has(shape.format) || renderSnorm) && !device().features?.has?.('texture-formats-tier1'))
+      fail('FEATURE', 'Compact or signed normalized storage requires texture-formats-tier1 for this usage');
   }
   function checkExtent(shape) {
     const d = device(), {width, height, depth, viewDimension} = shape;
@@ -272,6 +276,9 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     const access = accessNames.get(binding.access), mipLevel = binding.mipLevel ?? 0;
     if (!access || !Number.isSafeInteger(mipLevel) || mipLevel < 0 || mipLevel >= entry.shape.mipLevelCount)
       fail('BINDING', 'Expected source storage access and an allocated mip level');
+    // Neither tier1 nor tier2 enables read-write access for these formats.
+    if (snormStorageFormats.has(entry.shape.format) && access === 'read-write')
+      fail('ACCESS', 'Signed normalized storage textures require separate read-only and write-only uses');
     if (tier1StorageFormats.has(entry.shape.format) && access === 'read-write') {
       if (entry.shape.format === 'rg8unorm' || entry.shape.format === 'rg16float')
         fail('ACCESS', 'Two-channel compact storage textures require separate read-only and write-only uses');

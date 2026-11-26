@@ -111,10 +111,10 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
       if (entry.storageTexture) {
         const {access, format, viewDimension} = entry.storageTexture;
         if (access !== 'read-only' || (entry.visibility & ~3) !== 0 ||
-            !/^(?:r|rg|rgba)(?:8unorm|16float|32(?:float|sint|uint))$/.test(format) ||
+            !/^(?:r|rg|rgba)(?:8(?:unorm|snorm)|16float|32(?:float|sint|uint))$/.test(format) ||
             !['2d', '2d-array', '3d'].includes(viewDimension))
           fail('ANIMATION_RENDER_OPTIONS', 'Native graphics storage textures require read-only source color views in vertex or fragment stages');
-        if (['r8unorm', 'rg8unorm', 'r16float', 'rg16float'].includes(format) && !device.features?.has?.('texture-formats-tier1'))
+        if (['r8unorm', 'rg8unorm', 'r8snorm', 'rg8snorm', 'r16float', 'rg16float'].includes(format) && !device.features?.has?.('texture-formats-tier1'))
           fail('ANIMATION_RENDER_OPTIONS', 'Compact graphics storage textures require texture-formats-tier1');
         return {...base, storageTexture: {access, format, viewDimension}};
       }

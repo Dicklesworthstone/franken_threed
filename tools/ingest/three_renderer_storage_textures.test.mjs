@@ -106,6 +106,9 @@ const compactFormats = [
   {type: T.UnsignedByteType, format: T.RGFormat, native: 'rg8unorm'},
   {type: T.HalfFloatType, format: T.RedFormat, native: 'r16float'},
   {type: T.HalfFloatType, format: T.RGFormat, native: 'rg16float'},
+  {type: T.ByteType, format: T.RedFormat, native: 'r8snorm'},
+  {type: T.ByteType, format: T.RGFormat, native: 'rg8snorm'},
+  {type: T.ByteType, format: T.RGBAFormat, native: 'rgba8snorm'},
 ];
 for (const profile of compactFormats) for (const dimension of ['2d', '2d-array', '3d'])
 test(`compact ${profile.native} ${dimension} compute and graphics preserve source shaders and shared storage`, async t => {

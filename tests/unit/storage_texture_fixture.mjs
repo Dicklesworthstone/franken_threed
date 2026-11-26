@@ -1,6 +1,6 @@
 // Command/resource test double. It records GPU work; it does not execute WGSL.
 export const THREE = {REVISION: '186', NoColorSpace: '', LinearSRGBColorSpace: 'srgb-linear', SRGBColorSpace: 'srgb',
-  UnsignedByteType: 1009, HalfFloatType: 1016, FloatType: 1015, RGBAFormat: 1023, RedFormat: 1028, RGFormat: 1030,
+  UnsignedByteType: 1009, ByteType: 1010, HalfFloatType: 1016, FloatType: 1015, RGBAFormat: 1023, RedFormat: 1028, RGFormat: 1030,
   NearestFilter: 1003, LinearFilter: 1006, NearestMipmapNearestFilter: 1004, NearestMipmapLinearFilter: 1005,
   LinearMipmapNearestFilter: 1007, LinearMipmapLinearFilter: 1008, ClampToEdgeWrapping: 1001, RepeatWrapping: 1000, MirroredRepeatWrapping: 1002};
 THREE.Texture = class Texture {

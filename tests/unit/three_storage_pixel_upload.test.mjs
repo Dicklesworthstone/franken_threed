@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createStorageTextureTransfers, inspectStoragePixelRegion} from '../../tools/ingest/three_storage_texture_transfer.mjs';
 import {deferred} from './storage_texture_fixture.mjs';
-import {setup, texture, formats, THREE} from './storage_pixel_fixture.mjs';
+import {setup, texture, formats, compactFormats, THREE} from './storage_pixel_fixture.mjs';
 import {withThreeNativeCapture} from '../../tools/ingest/three_node_shadows.mjs';
 
 test('storage uploads and copies reject destinations already sampled by a pending parent draw', async () => {
@@ -65,6 +65,28 @@ test('queued uploads capture bytes/options before caller mutation and interleave
   assert.deepEqual(s.events, ['write', 'copy', 'write']);
   assert.equal(new Uint32Array(s.bytes(a).buffer)[0], 16777217);
   assert.equal(new Uint32Array(s.bytes(b).buffer)[0], 0xffffffff); s.renderer.dispose();
+});
+
+for (const format of compactFormats.filter(value => value[0] === THREE.ByteType))
+test(`queued ${format[2]} uploads, copies and readbacks retain signed byte extrema`, async t => {
+  const s = setup({features: ['texture-formats-tier1']}), a = texture('2d', 3, 2, 1, format), b = texture('2d', 3, 2, 1, format);
+  t.after(() => s.renderer.dispose());
+  const backing = new Int8Array(3 * 2 * format[3] + 2), input = backing.subarray(1, -1);
+  input.set(Array.from({length: input.length}, (_, i) => [-128, -127, -1, 0, 1, 127][i % 6]));
+  const first = new Uint8Array(input.buffer, input.byteOffset, input.byteLength).slice();
+  s.renderer._preparing = true;
+  const before = s.renderer.writeStorageTexturePixelsAsync(a, input);
+  before.catch(() => {});
+  s.renderer.copyTextureToTexture(a, b);
+  input.fill(-37);
+  const after = s.renderer.writeStorageTexturePixelsAsync(a, input);
+  input.fill(99); structuredClone(backing.buffer, {transfer: [backing.buffer]});
+  assert.equal(s.device.textures.length, 0);
+  s.renderer.flush(); await Promise.all([before, after]);
+  assert.deepEqual(s.events, ['write', 'copy', 'write']);
+  assert.deepEqual(await s.renderer.readStorageTexturePixelsAsync(b), first);
+  assert.deepEqual([...new Int8Array((await s.renderer.readStorageTexturePixelsAsync(a)).buffer)], Array(first.length).fill(-37));
+  assert.equal(s.device.textures.length, 2);
 });
 
 for (const dim of ['2d-array', '3d']) test(`manual ${dim} mips use correct depth and preserve base level`, async () => {
