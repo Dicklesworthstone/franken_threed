@@ -7,7 +7,7 @@ function setup({format = 'rgba8unorm', width = 3, height = 2, completion = null,
   cube = false, array = false, volume = false, layers = cube ? 6 : 1, mipLevelCount = 1, generateMipmaps = false,
   colorFormats = null, colorMipLevelCounts = null, colorGenerateMipmaps = null} = {}) {
   const calls = [], textures = (colorFormats ?? [format]).map((format, colorIndex) => {
-    const bpp = {rgba8unorm: 4, 'rgba8unorm-srgb': 4, r16float: 2, rg16float: 4, rgba16float: 8,
+    const bpp = {r8unorm: 1, rg11b10ufloat: 4, rgba8unorm: 4, 'rgba8unorm-srgb': 4, r16float: 2, rg16float: 4, rgba16float: 8,
       r32float: 4, rg32float: 8, rgba32float: 16, r32uint: 4, rg32uint: 8, rgba32uint: 16,
       r32sint: 4, rg32sint: 8, rgba32sint: 16}[format];
     const texture = {width, height, bpp, levels: Array.from({length: colorMipLevelCounts?.[colorIndex] ?? mipLevelCount}, (_, mip) => {
@@ -121,6 +121,39 @@ test('R16F copies permit two-byte offsets and encode only legal native row strid
   }
 });
 
+
+for (const [format, bpp] of [['r8unorm', 1], ['rg11b10ufloat', 4]])
+  test(`${format}: compact compute rows preserve raw bytes, offsets and explicit flipY`, async () => {
+    for (const bytesPerRow of [3 * bpp, 5 * bpp, 256]) for (const flipY of [false, true]) {
+      const s = setup({format}), offset = bpp;
+      const values = new Uint8Array(Math.ceil((offset + bytesPerRow + 3 * bpp) / 4) * 4).fill(0xad);
+      const row0 = Uint8Array.from({length: 3 * bpp}, (_, i) => [0, 255, 128, 127, 1, 254, 0x34, 0x12][i % 8]);
+      const row1 = Uint8Array.from({length: 3 * bpp}, (_, i) => [0xff, 0xff, 0xff, 0xff, 0, 0, 0x80, 0x7f][i % 8]);
+      values.set(row0, offset); values.set(row1, offset + bytesPerRow);
+      const before = values.slice();
+      await copyComputeBufferToTarget(s.device, s.source(values), s.targets, s.destination, {offset, bytesPerRow, flipY});
+      assert.deepEqual(s.texture.data, new Uint8Array(flipY ? [...row1, ...row0] : [...row0, ...row1]));
+      assert.deepEqual(values, before);
+      const copies = s.calls.filter(call => call[0] === 'copy');
+      assert.deepEqual(copies.map(call => [call[1], call[2]]), !flipY && bytesPerRow === 256
+        ? [[offset, 256]] : [[offset + (flipY ? bytesPerRow : 0), undefined], [offset + (flipY ? 0 : bytesPerRow), undefined]]);
+      assert.equal(s.calls.filter(call => call[0] === 'submit').length, 1);
+      assert.equal(s.destination.depthDirty, false);
+    }
+  });
+
+test('compact target copies validate exact byte bounds and packed-word alignment before native work', () => {
+  for (const [format, bpp] of [['r8unorm', 1], ['rg11b10ufloat', 4]]) {
+    const s = setup({format}), buffer = s.source(new Uint8Array(8 * bpp));
+    for (const options of [{offset: 3 * bpp}, {bytesPerRow: 2 * bpp}, {offset: 0.5},
+      ...(bpp === 4 ? [{offset: 2}, {bytesPerRow: 14}] : [])])
+      assert.throws(() => copyComputeBufferToTarget(s.device, buffer, s.targets, s.destination, options), /BOUNDS|LAYOUT/);
+    assert.throws(() => copyComputeBufferToTarget(s.device, {...buffer, size: 6 * bpp - 1}, s.targets, s.destination), /BOUNDS/);
+    assert.equal(inspectComputeTextureCopy(6 * bpp, s.destination.shape).bytesPerRow, 3 * bpp);
+    assert.equal(s.ensureCount, 0); assert.equal(s.calls.length, 0);
+  }
+});
+
 for (const format of ['r32uint', 'rg32uint', 'rgba32uint', 'r32sint', 'rg32sint', 'rgba32sint'])
   test(`${format}: compute bytes reach only the selected MRT attachment without integer conversion`, async () => {
     const s = setup({colorFormats: ['rgba8unorm', format]}), selected = s.textures[1];
@@ -160,11 +193,26 @@ test('attachment selectors, byte bounds, mips and generation fail before native 
   assert.equal(s.ensureCount, 0); assert.equal(s.calls.length, 0); assert.equal(s.destination.dirtyColors.size, 0);
 });
 
-test('production source and native target owners expose the copied integer attachment without a replica', async t => {
+for (const [format, sourceFormat, sourceType, bpp, sampleType] of [
+  ['rgba32uint', 'RGBAIntegerFormat', 'UnsignedIntType', 16, 'uint'],
+  ['r8unorm', 'RedFormat', 'UnsignedByteType', 1, 'float'],
+  ['rg11b10ufloat', 'RGBFormat', 'UnsignedInt101111Type', 4, 'float'],
+]) test(`${format}: production source and native target owners expose raw compute output without a replica`, async t => {
   const T = await import('../../upstream/three.js/build/three.webgpu.js');
   const {createThreeRenderTargets} = await import('../../tools/ingest/three_render_targets.mjs');
   const {mrtTransferDevice} = await import('../../tools/ingest/fixtures/mrt_transfer_fixture.mjs');
   const f = mrtTransferDevice(), copies = [], encode = f.device.createCommandEncoder;
+  // The recorder's compact byte planes are independent of product format admission.
+  const createTexture = f.device.createTexture;
+  f.device.createTexture = descriptor => {
+    const texture = createTexture(descriptor);
+    if (descriptor.format === 'r8unorm') {
+      texture.bpp = 1;
+      texture.planes = texture.planes.map(planes => planes.map(plane => new Uint8Array(plane.length / 4)));
+    }
+    return texture;
+  };
+  f.device.features = new Set();
   // Extend the existing independent byte recorder with buffer-to-texture copies.
   // Source and native target allocation, attachment borrowing and sampling stay real.
   f.device.createCommandEncoder = () => {
@@ -184,17 +232,23 @@ test('production source and native target owners expose the copied integer attac
     }, finish() { const command = encoder.finish(); command.commands.push(...pending); return command; }};
   };
   const target = new T.RenderTarget(3, 2, {count: 2, depthBuffer: false});
-  Object.assign(target.textures[1], {format: T.RGBAIntegerFormat, type: T.UnsignedIntType});
+  Object.assign(target.textures[1], {format: T[sourceFormat], type: T[sourceType]});
   const owner = createThreeRenderTargets(T, {getDevice: () => f.device, flipY: false});
   t.after(() => { owner.dispose(); target.dispose(); });
+  if (format === 'rg11b10ufloat') {
+    assert.throws(() => owner.capture(target), /rg11b10ufloat-renderable/);
+    assert.equal(f.calls.textures.length, 0);
+    f.device.features.add('rg11b10ufloat-renderable');
+  }
   const entry = owner.capture(target), sample = owner.captureNativeTexture(target.textures[1]);
-  const words = Uint32Array.from({length: 24}, (_, i) => [0xffffffff, 0x01000001, 0x80000001, 0][i % 4]);
+  const words = Uint32Array.from({length: Math.ceil(6 * bpp / 4)}, (_, i) => [0xffffffff, 0x01000001, 0x80000001, 0][i % 4]);
   await copyComputeBufferToTarget(f.device, {size: words.byteLength, usage: 4 | 128, data: words.buffer}, owner, entry, {colorIndex: 1});
   owner.withNativeTexture(sample, texture => {
-    assert.equal(texture, copies[0].destination.texture); assert.equal(texture.format, 'rgba32uint');
-    assert.deepEqual(new Uint32Array(texture.planes[0][0].buffer), words);
+    assert.equal(texture, copies[0].destination.texture); assert.equal(texture.format, format);
+    assert.deepEqual(texture.planes[0][0], new Uint8Array(words.buffer, 0, 6 * bpp));
   });
-  assert.equal(sample.sampleType, 'uint'); assert.equal(f.calls.textures.length, 2);
+  assert.equal(sample.sampleType, sampleType); assert.equal(f.calls.textures.length, 2);
+  assert.equal(f.device.features.has('float32-filterable'), false);
   assert.ok(f.calls.textures[0].planes[0][0].every(byte => byte === 0));
   assert.equal(entry.sample, null); assert.equal(f.calls.buffers.length, 0); assert.equal(f.uploads.length, 0);
   await owner.whenIdle();
@@ -321,14 +375,14 @@ test('layout validation rejects unsafe integer overflow', () => {
     {offset: Number.MAX_SAFE_INTEGER - 15, bytesPerRow: 32}), /BOUNDS/);
 });
 
-for (const format of ['rgba8unorm', 'rgba16float', 'rgba32float'])
+for (const format of ['r8unorm', 'rg11b10ufloat', 'rgba8unorm', 'rgba16float', 'rgba32float'])
   for (const dimension of ['cube', 'array', 'volume']) for (const flipY of [false, true])
     test(`${format}/${dimension}/flip=${flipY}: GPU bytes fill an authored mip slice without touching other subresources`, async () => {
       const layers = dimension === 'cube' ? 6 : 8, face = dimension === 'volume' ? 3 : layers - 1;
       const s = setup({format, width: 15, height: 11, layers, mipLevelCount: 4, [dimension]: true});
       const bpp = s.texture.data.byteLength / (15 * 11 * layers);
-      const words = Uint32Array.from({length: 6 * bpp / 4}, (_, i) => [0x80000000, 0x7fc01234, 0xff800000, 0x3f800001][i % 4]);
-      const input = new Uint8Array(words.buffer), before = input.slice();
+      const words = Uint32Array.from({length: Math.ceil(6 * bpp / 4)}, (_, i) => [0x80000000, 0x7fc01234, 0xff800000, 0x3f800001][i % 4]);
+      const input = new Uint8Array(words.buffer, 0, 6 * bpp), before = input.slice();
       await copyComputeBufferToTarget(s.device, s.source(input), s.targets, s.destination,
         {destinationMipLevel: 1, face, x: 1, y: 1, width: 2, height: 2, offset: bpp, bytesPerRow: 3 * bpp, flipY});
       for (const [mip, level] of s.texture.levels.entries())

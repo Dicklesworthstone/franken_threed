@@ -3,6 +3,7 @@
  * Aligned rows use one copy; tight unaligned rows (or flipY) use row copies in
  * one command buffer. Selected MRT attachments, authored mips and cube/array/
  * volume slices share the normal owner's allocation, mips and sampling invalidation.
+ * R8 copies one byte per texel; packed R11G11B10 copies one raw 32-bit word.
  * Native coordinates are top-left. This is an explicit F3D extension, not an
  * implementation claim for upstream texture-backed TSL compute bindings. */
 import {gpuTargetColorFormat} from './gpu_target_transfer.mjs';
@@ -14,7 +15,8 @@ export class GpuComputeTextureCopyError extends Error {
   }
 }
 const fail = (code, message) => { throw new GpuComputeTextureCopyError(code, message); };
-const TEXEL_BYTES = new Map([['rgba8unorm', 4], ['rgba8unorm-srgb', 4],
+const TEXEL_BYTES = new Map([['r8unorm', 1], ['rg11b10ufloat', 4],
+  ['rgba8unorm', 4], ['rgba8unorm-srgb', 4],
   ['r16float', 2], ['rg16float', 4], ['rgba16float', 8],
   ['r32float', 4], ['rg32float', 8], ['rgba32float', 16],
   ['r32uint', 4], ['rg32uint', 8], ['rgba32uint', 16],
@@ -30,7 +32,7 @@ export function inspectComputeTextureCopy(byteLength, target, options = {}) {
   const {colorIndex = 0, destinationMipLevel = 0} = options;
   const texelBytes = TEXEL_BYTES.get(gpuTargetColorFormat(target, colorIndex, fail));
   if (!texelBytes || target.sampleCount !== 1)
-    fail('TARGET', 'Expected a single-sample RGBA8 or R/RG/RGBA 16F/32F/32I/32UI color attachment');
+    fail('TARGET', 'Expected single-sample R8/RGBA8, packed RGB11F or R/RG/RGBA 16F/32F/32I/32UI color storage');
   const mipLevelCount = target.colorMipLevelCounts?.[colorIndex] ?? target.mipLevelCount ?? 1;
   if (!integer(destinationMipLevel) || !integer(mipLevelCount) || mipLevelCount < 1 || destinationMipLevel >= mipLevelCount)
     fail('LEVEL', 'Destination mip level is not allocated');
