@@ -247,11 +247,14 @@ function scoped(device, operation) {
   device.pushErrorScope('validation'); device.pushErrorScope('out-of-memory');
   let value, error;
   try { value = operation(); } catch (caught) { error = caught; }
-  const errors = Promise.all([device.popErrorScope(), device.popErrorScope()]).then(results => {
-    const reported = results.find(Boolean);
-    if (error) throw error;
-    if (reported) fail('ANIMATION_GPU_DEVICE', reported.message || 'WebGPU operation failed');
-  });
+  const scopes = [device.popErrorScope(), device.popErrorScope()];
+  // Recognize each failed report independently so it can release allocations
+  // and reject completion while another native scope is still unresolved.
+  const errors = Promise.all([error ? Promise.reject(error) : null,
+    ...scopes.map(scope => Promise.resolve(scope).then(reported => {
+      if (reported) fail('ANIMATION_GPU_DEVICE', reported.message || 'WebGPU operation failed');
+    })),
+  ]).then(() => {});
   return {value, errors, error};
 }
 

@@ -156,6 +156,68 @@ test('validation failures wait for pending work before releasing uniforms and ev
   assert.equal(f.pipelines.length, 2);
 });
 
+for (const failedScope of ['validation', 'out-of-memory'])
+  test(`${failedScope} failure drains submitted depth work without waiting for its sibling scope`, async () => {
+    const f = depthDevice(), {source, destination} = targets(f);
+    await Promise.all([source.validation, destination.validation]);
+    const sibling = deferred(), fence = deferred(), pop = f.device.popErrorScope;
+    f.control.fence = fence.promise;
+    f.device.popErrorScope = () => f.scopes.pop() === failedScope
+      ? Promise.resolve({message: 'depth copy refused'}) : sibling.promise;
+    destination.copyDepthFrom(source, {maxInFlightBytes: 32});
+    f.device.popErrorScope = pop;
+    let outcome = null;
+    const pending = destination.whenIdle().then(value => { outcome = {value}; }, error => { outcome = {error}; });
+    try {
+      await flush();
+      assert.equal(outcome, null, 'submitted work must retain its completion fence');
+      assert.equal(f.buffers[0].destroyCount, 0);
+      assert.throws(() => source.copyDepthFrom(destination, {maxInFlightBytes: 32}), code('BUDGET'));
+      fence.resolve(); await flush();
+      assert.equal(outcome?.error?.code, 'GPU_DEPTH_TRANSFER_GPU');
+      assert.match(outcome.error.message, /depth copy refused/);
+      assert.equal(f.buffers[0].destroyCount, 1);
+      assert.equal(f.scopes.length, 0);
+      const next = targets(f);
+      try {
+        next.destination.copyDepthFrom(next.source, {maxInFlightBytes: 32});
+        await next.destination.whenIdle();
+        assert.equal(f.pipelines.length, 2, 'the rejected pipeline is not reused');
+        assert.ok(f.buffers.every(buffer => buffer.destroyCount === 1));
+      } finally { next.source.dispose(); next.destination.dispose(); }
+      sibling.reject(new Error('late sibling failure')); await flush();
+      assert.ok(f.buffers.every(buffer => buffer.destroyCount === 1));
+    } finally {
+      f.device.popErrorScope = pop; sibling.resolve(null); fence.resolve(); await pending;
+      source.dispose(); destination.dispose();
+    }
+  });
+
+test('a synchronous depth-copy failure releases unsubmitted work despite stalled scopes', async () => {
+  const f = depthDevice(), {source, destination} = targets(f);
+  await Promise.all([source.validation, destination.validation]);
+  const sibling = deferred(), pop = f.device.popErrorScope;
+  f.device.popErrorScope = () => { f.scopes.pop(); return sibling.promise; };
+  f.control.fault = 'group';
+  destination.copyDepthFrom(source, {maxInFlightBytes: 32});
+  f.device.popErrorScope = pop;
+  let outcome = null;
+  const pending = destination.whenIdle().then(value => { outcome = {value}; }, error => { outcome = {error}; });
+  try {
+    await flush();
+    assert.match(outcome?.error?.message ?? '', /injected group/);
+    assert.equal(f.submissions.length, 0);
+    assert.equal(f.buffers[0].destroyCount, 1);
+    assert.equal(f.scopes.length, 0);
+    sibling.reject(new Error('late scope failure')); await flush();
+    assert.match(outcome.error.message, /injected group/);
+    assert.equal(f.buffers[0].destroyCount, 1);
+  } finally {
+    f.device.popErrorScope = pop; sibling.resolve(null); await pending;
+    source.dispose(); destination.dispose();
+  }
+});
+
 for (const stage of ['shader', 'pipeline', 'buffer', 'write', 'group', 'encoder', 'begin', 'draw', 'end', 'finish', 'submit', 'pop', 'fence']) {
   test(`native depth copy cleans up and reports ${stage} failure`, async () => {
     const f = depthDevice(), {source, destination} = targets(f);

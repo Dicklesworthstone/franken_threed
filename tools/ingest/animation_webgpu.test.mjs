@@ -453,6 +453,54 @@ test("allocation validation errors fail initialization and release all buffers",
   assert.equal(device.scopes.length, 0);
 });
 
+for (const failedScope of ["validation", "out-of-memory"])
+  test(`${failedScope} rejects animation initialization without waiting for another scope or pipeline`, async () => {
+    const device = deviceSpy(), pose = scene(), sibling = deferred(), cache = createGpuAnimationDeformerCache(device);
+    device.pipelineGate = deferred();
+    device.popErrorScope = () => device.scopes.pop() === failedScope
+      ? Promise.resolve({message: "allocation refused"}) : sibling.promise;
+    let outcome = null;
+    const pending = createGpuAnimationDeformer(device, pose, geometry(), {cache})
+      .then(value => { outcome = {value}; }, error => { outcome = {error}; });
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(outcome?.error?.code, "ANIMATION_GPU_DEVICE");
+      assert.match(outcome.error.message, /allocation refused/);
+      assert.equal(device.scopes.length, 0);
+      assert.equal(device.submissions.length, 0);
+      assert.ok(device.buffers.every(buffer => buffer.destroyed === 1));
+      assert.equal(cache.entries, 0); assert.equal(cache.bytes, 0);
+      assert.equal(pose.disposed, false);
+      sibling.reject(new Error("late scope failure"));
+      device.pipelineGate.reject(new Error("late pipeline failure"));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.ok(device.buffers.every(buffer => buffer.destroyed === 1));
+    } finally {
+      sibling.resolve(null); device.pipelineGate.resolve(); await pending;
+      outcome?.value?.dispose(); pose.dispose();
+    }
+  });
+
+test("a synchronous animation allocation failure is not hidden behind stalled scopes", async () => {
+  const device = deviceSpy(), pose = scene(), sibling = deferred(), failure = new Error("shader creation failed");
+  device.createShaderModule = () => { throw failure; };
+  device.popErrorScope = () => { device.scopes.pop(); return sibling.promise; };
+  let outcome = null;
+  const pending = createGpuAnimationDeformer(device, pose, geometry())
+    .then(value => { outcome = {value}; }, error => { outcome = {error}; });
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(outcome?.error, failure);
+    assert.equal(device.submissions.length, 0); assert.equal(device.scopes.length, 0);
+    assert.ok(device.buffers.every(buffer => buffer.destroyed === 1));
+    sibling.reject(new Error("late scope failure"));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(outcome.error, failure);
+  } finally {
+    sibling.resolve(null); await pending; outcome?.value?.dispose(); pose.dispose();
+  }
+});
+
 test("asynchronous update validation errors are surfaced by whenIdle and latched", async () => {
   const device = deviceSpy(),
     gpu = await createGpuAnimationDeformer(device, scene(), geometry());
@@ -463,6 +511,33 @@ test("asynchronous update validation errors are surfaced by whenIdle and latched
   assert.throws(() => gpu.update(), code("ANIMATION_GPU_DEVICE"));
   gpu.dispose();
 });
+
+for (const failedScope of ["validation", "out-of-memory"])
+  test(`${failedScope} rejects animation completion without waiting for its sibling scope`, async () => {
+    const device = deviceSpy(), pose = scene(), gpu = await createGpuAnimationDeformer(device, pose, geometry());
+    const sibling = deferred();
+    device.completionGate = deferred();
+    device.popErrorScope = () => device.scopes.pop() === failedScope
+      ? Promise.resolve({message: "dispatch refused"}) : sibling.promise;
+    gpu.update();
+    let outcome = null;
+    const pending = gpu.whenIdle().then(value => { outcome = {value}; }, error => { outcome = {error}; });
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(outcome?.error?.code, "ANIMATION_GPU_DEVICE");
+      assert.match(outcome.error.message, /dispatch refused/);
+      assert.equal(gpu.failed, true);
+      assert.throws(() => gpu.update(), code("ANIMATION_GPU_DEVICE"));
+      assert.ok(device.buffers.every(buffer => buffer.destroyed === 1));
+      assert.equal(device.scopes.length, 0);
+      sibling.reject(new Error("late scope failure")); device.completionGate.resolve();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.ok(device.buffers.every(buffer => buffer.destroyed === 1));
+    } finally {
+      sibling.resolve(null); device.completionGate.resolve(); await pending;
+      gpu.dispose(); pose.dispose();
+    }
+  });
 
 test("synchronous encoder failure does not publish new submission state", async () => {
   const device = deviceSpy(),

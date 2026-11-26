@@ -209,11 +209,13 @@ export function submitGpuDepthCopy(device, texture, depthView, plan) {
       catch (error) { remember(error); }
     }
   }
-  const checked = Promise.all(scopes).then(errors => {
-    if (failed) throw failure;
-    const error = errors.find(Boolean);
-    if (error) throw new GpuDepthTransferError('GPU', error.message ?? 'Depth copy validation failed');
-  });
+  // A known failure must not wait for a sibling scope. Retirement still joins
+  // the submission fence below, including when validation rejects first.
+  const checked = Promise.all([failed ? Promise.reject(failure) : null,
+    ...scopes.map(scope => scope.then(error => {
+      if (error) throw new GpuDepthTransferError('GPU', error.message ?? 'Depth copy validation failed');
+    })),
+  ]);
   const validation = Promise.all([cached?.validation, checked]).then(() => {});
   if (cached) {
     cached.validation = validation;
