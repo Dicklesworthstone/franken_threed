@@ -348,10 +348,10 @@ export function stripCssComments(css) {
  * @param {string} cssContent
  * @returns {string[]} Deduplicated list of relative URLs
  */
-export function extractRelativeCssUrls(cssContent, documentRoot = null) {
+export function extractRelativeCssUrls(cssContent, documentRoot = null, options = {}) {
   if (!cssContent || typeof cssContent !== "string") return [];
   const urls = new Set();
-  for (const { url } of cssResources(cssContent)) {
+  for (const { url } of cssResources(cssContent, options)) {
     if (isDocumentResourceUrl(url, documentRoot)) urls.add(url);
   }
 
@@ -1077,7 +1077,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     const importMap = parsedHtml.importMap;
     const { effectiveBaseDir } = resolveBaseDetails(parsedHtml.baseHref, entryDir, entryBaseUrl, documentRoot);
     const importedStrings = createImportedStringResolver({
-      readModule: url => url.startsWith("file:") && path.extname(urlToFilePath(url)).toLowerCase() !== ".json" &&
+      readModule: url => url.startsWith("file:") && ![".json", ".css"].includes(path.extname(urlToFilePath(url)).toLowerCase()) &&
         commonjsFormat(url, moduleSources) === "module" ? moduleSources.read(url).code : null,
       resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, importMap, {
         target, mapBaseUrl: parsedHtml.baseUrl, documentRoot,
@@ -1328,7 +1328,8 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         runtimeFiles.add(srcAssetAbs);
       }
 
-      const javascript = !item.modelResource && item.moduleType !== "json" && path.extname(srcAssetAbs).toLowerCase() !== ".json" &&
+      const javascript = !item.modelResource && !["json", "css"].includes(item.moduleType) &&
+        ![".json", ".css"].includes(path.extname(srcAssetAbs).toLowerCase()) &&
         (item.isModuleSpecifier || /\.(?:mjs|cjs|js)$/.test(srcAssetAbs));
       // Retained scripts must use the same frontend output as bundled imports.
       // URL variants can share a physical output only when their bytes agree.
@@ -1367,11 +1368,15 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         }
       }
 
-      // If asset is a CSS file, scan for transitive child url() and @import resources
-      if (!item.modelResource && srcAssetAbs.endsWith(".css") && !visitedCssPaths.has(srcAssetAbs)) {
-        visitedCssPaths.add(srcAssetAbs);
+      // A CSS module keeps its native constructed-sheet behavior: @import is
+      // never a fetched dependency. A separate ordinary stylesheet use of the
+      // same URL still traverses its complete stylesheet graph.
+      const cssIdentity = `${item.isModuleSpecifier ? "module:" : "stylesheet:"}${srcAssetAbs}`;
+      const cssGoal = !item.isModuleSpecifier || !item.moduleType || ["css", "unknown"].includes(item.moduleType);
+      if (!item.modelResource && cssGoal && path.extname(srcAssetAbs).toLowerCase() === ".css" && !visitedCssPaths.has(cssIdentity)) {
+        visitedCssPaths.add(cssIdentity);
         const cssContent = assetData.toString("utf-8");
-        const childUrls = extractRelativeCssUrls(cssContent, documentRoot);
+        const childUrls = extractRelativeCssUrls(cssContent, documentRoot, {ignoreImports: item.isModuleSpecifier === true});
         const cssDir = path.dirname(srcAssetAbs);
         for (const childUrl of childUrls) {
           assetQueue.push({

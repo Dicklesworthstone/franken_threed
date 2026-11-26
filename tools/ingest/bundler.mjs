@@ -25,6 +25,7 @@ import { transformThreePostProcessing } from "./postprocessing_contracts.mjs";
 import { transformThreeGpuComputation } from "./gpu_computation_contracts.mjs";
 import { analyzeDocumentFetch, collectDocumentFetchAssets } from "./document_fetch_assets.mjs";
 import { gltfAssetUris } from "./pack_gltf.mjs";
+import { cssResources } from "./css_resources.mjs";
 import { collectThreeLoaderAssets, findThreeLoaderRequests } from "./three_loader_assets.mjs";
 import { prepareUsdAssetUris } from "./pack_usd.mjs";
 import {
@@ -148,7 +149,7 @@ export function f3dRollupPlugin(options = {}) {
   const resourceSnapshots = compilerResourceSnapshots.has(options._resourceSourceSnapshots)
     ? options._resourceSourceSnapshots : null;
   const importedStrings = createImportedStringResolver({
-    readModule: url => url.startsWith('file:') && path.extname(urlToFilePath(url)).toLowerCase() !== '.json' &&
+    readModule: url => url.startsWith('file:') && !['.json', '.css'].includes(path.extname(urlToFilePath(url)).toLowerCase()) &&
       commonjsFormat(url, moduleSources) === 'module' ? moduleSources.read(url).code : null,
     resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, inlineModules.has(from) ? mapBaseUrl : from, importMap, {
       target, mapBaseUrl, documentRoot, _moduleSources: moduleSources, packageRootUrl: options.packageRootUrl,
@@ -158,6 +159,9 @@ export function f3dRollupPlugin(options = {}) {
   const emittedChunksByUrl = new Map();
   const emittedJsonByUrl = new Map();
   const emittedJsonTargets = new Set();
+  const emittedCssByUrl = new Map();
+  const emittedCssTargets = new Set();
+  const emittedCssAssets = new Map();
   const dynamicChunkRefIds = new Set();
   const moduleAssetRefIds = new Set();
   const documentAssets = new Map();
@@ -209,6 +213,49 @@ export function f3dRollupPlugin(options = {}) {
     const target = "./" + fileName.split("/").map(encodeURIComponent).join("/");
     emittedJsonByUrl.set(url, target);
     emittedJsonTargets.add(target);
+    return target;
+  }
+
+  function emitCssModule(context, url, processCss = true) {
+    const identity = JSON.stringify([url, processCss]);
+    if (emittedCssByUrl.has(identity)) return emittedCssByUrl.get(identity);
+    const filename = urlToFilePath(url), original = fs.readFileSync(filename);
+    let source = original;
+    // Keep a MIME mismatch native: type:'css' cannot turn a .js/.json resource
+    // into a stylesheet. Correct CSS modules retain browser parsing, adoption,
+    // mutable sheet identity, and ignored @import rules. A known non-CSS goal
+    // fails before stylesheet parsing, so its assets must not be traversed.
+    if (processCss && path.extname(filename).toLowerCase() === '.css') {
+      const css = original.toString('utf8'), replacements = [];
+      for (const resource of cssResources(css, {ignoreImports: true})) {
+        if (!isRelativeUrl(resource.url) && !(documentRoot && isRootRelativeDocumentUrl(resource.url))) continue;
+        const assetUrl = resolveDocumentUrl(resource.url, url, documentRoot);
+        if (!assetUrl.startsWith('file:')) continue;
+        let target = emittedCssAssets.get(assetUrl);
+        if (!target) {
+          const assetPath = urlToFilePath(assetUrl), bytes = fs.readFileSync(assetPath);
+          const hash = createHash('sha256').update(assetUrl).update('\0').update(bytes).digest('hex');
+          const fileName = `assets/f3d-css-resource-${hash}${path.extname(assetPath)}`;
+          context.emitFile({type: 'asset', fileName, source: bytes, originalFileName: assetPath});
+          const parsed = new URL(assetUrl);
+          target = './' + encodeURIComponent(path.posix.basename(fileName)) + parsed.search + parsed.hash;
+          emittedCssAssets.set(assetUrl, target);
+        }
+        replacements.push({...resource, value: resource.kind === 'image-set'
+          ? JSON.stringify(target) : `url(${JSON.stringify(target)})`});
+      }
+      let output = css;
+      for (const {start, end, value} of replacements.reverse()) output = output.slice(0, start) + value + output.slice(end);
+      if (replacements.length) source = Buffer.from(output);
+    }
+    // Rollup keys external modules by ID, without the native module goal. Keep
+    // conflicting static goals separate even when their resource bytes match.
+    const hash = createHash('sha256').update(identity).update('\0').update(source).digest('hex');
+    const fileName = `assets/f3d-css-${hash}${path.extname(filename)}`;
+    const target = './' + fileName.split('/').map(encodeURIComponent).join('/');
+    if (!emittedCssTargets.has(target)) context.emitFile({type: 'asset', fileName, source, originalFileName: filename});
+    emittedCssByUrl.set(identity, target);
+    emittedCssTargets.add(target);
     return target;
   }
 
@@ -366,7 +413,7 @@ export function f3dRollupPlugin(options = {}) {
     },
 
     resolveId(source, importer, {attributes = {}} = {}) {
-      if (emittedJsonTargets.has(source)) return {id: source, external: true, attributes};
+      if (emittedJsonTargets.has(source) || emittedCssTargets.has(source)) return {id: source, external: true, attributes};
       // The require boundary already selected and validated this exact JSON
       // URL. Reapplying browser/import-map replacements could select a second
       // file and break its shared identity with an ordinary ESM import.
@@ -396,16 +443,25 @@ export function f3dRollupPlugin(options = {}) {
       if (importer && retainedModuleUrls.has(resolvedUrl)) {
         // Both retained imports and bundled imports must reach the same browser module.
         // These URLs keep their query/fragment identity and are relative to output chunks.
+        const cssResource = path.extname(urlToFilePath(resolvedUrl)).toLowerCase() === '.css';
+        if (attributes.type === 'css' && !cssResource)
+          return {id: emitCssModule(this, resolvedUrl), external: true, attributes};
+        if (cssResource && attributes.type !== 'css')
+          return {id: emitCssModule(this, resolvedUrl, false), external: true, attributes};
         return { id: retainedModuleUrls.get(resolvedUrl), external: true };
       }
       if (isExternalUrl(resolvedUrl)) {
         return { id: resolvedUrl, external: true };
       }
+      if (importer && attributes.type === "css")
+        return {id: emitCssModule(this, resolvedUrl), external: true, attributes};
       if (importer && (attributes.type === "json" || path.extname(urlToFilePath(resolvedUrl)).toLowerCase() === ".json")) {
         // Untyped .json imports also stay native so missing/invalid attributes
         // cannot accidentally become a successful JavaScript module import.
         return {id: emitJsonModule(this, resolvedUrl), external: true, attributes};
       }
+      if (importer && path.extname(urlToFilePath(resolvedUrl)).toLowerCase() === ".css")
+        return {id: emitCssModule(this, resolvedUrl, false), external: true, attributes};
       return options.commonJS ? commonjsEntry(resolvedUrl, moduleSources) : resolvedUrl;
     },
 
@@ -541,6 +597,25 @@ export function f3dRollupPlugin(options = {}) {
       }
 
       if (ast) {
+        // Rollup merges static requests by specifier before resolveId sees
+        // their attributes. Isolate conflicting CSS requests first, including
+        // wrong-MIME URLs, so their native type errors cannot become successes.
+        const staticRequests = ast.body.filter(node => node.source &&
+          ['ImportDeclaration', 'ExportNamedDeclaration', 'ExportAllDeclaration'].includes(node.type));
+        const otherSpecifiers = new Set(staticRequests.filter(node => classifyImportType(node) !== 'css')
+          .map(node => node.source.value));
+        for (const node of staticRequests) {
+          const specifier = node.source.value;
+          if (!otherSpecifiers.has(specifier) || classifyImportType(node) !== 'css') continue;
+          const resolvedUrl = resolveModuleSpecifier(specifier, referrerUrl, importMap, {
+            target, mapBaseUrl, documentRoot, _moduleSources: moduleSources,
+            allowCommonJS: options.commonJS === true, packageRootUrl: options.packageRootUrl,
+          });
+          if (isExternalUrl(resolvedUrl)) continue;
+          const targetUrl = emitCssModule(this, resolvedUrl);
+          edits.push({type: 'replace', pos: node.source.start, end: node.source.end,
+            priority: 2, text: JSON.stringify(targetUrl)});
+        }
         if (resourceSource === undefined) discoverDocumentResources(this, code, id, referrerUrl, ast);
         const classifyImport = createDynamicImportClassifier(ast, importedStrings(referrerUrl));
         const inspectorImports = new Map(analysis.dynamicImports.filter(request => request.runtime_fallback === true)
@@ -575,19 +650,23 @@ export function f3dRollupPlugin(options = {}) {
                 allowCommonJS: options.commonJS === true,
                 packageRootUrl: options.packageRootUrl,
               });
-              // Untyped JSON also needs an opaque native import expression:
+              // Untyped data modules also need an opaque native import expression:
               // Rollup otherwise merges its attributes with a typed import of
               // the same external asset and suppresses the host's error.
-              if (classified.classification === "literal" && !node.options && moduleType !== "json" &&
-                  (isExternalUrl(resolvedUrl) || path.extname(urlToFilePath(resolvedUrl)).toLowerCase() !== ".json"))
+              if (classified.classification === "literal" && !node.options && !["json", "css"].includes(moduleType) &&
+                  (isExternalUrl(resolvedUrl) || ![".json", ".css"].includes(path.extname(urlToFilePath(resolvedUrl)).toLowerCase())))
                 return;
 
               if (retainedModuleUrls.has(resolvedUrl)) {
                 specifierMap.set(cand, JSON.stringify(retainedModuleUrls.get(resolvedUrl)));
               } else if (isExternalUrl(resolvedUrl)) {
                 specifierMap.set(cand, JSON.stringify(resolvedUrl));
+              } else if (moduleType === "css") {
+                specifierMap.set(cand, JSON.stringify(emitCssModule(this, resolvedUrl)));
               } else if (moduleType === "json" || path.extname(urlToFilePath(resolvedUrl)).toLowerCase() === ".json") {
                 specifierMap.set(cand, JSON.stringify(emitJsonModule(this, resolvedUrl)));
+              } else if (path.extname(urlToFilePath(resolvedUrl)).toLowerCase() === ".css") {
+                specifierMap.set(cand, JSON.stringify(emitCssModule(this, resolvedUrl, moduleType === "unknown")));
               } else {
                 let chunkRefId = emittedChunksByUrl.get(resolvedUrl);
                 if (!chunkRefId) {

@@ -521,8 +521,8 @@ export function classifyImportType(node) {
   }
   const types = attributes.filter((p) => (p.key.name ?? p.key.value) === "type");
   if (!types.length) return "javascript";
-  return types.length === 1 && extractStaticString(tail(types[0].value)) === "json"
-    ? "json" : "unknown";
+  const type = types.length === 1 ? extractStaticString(tail(types[0].value)) : null;
+  return type === "json" || type === "css" ? type : "unknown";
 }
 
 /**

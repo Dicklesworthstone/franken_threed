@@ -43,9 +43,9 @@ function isExternalUrl(url) {
 }
 
 // A module map is keyed by URL AND import type. Keep ordinary JavaScript IDs
-// stable; JSON gets a typed namespace and retains its actual URL separately.
+// stable; native data modules get a typed namespace and retain their actual URL.
 function moduleIdentity(url, type) {
-  return type === "json" && !isExternalUrl(url) ? `json:${url}` : url;
+  return ["json", "css"].includes(type) && !isExternalUrl(url) ? `${type}:${url}` : url;
 }
 
 /**
@@ -168,7 +168,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
   }
 
   const importedStrings = createImportedStringResolver({
-    readModule: url => url.startsWith('file:') && path.extname(urlToFilePath(url)).toLowerCase() !== '.json' &&
+    readModule: url => url.startsWith('file:') && !['.json', '.css'].includes(path.extname(urlToFilePath(url)).toLowerCase()) &&
       commonjsFormat(url, moduleSources) === 'module' ? moduleSources.read(url).code : null,
     resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, importMap, {
       target, mapBaseUrl, documentRoot, _moduleSources: moduleSources, packageRootUrl: options.packageRootUrl,
@@ -197,8 +197,8 @@ export async function buildModuleGraph(entryPath, options = {}) {
     // Keep the requested module type separate from the resource's format.
     // An untyped JSON import must still reach the host's missing-attribute
     // error, rather than a JavaScript frontend or eager syntax failure here.
-    const nativeResource = moduleType === "json" || (!item.isInline &&
-      path.extname(urlToFilePath(sourceUrl)).toLowerCase() === ".json");
+    const nativeResource = ["json", "css"].includes(moduleType) || (!item.isInline &&
+      [".json", ".css"].includes(path.extname(urlToFilePath(sourceUrl)).toLowerCase()));
 
     let sourceCode;
     let sourcePath = null;
@@ -240,14 +240,14 @@ export async function buildModuleGraph(entryPath, options = {}) {
       contentHashMap.set(hash, [moduleId]);
     }
 
-    // Native JSON is data, not executable JavaScript. Keep even invalid lazy
+    // Native JSON/CSS is data, not executable JavaScript. Keep even invalid lazy
     // input unparsed: its rejection belongs to the original import() boundary.
     const sourceFormat = !nativeResource ? commonjsFormat(sourceUrl, moduleSources, {inline: item.isInline}) : 'module';
     const commonJS = sourceFormat !== 'module';
     const analysis = analyzeModuleAst(nativeResource || commonJS ? "" : sourceCode, sourceUrl,
       item.offsets || {}, null, importedStrings(resolutionBaseUrl));
     if (!nativeResource && !commonJS) sourceInputs.set(moduleId, {code: sourceCode, sourceUrl, offsets: item.offsets || {}});
-    if (moduleType === "json") analysis.staticExports.push({type: "default", local_name: null, localName: null});
+    if (["json", "css"].includes(moduleType)) analysis.staticExports.push({type: "default", local_name: null, localName: null});
 
     // Every source-bearing export is also a static module request. Keep it in
     // the same edge list used by route analysis, closure propagation and cycle

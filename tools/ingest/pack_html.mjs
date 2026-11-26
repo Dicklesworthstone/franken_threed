@@ -650,10 +650,11 @@ export function packHtml(
       }
       const types = attributes.filter((p) => (p.key.name ?? p.key.value) === "type");
       if (!types.length) return "javascript";
-      if (types.length !== 1 || literal(result(types[0].value)) !== "json") invalid();
+      const kind = types.length === 1 ? literal(result(types[0].value)) : null;
+      if (kind !== "json" && kind !== "css") invalid();
       // All original options/attribute expressions remain, including side
       // effects and unsupported extra keys that the native importer rejects.
-      return "json";
+      return kind;
     }
     function bind(node, target = bindings) {
       if (!node) return;
@@ -1085,14 +1086,16 @@ export function packHtml(
     if (url.startsWith("data:"))
       fail("DATA_MODULE", "Pre-encoded module sources require the normal build");
     const record = {
-      key: keyFor(url) + (kind === "json" ? "/json" : ""),
+      key: keyFor(url) + (kind === "javascript" ? "" : `/${kind}`),
       source: null,
       original: inline === null ? read(url) : Buffer.from(inline),
       mime: inline === null ? moduleMime(url) : "text/javascript",
     };
     modules.set(identity, record); // Register before traversal, so cycles close by identity.
     record.source = kind === "javascript" && JS_TYPES.has(record.mime)
-      ? javascript(text(record.original), referrer) : record.original;
+      ? javascript(text(record.original), referrer)
+      : kind === "css" && record.mime === "text/css"
+        ? css(text(record.original), url, {ignoreImports: true}) : record.original;
     // The suffix prevents same-byte modules at different source URLs coalescing.
     record.data =
       dataUrl(record.source, record.mime) +
@@ -1100,9 +1103,9 @@ export function packHtml(
       record.key.slice("f3d-packed/".length);
     return record;
   }
-  function css(source, from) {
+  function css(source, from, options = {}) {
     const replacements = [];
-    for (const { start, end, url, kind } of cssResources(source)) {
+    for (const { start, end, url, kind } of cssResources(source, options)) {
       if (!url || url.startsWith("#") || url.startsWith("data:")) continue;
       const embedded = assetFor(local(url, from), kind === "import");
       replacements.push({ start, end, value: kind === "image-set" ? `"${embedded}"`

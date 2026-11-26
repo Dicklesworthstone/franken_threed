@@ -241,12 +241,18 @@ for (const lane of ["document", "worker"]) {
   for (const options of [
     "options", "{...options}", "{with:attrs}", "{with:{...attrs}}",
     "{with:{[key]:'json'}}", "{get with(){return {type:'json'}}}",
-    "{with:{type:kind}}", "{with:{type:'css'}}", "{with:{__proto__:attrs}}",
+    "{with:{type:kind}}", "{with:{type:'unrecognized'}}", "{with:{__proto__:attrs}}",
     "{with:{type:'json'},with:{type:'json'}}",
   ]) test(`${lane}: rejects unproved import attributes: ${options}`, (t) => {
     const f = fixture(t, lane, { "main.mjs": `export const run=()=>import('./settings.json',${options});` });
     assert.throws(() => f.pack(), { code: "IMPORT_ATTRIBUTES" });
     assert.equal(fs.existsSync(f.output), false);
+  });
+
+  test(`${lane}: a CSS import type keeps JSON MIME and the native rejection`, async t => {
+    await equivalent(t, lane, {
+      'main.mjs': `export const run=()=>import('./settings.json',{with:{type:'css'}});`,
+    }, {ok:false,name:'TypeError',code:'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED'});
   });
 }
 
