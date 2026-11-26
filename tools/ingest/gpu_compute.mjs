@@ -85,7 +85,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       ![maxBytes, maxBuffers, maxPipelines].every(positive) ||
       !Number.isSafeInteger(maxCachedBindGroups) || maxCachedBindGroups < 0)
     fail('OPTIONS', 'Expected a GPUDevice, positive resource limits and a nonnegative bind-group cache limit');
-  const buffers = new Map(), pipelines = new Map(), compiled = new Map(), staging = new Set(), pending = new Set();
+  const buffers = new Map(), allocations = new Map(), pipelines = new Map(), compiled = new Map(), staging = new Set(), pending = new Set();
   const preparing = new Set(), dispatchGroups = new Set();
   // The cache owns only a bounded working set. Callers may retain a prepared
   // pipeline beyond eviction; weak admission preserves its use without turning
@@ -108,7 +108,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     bindGroups.clear();
     bindingIds = new WeakMap(); bindingUsers = new WeakMap(); bindingLayouts = new WeakMap();
     for (const entry of [...readbacks.values()]) disposeReadback(entry, terminal);
-    for (const entry of buffers.values()) entry.buffer.destroy();
+    for (const entry of allocations.values()) destroyBuffer(entry);
     for (const buffer of staging) buffer.destroy();
     buffers.clear(); staging.clear(); ready = new WeakSet(); pipelines.clear(); compiled.clear(); preparing.clear(); allocatedBytes = 0;
     signal?.removeEventListener('abort', onAbort);
@@ -182,14 +182,15 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     }) : [[0, size]];
     let entry = old;
     if (replacement) {
-      if (!old && buffers.size >= maxBuffers) fail('BUDGET', 'Compute buffer count exceeds maxBuffers');
+      if ((!old || old.references > 0) && allocations.size >= maxBuffers)
+        fail('BUDGET', 'Compute buffer count exceeds maxBuffers');
       // Charge both generations until the replacement is successfully created.
       budget(size);
       const buffer = checked(() => device.createBuffer({label: 'f3d-compute-buffer', size,
         usage: COPY_SRC | COPY_DST | (uniform ? UNIFORM : STORAGE | INDIRECT | INDEX | VERTEX)}));
-      entry = {buffer, size, bytes, uniform, array: null, version: null};
-      allocatedBytes += size; buffers.set(key, entry);
-      if (old) { invalidateBindings(old.buffer); old.buffer.destroy(); allocatedBytes -= old.size; }
+      entry = {buffer, size, bytes, uniform, array: null, version: null, references: 0, retired: false};
+      allocatedBytes += size; buffers.set(key, entry); allocations.set(buffer, entry);
+      if (old) retireBuffer(old);
     }
     const source = new Uint8Array(array.buffer, array.byteOffset, bytes);
     checked(() => {
@@ -206,12 +207,23 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     else attributeOwner.release(key);
     return entry.buffer;
   }
+  function destroyBuffer(entry) {
+    if (!allocations.delete(entry.buffer)) return;
+    invalidateBindings(entry.buffer);
+    entry.buffer.destroy(); allocatedBytes -= entry.size;
+  }
+  function retireBuffer(entry) {
+    entry.retired = true;
+    invalidateBindings(entry.buffer);
+    // Encoded commands still need a live native buffer when queue.submit()
+    // validates them. Submitted commands already retain their own GPU uses.
+    if (entry.references === 0) destroyBuffer(entry);
+  }
   function release(key) {
     const entry = buffers.get(key);
     if (!entry) return;
     attributeOwner.release(key);
-    invalidateBindings(entry.buffer);
-    buffers.delete(key); entry.buffer.destroy(); allocatedBytes -= entry.size;
+    buffers.delete(key); retireBuffer(entry);
   }
   function bindingId(resource) {
     let id = bindingIds.get(resource);
@@ -407,6 +419,17 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     live();
     let encoder = null, pass = null, state = 'open', failure = null;
     const validations = timestamp ? [] : null;
+    const heldBuffers = new Set();
+    const retainBuffer = buffer => {
+      const entry = allocations.get(buffer);
+      if (entry && !heldBuffers.has(entry)) { heldBuffers.add(entry); entry.references++; }
+    };
+    const releaseBuffers = () => {
+      for (const entry of heldBuffers) {
+        if (--entry.references === 0 && entry.retired) destroyBuffer(entry);
+      }
+      heldBuffers.clear();
+    };
     const open = () => {
       live();
       if (state !== 'open') throw failure ?? new GpuComputeError('GROUP_CLOSED', 'Compute dispatch group has already been submitted');
@@ -417,6 +440,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       failure = error instanceof Error ? error : new GpuComputeError('GROUP_ABORTED', 'Compute dispatch group was aborted before submission');
       dispatchGroups.delete(group);
       encoder = pass = null;
+      releaseBuffers();
       timestamp?.cancel();
     };
     // Each stage owns a complete error-scope interval. The pass may survive an
@@ -444,7 +468,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
           if (!ready.has(pipeline)) fail('PIPELINE', 'Prepare the compute pipeline before dispatch');
           if ((operation?.scope ?? null) !== operationScope)
             fail('GROUP', 'Compute dispatches must retain their group operation scope');
-          let direct = null;
+          let direct = null, indirect = null;
           if (Array.isArray(workgroups)) {
             const limit = device.limits?.maxComputeWorkgroupsPerDimension ?? 65535;
             if (workgroups.length < 1 || workgroups.length > 3 ||
@@ -456,19 +480,22 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
             const entry = [...buffers.values()].find(e => e.buffer === buffer && !e.uniform);
             if (!entry || !Number.isSafeInteger(offset) || offset < 0 || offset % 4 || offset + 12 > entry.bytes)
               fail('DISPATCH', 'Indirect dispatch requires twelve in-bounds bytes of owned storage');
+            indirect = Object.freeze({buffer, offset});
           }
           const snapshots = captureGroups(groups);
+          for (const snapshot of snapshots) for (const buffer of snapshot.resources) retainBuffer(buffer);
+          if (indirect) retainBuffer(indirect.buffer);
           issue(() => {
             const bindings = snapshots.map(snapshot => resolveGroup(pipeline, snapshot));
             beginPass();
             if (operationScope) {
               operationScope.backend.compute(operationScope.context, operation.node, bindings, pipeline,
-                operation.dispatchSize, pass, direct ?? workgroups);
+                operation.dispatchSize, pass, direct ?? indirect);
             } else {
               pass.setPipeline(pipeline);
               for (const {index, group} of bindings) pass.setBindGroup(index, group);
               if (direct) pass.dispatchWorkgroups(...direct);
-              else pass.dispatchWorkgroupsIndirect(workgroups.buffer, workgroups.offset ?? 0);
+              else pass.dispatchWorkgroupsIndirect(indirect.buffer, indirect.offset);
             }
           });
         } catch (error) { abort(error); throw error; }
@@ -485,6 +512,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
           state = 'submitted';
           dispatchGroups.delete(group);
           encoder = pass = null;
+          releaseBuffers();
           if (timestamp && validations.length) timestamp.validate(Promise.all(validations));
         } catch (error) { abort(error); throw error; }
       },
@@ -624,7 +652,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     captureUpload: (key, array, version) => { live(); return attributeOwner.capture(key, array, version); },
     releaseUpload: admission => attributeOwner.releaseCapture(admission),
     getBuffer: key => { live(); return buffers.get(key)?.buffer ?? null; },
-    get allocatedBytes() { return allocatedBytes; }, get bufferCount() { return buffers.size; },
+    get allocatedBytes() { return allocatedBytes; }, get bufferCount() { return allocations.size; },
     get readbackBufferCount() { return readbacks.size; }, get readbackBytes() { return readbackBytes; },
     get cachedBindGroupCount() { return bindGroups.size; },
     get cachedPipelineCount() { return pipelines.size; },

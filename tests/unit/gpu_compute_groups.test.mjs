@@ -16,8 +16,8 @@ function deviceFixture() {
     pushErrorScope() { scopes++; },
     popErrorScope() { assert.ok(scopes > 0); scopes--; return Promise.resolve(null); },
     createBuffer({size, usage}) {
-      const buffer = {size, usage, data: new Uint8Array(size), destroyed: false,
-        destroy() { this.destroyed = true; }};
+      const buffer = {size, usage, data: new Uint8Array(size), destroyed: false, destroyCount: 0,
+        destroy() { this.destroyed = true; this.destroyCount++; }};
       buffers.push(buffer); return buffer;
     },
     createShaderModule: descriptor => descriptor,
@@ -36,6 +36,8 @@ function deviceFixture() {
             // their GPU buffer contents are read only when submitted.
             const selected = pipeline, bindings = new Map(groups);
             commands.push(() => {
+              for (const group of bindings.values()) for (const entry of group.entries)
+                if (entry.resource.buffer) assert.equal(entry.resource.buffer.destroyed, false, 'submitted binding stays alive');
               const dimensions = counts(), buffer = bindings.get(0)?.entries[0]?.resource.buffer;
               const words = buffer ? new Uint32Array(buffer.data.buffer) : null;
               observations.push({code: selected.code, dimensions, words: words ? [...words] : null});
@@ -47,7 +49,10 @@ function deviceFixture() {
           };
           return {setPipeline(value) { pipeline = value; }, setBindGroup(index, value) { groups.set(index, value); },
             dispatchWorkgroups(...counts) { record(() => counts); },
-            dispatchWorkgroupsIndirect(buffer, offset) { record(() => [...new Uint32Array(buffer.data.buffer, offset, 3)]); },
+            dispatchWorkgroupsIndirect(buffer, offset) { record(() => {
+              assert.equal(buffer.destroyed, false, 'submitted indirect arguments stay alive');
+              return [...new Uint32Array(buffer.data.buffer, offset, 3)];
+            }); },
             end() { calls.push('end'); }};
         },
         finish() { calls.push('finish'); return commands; },
@@ -206,4 +211,178 @@ test('disposing the owner prevents submission and cancels each unsubmitted times
   owner.dispose();
   assert.throws(() => group.submit(), /DISPOSED/);
   assert.equal(cancelled, 1); assert.equal(device.calls.includes('submit'), false);
+});
+
+for (const uniform of [false, true])
+test(`queued ${uniform ? 'uniform' : 'storage'} bindings retain replaced allocations until submission`, async t => {
+  const device = deviceFixture(), owner = createGpuCompute(device, {maxBytes: 12, maxBuffers: 2});
+  t.after(() => owner.dispose());
+  const key = {}, first = owner.upload(key, new Uint32Array([7]), 0, {uniform});
+  const pipeline = owner.prepareSync({code: 'empty'}), group = owner.createDispatchGroup();
+  group.dispatch(pipeline, bindings(first), [1]);
+  const second = owner.upload(key, new Uint32Array([11, 13]), 1, {uniform});
+  assert.equal(owner.getBuffer(key), second);
+  assert.equal(first.destroyed, false);
+  assert.equal(owner.allocatedBytes, 12);
+  assert.equal(owner.bufferCount, 2);
+  group.dispatch(pipeline, bindings(second), [1]);
+  group.submit();
+  assert.deepEqual(device.observations.map(row => row.words), [[7], [11, 13]]);
+  assert.equal(first.destroyCount, 1);
+  assert.equal(second.destroyed, false);
+  assert.equal(owner.allocatedBytes, 8);
+  assert.equal(owner.bufferCount, 1);
+  await owner.whenIdle();
+});
+
+test('public release removes storage ownership while every open group retains its recorded buffer', async t => {
+  const device = deviceFixture(), owner = createGpuCompute(device);
+  t.after(() => owner.dispose());
+  const key = {}, buffer = owner.upload(key, new Uint32Array([2]));
+  const add = owner.prepareSync({code: 'add-one'}), double = owner.prepareSync({code: 'double'});
+  const outer = owner.createDispatchGroup(), inner = owner.createDispatchGroup();
+  outer.dispatch(add, bindings(buffer), [1]);
+  outer.dispatch(add, bindings(buffer), [1]);
+  inner.dispatch(double, bindings(buffer), [1]);
+  owner.release(key); owner.release(key);
+  assert.equal(owner.getBuffer(key), null);
+  assert.equal(owner.allocatedBytes, 4);
+  assert.equal(owner.bufferCount, 1);
+  inner.submit();
+  assert.equal(buffer.destroyed, false);
+  assert.deepEqual(words(buffer), [4]);
+  outer.submit();
+  assert.deepEqual(device.observations.map(row => row.words), [[2], [4], [5]]);
+  assert.equal(buffer.destroyCount, 1);
+  assert.equal(owner.allocatedBytes, 0);
+  assert.equal(owner.bufferCount, 0);
+  await owner.whenIdle();
+});
+
+test('indirect-only buffers retain their accepted allocation across replacement and release', async t => {
+  const device = deviceFixture(), owner = createGpuCompute(device);
+  t.after(() => owner.dispose());
+  const key = {}, first = owner.upload(key, new Uint32Array([2, 3, 4]));
+  const pipeline = owner.prepareSync({code: 'empty'}), group = owner.createDispatchGroup();
+  group.dispatch(pipeline, [], {buffer: first, offset: 0});
+  const second = owner.upload(key, new Uint32Array([5, 6, 7, 8]), 1);
+  assert.equal(first.destroyed, false);
+  group.dispatch(pipeline, [], {buffer: second, offset: 4});
+  owner.release(key);
+  assert.equal(second.destroyed, false);
+  assert.equal(owner.allocatedBytes, 28);
+  group.submit();
+  assert.deepEqual(device.observations.map(row => row.dimensions), [[2, 3, 4], [6, 7, 8]]);
+  assert.equal(first.destroyCount, 1); assert.equal(second.destroyCount, 1);
+  assert.equal(owner.allocatedBytes, 0);
+  await owner.whenIdle();
+});
+
+test('retained generations remain charged to both byte and count budgets', async t => {
+  const device = deviceFixture(), owner = createGpuCompute(device, {maxBytes: 12, maxBuffers: 2});
+  t.after(() => owner.dispose());
+  const key = {}, buffer = owner.upload(key, new Uint32Array([1, 2]));
+  const pipeline = owner.prepareSync({code: 'empty'}), group = owner.createDispatchGroup();
+  group.dispatch(pipeline, bindings(buffer), [1]); owner.release(key);
+  assert.throws(() => owner.upload({}, new Uint32Array([1, 2])), /BUDGET/);
+  const secondKey = {}, second = owner.upload(secondKey, new Uint32Array([3]));
+  assert.throws(() => owner.upload(secondKey, new Uint32Array([4, 5])), /BUDGET/);
+  assert.equal(owner.getBuffer(secondKey), second);
+  assert.equal(buffer.destroyed, false);
+  assert.equal(owner.allocatedBytes, 12);
+  group.abort();
+  assert.equal(buffer.destroyCount, 1);
+  assert.equal(owner.allocatedBytes, 4);
+  const replacement = owner.upload(secondKey, new Uint32Array([4, 5]));
+  assert.equal(second.destroyCount, 1); assert.equal(replacement.destroyed, false);
+  await owner.whenIdle();
+
+  const bounded = createGpuCompute(device, {maxBytes: 128, maxBuffers: 1});
+  t.after(() => bounded.dispose());
+  const old = bounded.upload(key, new Uint32Array([6]));
+  const waiting = bounded.createDispatchGroup(), prepared = bounded.prepareSync({code: 'empty'});
+  waiting.dispatch(prepared, bindings(old), [1]);
+  assert.throws(() => bounded.upload(key, new Uint32Array([7, 8])), /BUDGET/);
+  assert.equal(bounded.getBuffer(key), old);
+  assert.equal(old.destroyed, false);
+  bounded.release(key);
+  assert.throws(() => bounded.upload({}, new Uint32Array([9])), /BUDGET/);
+  waiting.submit();
+  assert.equal(old.destroyCount, 1);
+  bounded.upload({}, new Uint32Array([10]));
+  await bounded.whenIdle();
+});
+
+for (const exit of ['abort', 'invalid dispatch', 'failed submit', 'dispose', 'device loss'])
+test(`retired group resources are destroyed once after ${exit}`, async t => {
+  const device = deviceFixture(), owner = createGpuCompute(device);
+  t.after(() => owner.dispose());
+  const key = {}, buffer = owner.upload(key, new Uint32Array([17]));
+  const pipeline = owner.prepareSync({code: 'empty'}), group = owner.createDispatchGroup();
+  group.dispatch(pipeline, bindings(buffer), [1]); owner.release(key);
+  assert.equal(buffer.destroyed, false);
+  if (exit === 'abort') group.abort();
+  else if (exit === 'invalid dispatch') assert.throws(() => group.dispatch(pipeline, [], [65536]), /DISPATCH/);
+  else if (exit === 'failed submit') {
+    const error = new Error('submission failed');
+    device.queue.submit = () => { assert.equal(buffer.destroyed, false); throw error; };
+    assert.throws(() => group.submit(), value => value === error);
+  } else if (exit === 'device loss') {
+    device.lose({message: 'lost while recording'}); await Promise.resolve();
+  } else owner.dispose();
+  assert.equal(buffer.destroyCount, 1);
+  assert.equal(owner.allocatedBytes, 0); assert.equal(owner.bufferCount, 0);
+  assert.equal(device.observations.length, 0);
+  group.abort(); owner.dispose(); owner.dispose();
+  assert.equal(buffer.destroyCount, 1);
+});
+
+test('indirect submission retains the same selector that admission validated', async t => {
+  const device = deviceFixture(), owner = createGpuCompute(device);
+  t.after(() => owner.dispose());
+  const firstKey = {}, secondKey = {};
+  const first = owner.upload(firstKey, new Uint32Array([2, 3, 4]));
+  const second = owner.upload(secondKey, new Uint32Array([9, 8, 7]));
+  const pipeline = owner.prepareSync({code: 'empty'});
+  let reads = 0;
+  const selector = {get buffer() { reads++; return reads === 1 ? first : second; }, offset: 0};
+  const group = owner.createDispatchGroup();
+  group.dispatch(pipeline, [], selector); owner.release(firstKey); owner.release(secondKey);
+  assert.equal(reads, 1); assert.equal(first.destroyed, false); assert.equal(second.destroyCount, 1);
+  group.submit();
+  assert.deepEqual(device.observations[0].dimensions, [2, 3, 4]);
+  assert.equal(first.destroyCount, 1);
+  await owner.whenIdle();
+});
+
+test('recording hooks can release selected resources without destroying their pending uses', async t => {
+  const device = deviceFixture(), owner = createGpuCompute(device);
+  t.after(() => owner.dispose());
+  const key = {}, indirectKey = {}, buffer = owner.upload(key, new Uint32Array([3]));
+  const indirect = owner.upload(indirectKey, new Uint32Array([1, 1, 1]));
+  const pipeline = owner.prepareSync({code: 'add-one'}), selector = {buffer: indirect, offset: 0};
+  const create = device.createBindGroup;
+  device.createBindGroup = descriptor => { owner.release(key); return create(descriptor); };
+  const scope = {context: {}, run(run) { selector.buffer = {}; selector.offset = 99; return run(); }, backend: {
+    beginCompute(context, encoder, descriptor) { return encoder.beginComputePass(descriptor); },
+    compute(context, node, groups, selected, dispatchSize, pass, captured) {
+      assert.notEqual(captured, selector); assert.equal(Object.isFrozen(captured), true);
+      pass.setPipeline(selected);
+      for (const {index, group} of groups) pass.setBindGroup(index, group);
+      pass.dispatchWorkgroupsIndirect(captured.buffer, captured.offset);
+    },
+    finishCompute(context, pass) {
+      owner.release(indirectKey); assert.equal(indirect.destroyed, false); pass.end();
+    },
+  }};
+  const group = owner.createDispatchGroup(null, scope);
+  group.dispatch(pipeline, bindings(buffer), selector, {scope, node: {}, dispatchSize: null});
+  assert.equal(buffer.destroyed, false);
+  group.submit();
+  assert.deepEqual(device.observations[0].dimensions, [1, 1, 1]);
+  assert.deepEqual(words(buffer), [4]);
+  assert.equal(buffer.destroyCount, 1); assert.equal(indirect.destroyCount, 1);
+  assert.equal(owner.cachedBindGroupCount, 0);
+  assert.equal(owner.allocatedBytes, 0);
+  await owner.whenIdle();
 });
