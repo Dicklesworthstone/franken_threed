@@ -68,7 +68,7 @@ use f3d_core::{
 use f3d_graph::{
     CanvasEpochTracker, CanvasFormat, CanvasId, ComputeBufferBinding, CopyCommand, Dispatch,
     DrawKind, ExecutionPlan, LoadOp, Pass, PassGraph, PassId, PassKind, ResourceAccess,
-    ResourceId, ResourceKind, ResourceUse, StoreOp,
+    ResourceId, ResourceKind, ResourceUse, StoreOp, SubresourceRange, TextureAspect,
 };
 use f3d_math::{Matrix4, Quaternion, Vector3};
 
@@ -2087,6 +2087,17 @@ pub enum PlanLoweringError {
         /// Number of configured color attachments.
         count: usize,
     },
+    /// An attachment view cannot be represented by the bridge's texture profile.
+    UnsupportedAttachmentView {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+        /// Attachment resource whose selector must not be silently dropped.
+        target_id: u32,
+        /// Required attachment aspect: color or depth.
+        attachment_aspect: TextureAspect,
+        /// Original requested mip, layer, and aspect range.
+        view_subresource: SubresourceRange,
+    },
     /// A resolve combination is outside the current offscreen, color-only bridge path.
     UnsupportedResolveTarget {
         /// Diagnostic name of the pass segment.
@@ -2206,6 +2217,14 @@ impl core::fmt::Display for PlanLoweringError {
                     "Render segment '{segment_name}' configures {count} color attachments; MRT is not supported by bridge lowering"
                 )
             }
+            Self::UnsupportedAttachmentView {
+                segment_name, target_id, attachment_aspect, view_subresource,
+            } => {
+                write!(
+                    f,
+                    "Render segment '{segment_name}' targets resource {target_id} with unsupported {attachment_aspect:?} attachment view {view_subresource:?}; bridge textures have one mip and one layer"
+                )
+            }
             Self::UnsupportedResolveTarget { segment_name, resolve_target } => {
                 write!(
                     f,
@@ -2310,6 +2329,35 @@ impl core::fmt::Display for PlanLoweringError {
 
 impl core::error::Error for PlanLoweringError {}
 
+fn validate_attachment_view(
+    segment_name: &str,
+    target_id: ResourceId,
+    view_subresource: &SubresourceRange,
+    attachment_aspect: TextureAspect,
+) -> Result<(), PlanLoweringError> {
+    // Packet allocation creates one-mip, one-layer textures. Zero counts mean
+    // all remaining subresources and therefore also select exactly one here.
+    // Dropping any other selector would invalidate the graph's hazard proof.
+    if matches!(
+        view_subresource,
+        SubresourceRange::TextureRange {
+            mip_level_start: 0,
+            mip_level_count: 0 | 1,
+            array_layer_start: 0,
+            array_layer_count: 0 | 1,
+            aspect,
+        } if *aspect == TextureAspect::All || *aspect == attachment_aspect
+    ) {
+        return Ok(());
+    }
+    Err(PlanLoweringError::UnsupportedAttachmentView {
+        segment_name: segment_name.to_string(),
+        target_id: target_id.get(),
+        attachment_aspect,
+        view_subresource: view_subresource.clone(),
+    })
+}
+
 // The bridge's buffer-copy formats contain one four-byte texel per block.
 // Encoder row pitch is independent of queue.writeTexture's layout rules.
 fn validate_texture_buffer_layout(width: u32, height: u32, bytes_per_row: u32) -> Result<(), String> {
@@ -2358,6 +2406,10 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                 }
                 let depth_attachment = segment.depth_stencil_attachment();
                 if let Some(dsa) = depth_attachment {
+                    validate_attachment_view(
+                        segment.name(), dsa.target_id(), &dsa.view_subresource,
+                        TextureAspect::DepthOnly,
+                    )?;
                     if dsa.target_id().get() == 0 {
                         return Err(PlanLoweringError::InvalidDepthAttachment {
                             segment_name: segment.name().to_string(),
@@ -2412,6 +2464,9 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                         segment_name: segment.name().to_string(),
                     });
                 };
+                validate_attachment_view(
+                    segment.name(), ca.target_id(), &ca.view_subresource, TextureAspect::Color,
+                )?;
                 let resolve_target_id = ca.resolve_target().map(|id| id.get());
                 if let Some(resolve_target) = resolve_target_id.filter(|_| ca.is_canvas()) {
                     return Err(PlanLoweringError::UnsupportedResolveTarget {
@@ -8920,6 +8975,115 @@ mod tests {
         // 5. Freestanding helper also rejects stale epoch
         assert!(!try_publish_readback(&region, Epoch::ZERO));
         assert!(try_publish_readback(&region, next_epoch));
+    }
+
+    fn attachment_view_test_plan(view: SubresourceRange, depth: bool) -> ExecutionPlan {
+        use f3d_graph::{ColorAttachment, DepthStencilAttachment, PlanSegment};
+        let mut pass = Pass::new_render(PassId::new(1), "attachment_view")
+            .with_color_attachment(ColorAttachment::new_clear(
+                ResourceId::new(10), [0.2, 0.3, 0.4, 1.0],
+            ));
+        if depth {
+            let mut attachment = DepthStencilAttachment::new_depth_clear(ResourceId::new(99), 0.5);
+            attachment.view_subresource = view;
+            pass.depth_stencil_attachment = Some(attachment);
+        } else {
+            pass.color_attachments[0].view_subresource = view;
+        }
+        ExecutionPlan {
+            segments: vec![PlanSegment::from_pass(&pass)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lower_plan_rejects_unrepresentable_attachment_views() {
+        use f3d_graph::Draw;
+        for depth in [false, true] {
+            let aspect = if depth { TextureAspect::DepthOnly } else { TextureAspect::Color };
+            let wrong_aspect = if depth { TextureAspect::Color } else { TextureAspect::DepthOnly };
+            let mut invalid_views = vec![
+                SubresourceRange::WholeBuffer,
+                SubresourceRange::single_mip_layer(0, 0, wrong_aspect),
+                SubresourceRange::single_mip_layer(0, 0, TextureAspect::StencilOnly),
+            ];
+            for (mip, mips, layer, layers) in [
+                (1, 1, 0, 1), (0, 2, 0, 1), (0, 1, 1, 1), (0, 1, 0, 2),
+            ] {
+                invalid_views.push(SubresourceRange::TextureRange {
+                    mip_level_start: mip, mip_level_count: mips,
+                    array_layer_start: layer, array_layer_count: layers, aspect,
+                });
+            }
+            for view in invalid_views {
+                for mode in 0..3 {
+                    let mut plan = attachment_view_test_plan(view.clone(), depth);
+                    let segment = &mut plan.segments[0];
+                    if mode == 1 {
+                        segment.draws.push(Draw::new_bundle(0, 42, 100, Vec::new()));
+                    } else if mode == 2 {
+                        segment.color_attachments[0].load_op = LoadOp::Load;
+                        segment.color_attachments[0].resolve_target = Some(ResourceId::new(11));
+                        if let Some(attachment) = &mut segment.depth_stencil_attachment {
+                            attachment.depth_load_op = Some(LoadOp::Load);
+                        }
+                    }
+                    // Clear-only, bundle-first, and resolve-only passes all validate views.
+                    assert_eq!(lower_plan(&plan), Err(PlanLoweringError::UnsupportedAttachmentView {
+                        segment_name: "attachment_view".to_string(),
+                        target_id: if depth { 99 } else { 10 },
+                        attachment_aspect: aspect,
+                        view_subresource: view.clone(),
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_plan_equivalent_attachment_views_preserve_packet_bytes() {
+        for depth in [false, true] {
+            let encode = |plan: &ExecutionPlan| {
+                GpuSubmissionPacket::from_commands(lower_plan(plan).unwrap()).encode().unwrap()
+            };
+            let expected = encode(&attachment_view_test_plan(SubresourceRange::full_texture(), depth));
+            let required_aspect = if depth { TextureAspect::DepthOnly } else { TextureAspect::Color };
+            for mips in [0, 1] {
+                for layers in [0, 1] {
+                    for aspect in [TextureAspect::All, required_aspect] {
+                        let view = SubresourceRange::TextureRange {
+                            mip_level_start: 0, mip_level_count: mips,
+                            array_layer_start: 0, array_layer_count: layers, aspect,
+                        };
+                        assert_eq!(encode(&attachment_view_test_plan(view, depth)), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_plan_rejects_later_attachment_view_without_returning_partial_commands() {
+        for depth in [false, true] {
+            let mut plan = attachment_view_test_plan(SubresourceRange::full_texture(), depth);
+            assert!(lower_plan(&plan).is_ok());
+            let aspect = if depth { TextureAspect::DepthOnly } else { TextureAspect::Color };
+            let view = SubresourceRange::single_mip_layer(1, 0, aspect);
+            let mut later = attachment_view_test_plan(view.clone(), depth).segments[0].clone();
+            later.pass_id = PassId::new(2);
+            later.name = "later_attachment_view".to_string();
+            plan.segments.push(later);
+            plan.pass_count = 2;
+            assert_eq!(lower_plan(&plan), Err(PlanLoweringError::UnsupportedAttachmentView {
+                segment_name: "later_attachment_view".to_string(),
+                target_id: if depth { 99 } else { 10 },
+                attachment_aspect: aspect,
+                view_subresource: view,
+            }));
+        }
     }
 
     #[test]
