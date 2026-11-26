@@ -91,6 +91,9 @@ impl PlanSegment {
             uses.extend(dispatch.uses.clone());
         }
         for copy in &self.copies {
+            if copy.has_empty_texture_layer_range() {
+                continue;
+            }
             let (src, dst) = copy.all_uses(DataVersion::INITIAL);
             uses.push(src);
             uses.push(dst);

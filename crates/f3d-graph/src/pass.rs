@@ -875,6 +875,15 @@ pub enum CopyCommand {
 }
 
 impl CopyCommand {
+    /// Whether a texture-to-texture transfer selects no array layers.
+    ///
+    /// Keep the command for host validation. Zero here must not become the
+    /// unbounded range represented by `SubresourceRange` count zero. Width and
+    /// height do not change the selected subresources or their overlap rules.
+    pub(crate) fn has_empty_texture_layer_range(&self) -> bool {
+        matches!(self, Self::TextureToTexture { extent: [_, _, 0], .. })
+    }
+
     /// Extract the resources used by this copy command.
     pub fn all_uses(&self, version: DataVersion) -> (ResourceUse, ResourceUse) {
         match self {
@@ -900,12 +909,18 @@ impl CopyCommand {
                     canvas_epoch: None,
                 },
             ),
-            Self::TextureToTexture { src, src_mip, src_layer, dst, dst_mip, dst_layer, .. } => (
+            Self::TextureToTexture { src, src_mip, src_layer, dst, dst_mip, dst_layer, extent } => (
                 ResourceUse {
                     resource_id: *src,
                     kind: ResourceKind::Texture,
                     version,
-                    subresource: SubresourceRange::single_mip_layer(*src_mip, *src_layer, crate::resource::TextureAspect::All),
+                    subresource: SubresourceRange::TextureRange {
+                        mip_level_start: *src_mip,
+                        mip_level_count: 1,
+                        array_layer_start: *src_layer,
+                        array_layer_count: extent[2],
+                        aspect: crate::resource::TextureAspect::All,
+                    },
                     access: ResourceAccess::CopySrc,
                     byte_offset: None,
                     byte_size: None,
@@ -915,7 +930,13 @@ impl CopyCommand {
                     resource_id: *dst,
                     kind: ResourceKind::Texture,
                     version,
-                    subresource: SubresourceRange::single_mip_layer(*dst_mip, *dst_layer, crate::resource::TextureAspect::All),
+                    subresource: SubresourceRange::TextureRange {
+                        mip_level_start: *dst_mip,
+                        mip_level_count: 1,
+                        array_layer_start: *dst_layer,
+                        array_layer_count: extent[2],
+                        aspect: crate::resource::TextureAspect::All,
+                    },
                     access: ResourceAccess::CopyDst,
                     byte_offset: None,
                     byte_size: None,
@@ -1149,6 +1170,9 @@ impl Pass {
             uses.extend(dispatch.uses.clone());
         }
         for copy in &self.copies {
+            if copy.has_empty_texture_layer_range() {
+                continue;
+            }
             let (src, dst) = copy.all_uses(DataVersion::INITIAL);
             uses.push(src);
             uses.push(dst);

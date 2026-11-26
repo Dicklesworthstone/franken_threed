@@ -2,8 +2,8 @@
 
 use f3d_core::ownership::DataVersion;
 use f3d_graph::{
-    ColorAttachment, DepthStencilAttachment, Draw, GraphError, HazardError, LoadOp, Pass,
-    PassGraph, PassId, ResourceAccess, ResourceId, ResourceKind, ResourceUse, StoreOp,
+    ColorAttachment, CopyCommand, DepthStencilAttachment, Draw, GraphError, HazardError, LoadOp,
+    Pass, PassGraph, PassId, ResourceAccess, ResourceId, ResourceKind, ResourceUse, StoreOp,
     SubresourceRange, TextureAspect, can_split_pass, split_pass_on_hazard, validate_pass_hazards,
 };
 
@@ -318,4 +318,170 @@ fn another_split_reason_cannot_hide_resolve_target_feedback() {
         Err(HazardError::AttachmentSamplingConflict { texture_id: 60, .. })
     ));
     assert!(!can_split_pass(&pass));
+}
+
+#[test]
+fn texture_copy_uses_cover_every_copied_array_layer() {
+    let copy = CopyCommand::TextureToTexture {
+        src: ResourceId::new(50),
+        src_mip: 1,
+        src_layer: 2,
+        dst: ResourceId::new(60),
+        dst_mip: 3,
+        dst_layer: 5,
+        extent: [8, 8, 3],
+    };
+    let (source, destination) = copy.all_uses(DataVersion::INITIAL);
+    for (usage, mip, first_layer) in [(source, 1, 2), (destination, 3, 5)] {
+        for layer in 0..10 {
+            let view = SubresourceRange::single_mip_layer(mip, layer, TextureAspect::Color);
+            assert_eq!(
+                usage.subresource.overlaps(&view),
+                (first_layer..first_layer + 3).contains(&layer),
+                "copy must cover exactly its three array layers: mip {mip}, layer {layer}"
+            );
+        }
+        assert!(
+            !usage
+                .subresource
+                .overlaps(&SubresourceRange::single_mip_layer(
+                    mip + 1,
+                    first_layer,
+                    TextureAspect::Color,
+                ))
+        );
+    }
+}
+
+#[test]
+fn multilayer_texture_self_copy_rejects_overlapping_subresources() {
+    for (src_mip, src_layer, dst_mip, dst_layer, depth, overlaps) in [
+        (1, 2, 1, 4, 3, true),
+        (1, 4, 1, 2, 3, true),
+        (1, 2, 1, 5, 3, false),
+        (1, 2, 2, 2, 3, false),
+    ] {
+        let pass =
+            Pass::new_copy(PassId::new(1), "array_copy").with_copy(CopyCommand::TextureToTexture {
+                src: ResourceId::new(50),
+                src_mip,
+                src_layer,
+                dst: ResourceId::new(50),
+                dst_mip,
+                dst_layer,
+                extent: [8, 8, depth],
+            });
+        if overlaps {
+            assert!(matches!(
+                validate_pass_hazards(&pass),
+                Err(HazardError::OverlappingCopyEndpoints { resource_id: 50 })
+            ));
+        } else {
+            validate_pass_hazards(&pass).unwrap();
+        }
+        let mut graph = PassGraph::new();
+        graph.add_pass(pass).unwrap();
+        let plan = graph.compile(None);
+        if overlaps {
+            assert!(matches!(plan, Err(GraphError::Hazard(_))));
+        } else {
+            assert_eq!(plan.unwrap().segment_count(), 1);
+        }
+    }
+}
+
+fn empty_texture_layer_copies() -> Vec<CopyCommand> {
+    let mut copies = Vec::new();
+    for extent in [[8, 8, 0], [0, 8, 0], [8, 0, 0], [0, 0, 0]] {
+        copies.push(CopyCommand::TextureToTexture {
+            src: ResourceId::new(50),
+            src_mip: 1,
+            src_layer: 2,
+            dst: ResourceId::new(50),
+            dst_mip: 1,
+            dst_layer: 2,
+            extent,
+        });
+    }
+    copies
+}
+
+#[test]
+fn empty_texture_layer_copies_keep_commands_without_hazards_or_version_updates() {
+    for copy in empty_texture_layer_copies() {
+        let pass = Pass::new_copy(PassId::new(1), "empty_texture_copy").with_copy(copy.clone());
+        validate_pass_hazards(&pass).expect("empty self-copy has no overlapping texels");
+        assert!(pass.all_uses().is_empty(), "{copy:?}");
+        let mut graph = PassGraph::new();
+        graph.add_pass(pass).unwrap();
+        let plan = graph.compile(None).unwrap();
+        assert_eq!(plan.segment_count(), 1);
+        let segment = &plan.segments()[0];
+        assert!(segment.all_uses().is_empty());
+        assert!(segment.versioned_reads().is_empty());
+        assert!(segment.versioned_writes().is_empty());
+        assert_eq!(segment.copies(), &[copy.clone()]);
+
+        // Empty commands remain subject to placement and host API validation.
+        let render = Pass::new_render(PassId::new(2), "misplaced_empty_copy").with_copy(copy);
+        assert_eq!(
+            validate_pass_hazards(&render),
+            Err(HazardError::CopyInRenderPass { pass_id: 2 }),
+        );
+    }
+}
+
+#[test]
+fn empty_texture_layer_copies_do_not_infer_false_dependencies() {
+    for copy in empty_texture_layer_copies() {
+        let mut graph = PassGraph::new();
+        graph
+            .add_pass(
+                Pass::new_copy(PassId::new(1), "empty_texture_copy")
+                    .with_copy(copy)
+                    .with_dependency(PassId::new(3)),
+            )
+            .unwrap();
+        graph
+            .add_pass(
+                Pass::new_render(PassId::new(2), "write_texture").with_color_attachment(
+                    ColorAttachment::new_clear(ResourceId::new(50), [0.0; 4]),
+                ),
+            )
+            .unwrap();
+        graph
+            .add_pass(Pass::new_copy(PassId::new(3), "explicit_prerequisite"))
+            .unwrap();
+        let plan = graph.compile(None).unwrap();
+        assert_eq!(
+            plan.segments()
+                .iter()
+                .map(|segment| segment.pass_id().get())
+                .collect::<Vec<_>>(),
+            vec![2, 3, 1],
+            "the real write must not wait on an empty transfer; explicit ordering still holds",
+        );
+    }
+}
+
+#[test]
+fn zero_width_or_height_does_not_waive_texture_copy_overlap_validation() {
+    for extent in [[0, 8, 1], [8, 0, 1], [0, 0, 1], [0, 8, 3], [8, 0, 3]] {
+        let pass = Pass::new_copy(PassId::new(1), "overlapping_empty_xy_copy").with_copy(
+            CopyCommand::TextureToTexture {
+                src: ResourceId::new(50),
+                src_mip: 1,
+                src_layer: 2,
+                dst: ResourceId::new(50),
+                dst_mip: 1,
+                dst_layer: 2,
+                extent,
+            },
+        );
+        assert_eq!(pass.all_uses().len(), 2);
+        assert_eq!(
+            validate_pass_hazards(&pass),
+            Err(HazardError::OverlappingCopyEndpoints { resource_id: 50 }),
+        );
+    }
 }

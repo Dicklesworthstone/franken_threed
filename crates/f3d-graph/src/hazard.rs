@@ -357,6 +357,9 @@ fn validate_copy_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
         });
     }
     for copy in &pass.copies {
+        if copy.has_empty_texture_layer_range() {
+            continue;
+        }
         let (src, dst) = copy.all_uses(f3d_core::ownership::DataVersion::INITIAL);
         if src.resource_id == dst.resource_id && src.subresource.overlaps(&dst.subresource) {
             return Err(HazardError::OverlappingCopyEndpoints {

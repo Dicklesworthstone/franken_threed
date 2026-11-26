@@ -40,6 +40,8 @@ export const OPCODE_RENDER_PASS_RESOLVE = 25;
 export const OPCODE_CREATE_PIPELINE_DEPTH_MULTISAMPLED = 26;
 export const OPCODE_RENDER_PASS_DEPTH_RESOLVE = 27;
 export const OPCODE_COPY_TEXTURE_TO_BUFFER_LAYOUT = 28;
+export const OPCODE_COPY_BUFFER_TO_TEXTURE = 29;
+export const OPCODE_COPY_TEXTURE_TO_TEXTURE = 30;
 
 export const BINDING_TYPE_UNIFORM = 0;
 export const BINDING_TYPE_STORAGE_READ = 1;
@@ -1774,6 +1776,98 @@ export class WebGpuBridgeHost {
               break;
             }
 
+            case OPCODE_COPY_BUFFER_TO_TEXTURE: {
+              closeActivePass();
+              if (cursor + 20 > dataBlockStart) {
+                throw new Error(`Truncated COPY_BUFFER_TO_TEXTURE fields at command ${i}`);
+              }
+              const bufferId = dataView.getUint32(cursor, true);
+              const textureId = dataView.getUint32(cursor + 4, true);
+              const width = dataView.getUint32(cursor + 8, true);
+              const height = dataView.getUint32(cursor + 12, true);
+              const bytesPerRow = dataView.getUint32(cursor + 16, true);
+              cursor += 20;
+              const buffer = usePrepared(this.buffers.get(bufferId));
+              const texture = usePrepared(this.textures.get(textureId));
+              if (!buffer || !texture) throw new Error("CopyBufferToTexture: invalid buffer or texture id");
+              const rowBytes = width * 4;
+              const requiredBytes = height > 0 ? (height - 1) * bytesPerRow + rowBytes : 0;
+              if (bytesPerRow % 256 !== 0 || bytesPerRow < rowBytes ||
+                  !Number.isSafeInteger(requiredBytes) || requiredBytes > buffer.size) {
+                throw new Error("CopyBufferToTexture: invalid row layout or source buffer bounds");
+              }
+              if (texture.dimension !== "2d" || texture.sampleCount !== 1 ||
+                  width > texture.width || height > texture.height ||
+                  !["rgba8unorm", "rgba8unorm-srgb", "bgra8unorm", "bgra8unorm-srgb"].includes(texture.format)) {
+                throw new Error("CopyBufferToTexture: unsupported texture format, sample count, dimension or extent");
+              }
+              if (!(buffer.usage & 4) || !(texture.usage & TEXTURE_USAGE_COPY_DST) ||
+                  (buffer.mapState !== undefined && buffer.mapState !== "unmapped")) {
+                throw new Error("CopyBufferToTexture: source/destination copy usage or buffer map state is invalid");
+              }
+              encoder().copyBufferToTexture(
+                { buffer, bytesPerRow, rowsPerImage: height },
+                { texture }, [width, height, 1],
+              );
+              break;
+            }
+
+            case OPCODE_COPY_TEXTURE_TO_TEXTURE: {
+              closeActivePass();
+              if (cursor + 36 > dataBlockStart) {
+                throw new Error(`Truncated COPY_TEXTURE_TO_TEXTURE fields at command ${i}`);
+              }
+              const sourceId = dataView.getUint32(cursor, true);
+              const sourceMip = dataView.getUint32(cursor + 4, true);
+              const sourceLayer = dataView.getUint32(cursor + 8, true);
+              const destinationId = dataView.getUint32(cursor + 12, true);
+              const destinationMip = dataView.getUint32(cursor + 16, true);
+              const destinationLayer = dataView.getUint32(cursor + 20, true);
+              const width = dataView.getUint32(cursor + 24, true);
+              const height = dataView.getUint32(cursor + 28, true);
+              const layers = dataView.getUint32(cursor + 32, true);
+              cursor += 36;
+              const source = usePrepared(this.textures.get(sourceId));
+              const destination = usePrepared(this.textures.get(destinationId));
+              if (!source || !destination) throw new Error("CopyTextureToTexture: invalid source or destination texture id");
+              const formats = ["rgba8unorm", "rgba8unorm-srgb", "bgra8unorm", "bgra8unorm-srgb", "depth24plus", "depth32float"];
+              if (source.dimension !== "2d" || destination.dimension !== "2d" ||
+                  !formats.includes(source.format) || !formats.includes(destination.format) ||
+                  source.format.replace(/-srgb$/, "") !== destination.format.replace(/-srgb$/, "") ||
+                  ![1, 4].includes(source.sampleCount) || source.sampleCount !== destination.sampleCount) {
+                throw new Error("CopyTextureToTexture: incompatible texture dimensions, formats or sample counts");
+              }
+              if (!(source.usage & TEXTURE_USAGE_COPY_SRC) || !(destination.usage & TEXTURE_USAGE_COPY_DST)) {
+                throw new Error("CopyTextureToTexture: source/destination copy usage is invalid");
+              }
+              if (sourceMip >= source.mipLevelCount || destinationMip >= destination.mipLevelCount ||
+                  sourceLayer + layers > 0xffffffff || destinationLayer + layers > 0xffffffff ||
+                  sourceLayer + layers > source.depthOrArrayLayers || destinationLayer + layers > destination.depthOrArrayLayers) {
+                throw new Error("CopyTextureToTexture: mip level or array layer range is out of bounds");
+              }
+              const sourceWidth = Math.max(1, Math.floor(source.width / 2 ** sourceMip));
+              const sourceHeight = Math.max(1, Math.floor(source.height / 2 ** sourceMip));
+              const destinationWidth = Math.max(1, Math.floor(destination.width / 2 ** destinationMip));
+              const destinationHeight = Math.max(1, Math.floor(destination.height / 2 ** destinationMip));
+              if (width > sourceWidth || width > destinationWidth || height > sourceHeight || height > destinationHeight) {
+                throw new Error("CopyTextureToTexture: copy extent is out of bounds");
+              }
+              if ((source.sampleCount > 1 || source.format.startsWith("depth")) &&
+                  (width !== sourceWidth || width !== destinationWidth || height !== sourceHeight || height !== destinationHeight)) {
+                throw new Error("CopyTextureToTexture: multisample and depth copies require complete XY subresources");
+              }
+              if (source === destination && sourceMip === destinationMip &&
+                  sourceLayer < destinationLayer + layers && destinationLayer < sourceLayer + layers) {
+                throw new Error("CopyTextureToTexture: source and destination subresources overlap");
+              }
+              encoder().copyTextureToTexture(
+                { texture: source, mipLevel: sourceMip, origin: [0, 0, sourceLayer] },
+                { texture: destination, mipLevel: destinationMip, origin: [0, 0, destinationLayer] },
+                [width, height, layers],
+              );
+              break;
+            }
+
             case OPCODE_COPY_BUFFER_TO_BUFFER: {
               closeActivePass();
               if (cursor + 40 > dataBlockStart) {
@@ -2117,6 +2211,10 @@ export class WebGpuBridgeHost {
                     scanCursor += 24;
                   } else if (nextOp === OPCODE_COPY_TEXTURE_TO_BUFFER_LAYOUT) {
                     scanCursor += 28;
+                  } else if (nextOp === OPCODE_COPY_BUFFER_TO_TEXTURE) {
+                    scanCursor += 20;
+                  } else if (nextOp === OPCODE_COPY_TEXTURE_TO_TEXTURE) {
+                    scanCursor += 36;
                   } else if (nextOp === OPCODE_RECORD_BUNDLE) {
                     scanCursor += 28;
                   } else if (nextOp === OPCODE_RECORD_BUNDLE_BATCH) {

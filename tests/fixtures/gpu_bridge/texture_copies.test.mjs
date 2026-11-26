@@ -40,6 +40,7 @@ function fixture({ bufferSize = 520, texture = {}, bufferUsage = 9, scopeError =
   const target = {
     size: bufferSize,
     usage: bufferUsage,
+    data: bytes,
     mapAsync() { events.push("map"); return Promise.resolve(); },
     getMappedRange(offset = 0, size = bufferSize - offset) { return bytes.buffer.slice(offset, offset + size); },
     unmap() { events.push("unmap"); },
@@ -48,7 +49,7 @@ function fixture({ bufferSize = 520, texture = {}, bufferUsage = 9, scopeError =
   host.textures.set(10, {
     width: 2, height: 2, depthOrArrayLayers: 1, mipLevelCount: 1,
     dimension: "2d", sampleCount: 1, format: "rgba8unorm", usage: 3,
-    data: sourceBytes,
+    data: sourceBytes.slice(),
     ...texture,
   });
   host.device = {
@@ -61,6 +62,32 @@ function fixture({ bufferSize = 520, texture = {}, bufferUsage = 9, scopeError =
     createCommandEncoder() {
       const work = [];
       return {
+        copyBufferToTexture(source, destination, extent) {
+          copies.push({ source, destination, extent });
+          events.push("upload");
+          work.push(() => {
+            for (let row = 0; row < extent[1]; row++) {
+              const start = row * source.bytesPerRow;
+              destination.texture.data.set(source.buffer.data.subarray(start, start + extent[0] * 4),
+                row * destination.texture.width * 4);
+            }
+          });
+        },
+        copyTextureToTexture(source, destination, extent) {
+          copies.push({ source, destination, extent });
+          events.push("texture-copy");
+          // Model bytes only for the mip-zero round trip. Other cases below
+          // assert exact native descriptors instead of simulating GPU mipmaps.
+          if (source.mipLevel === 0 && destination.mipLevel === 0) work.push(() => {
+            for (let layer = 0; layer < extent[2]; layer++) {
+              for (let row = 0; row < extent[1]; row++) {
+                const from = ((source.origin[2] + layer) * source.texture.height + row) * source.texture.width * 4;
+                const to = ((destination.origin[2] + layer) * destination.texture.height + row) * destination.texture.width * 4;
+                destination.texture.data.set(source.texture.data.subarray(from, from + extent[0] * 4), to);
+              }
+            }
+          });
+        },
         copyTextureToBuffer(source, destination, extent) {
           copies.push({ source, destination, extent });
           events.push("copy");
@@ -174,4 +201,143 @@ test("full depth32float readback uses the declared row layout", async () => {
   await f.host.executePacket(packet([readback()]));
   assert.equal(f.copies[0].destination.bytesPerRow, 512);
   assert.deepEqual([...f.bytes.slice(512)], [...sourceBytes.slice(8)]);
+});
+
+const upload = (pitch = 512, width = 2, height = 2) => [29, [21, 10, width, height, pitch]];
+const imageCopy = ({ sourceMip = 0, sourceLayer = 0, destinationMip = 0, destinationLayer = 0,
+  width = 2, height = 2, layers = 1 } = {}) =>
+  [30, [10, sourceMip, sourceLayer, 11, destinationMip, destinationLayer, width, height, layers]];
+
+function transferFixture(options = {}) {
+  const f = fixture(options), source = f.host.textures.get(10);
+  f.host.textures.set(11, { ...source, data: new Uint8Array(source.data.length) });
+  const staging = new Uint8Array(520).fill(0xdd);
+  staging.set(sourceBytes.subarray(0, 8), 0);
+  staging.set(sourceBytes.subarray(8), 512);
+  f.host.buffers.set(21, { data: staging, size: staging.length, usage: 4, mapState: "unmapped" });
+  return f;
+}
+
+test("staged upload, texture copy and readback share source-ordered encoded work", async () => {
+  const f = transferFixture();
+  f.host.textures.get(10).data.fill(0);
+  const finalRead = readback();
+  finalRead[1][0] = 11;
+  await f.host.executePacket(packet([upload(), imageCopy(), finalRead]));
+  const result = await f.host.readbackBuffer(20, 520);
+  assert.deepEqual([...result.slice(0, 8)], [...sourceBytes.slice(0, 8)]);
+  assert.deepEqual([...result.slice(512)], [...sourceBytes.slice(8)]);
+  assert.equal(f.copies[0].source.bytesPerRow, 512);
+  assert.equal(f.copies[0].source.rowsPerImage, 2);
+  assert.equal(f.copies[1].source.texture, f.host.textures.get(10));
+  assert.equal(f.copies[1].destination.texture, f.host.textures.get(11));
+  assert.deepEqual(f.events.slice(0, 8), [
+    "push:validation", "push:out-of-memory", "upload", "texture-copy", "copy",
+    "finish", "submit", "pop:out-of-memory",
+  ]);
+  assert.equal(f.events.filter(event => event === "submit").length, 1);
+});
+
+test("texture copies preserve mip selections and every array layer", async () => {
+  const f = transferFixture({ texture: {
+    width: 8, height: 8, depthOrArrayLayers: 8, mipLevelCount: 3,
+    data: new Uint8Array(8 * 8 * 8 * 4),
+  } });
+  await f.host.executePacket(packet([imageCopy({
+    sourceMip: 1, sourceLayer: 2, destinationMip: 2, destinationLayer: 5,
+    width: 2, height: 2, layers: 3,
+  })]));
+  const copy = f.copies[0];
+  assert.equal(copy.source.mipLevel, 1);
+  assert.deepEqual(copy.source.origin, [0, 0, 2]);
+  assert.equal(copy.destination.mipLevel, 2);
+  assert.deepEqual(copy.destination.origin, [0, 0, 5]);
+  assert.deepEqual(copy.extent, [2, 2, 3]);
+});
+
+test("physical texture aliases reject overlapping layers and permit disjoint layers or mips", async () => {
+  const f = transferFixture({ texture: {
+    width: 4, height: 4, depthOrArrayLayers: 6, mipLevelCount: 2,
+    data: new Uint8Array(4 * 4 * 6 * 4),
+  } });
+  f.host.textures.set(11, f.host.textures.get(10));
+  await assert.rejects(f.host.executePacket(packet([
+    imageCopy({ sourceLayer: 1, destinationLayer: 2, layers: 2 }),
+  ])), /subresources overlap/);
+  assert.equal(f.copies.length, 0);
+  await f.host.executePacket(packet([
+    imageCopy({ sourceLayer: 1, destinationLayer: 3, layers: 2 }),
+    imageCopy({ destinationMip: 1 }),
+    imageCopy({ layers: 0 }),
+  ]));
+  assert.equal(f.copies.length, 3);
+  // A zero XY extent does not waive WebGPU's disjoint-subresource rule.
+  await assert.rejects(f.host.executePacket(packet([imageCopy({ width: 0 })])), /subresources overlap/);
+});
+
+test("linear and sRGB copies retain their distinct native textures", async () => {
+  const f = transferFixture();
+  f.host.textures.get(11).format = "rgba8unorm-srgb";
+  await f.host.executePacket(packet([imageCopy()]));
+  assert.equal(f.copies[0].source.texture.format, "rgba8unorm");
+  assert.equal(f.copies[0].destination.texture.format, "rgba8unorm-srgb");
+});
+
+test("depth and multisampled texture copies require complete matching subresources", async () => {
+  for (const texture of [{ format: "depth24plus" }, { format: "depth32float" }, { sampleCount: 4 }]) {
+    const f = transferFixture({ texture });
+    await f.host.executePacket(packet([imageCopy()]));
+    assert.deepEqual(f.copies[0].extent, [2, 2, 1]);
+    await assert.rejects(f.host.executePacket(packet([imageCopy({ width: 1 })])), /complete XY/);
+    assert.equal(f.copies.length, 1);
+  }
+});
+
+for (const [name, prepare, command] of [
+  ["short staging buffer", f => { f.host.buffers.get(21).size = 519; }, upload()],
+  ["mapped staging buffer", f => { f.host.buffers.get(21).mapState = "mapped"; }, upload()],
+  ["staging without COPY_SRC", f => { f.host.buffers.get(21).usage = 8; }, upload()],
+  ["upload target without COPY_DST", f => { f.host.textures.get(10).usage = 1; }, upload()],
+  ["depth upload from buffer", f => { f.host.textures.get(10).format = "depth32float"; }, upload()],
+  ["unaligned upload pitch", () => {}, upload(511)],
+  ["narrow upload pitch", () => {}, upload(0)],
+  ["truncated upload", () => {}, [29, [21, 10, 2, 2]]],
+  ["truncated texture copy", () => {}, [30, imageCopy()[1].slice(0, -1)]],
+  ["missing texture", f => { f.host.textures.delete(11); }, imageCopy()],
+  ["different texture formats", f => { f.host.textures.get(11).format = "bgra8unorm"; }, imageCopy()],
+  ["different sample counts", f => { f.host.textures.get(11).sampleCount = 4; }, imageCopy()],
+  ["source without COPY_SRC", f => { f.host.textures.get(10).usage = 2; }, imageCopy()],
+  ["destination without COPY_DST", f => { f.host.textures.get(11).usage = 1; }, imageCopy()],
+  ["non-2D texture copy", f => { f.host.textures.get(10).dimension = "3d"; }, imageCopy()],
+  ["source mip outside allocation", () => {}, imageCopy({ sourceMip: 1 })],
+  ["destination mip outside allocation", () => {}, imageCopy({ destinationMip: 1 })],
+  ["source layer outside allocation", () => {}, imageCopy({ sourceLayer: 1 })],
+  ["destination layer outside allocation", () => {}, imageCopy({ destinationLayer: 1 })],
+  ["source layer overflow", () => {}, imageCopy({ sourceLayer: 0xffffffff })],
+  ["destination layer overflow", () => {}, imageCopy({ destinationLayer: 0xffffffff })],
+  ["wide texture copy", () => {}, imageCopy({ width: 3 })],
+  ["tall texture copy", () => {}, imageCopy({ height: 3 })],
+]) {
+  test(name + " rejects without submitting any copy", async () => {
+    const f = transferFixture();
+    prepare(f);
+    await assert.rejects(f.host.executePacket(packet([command])));
+    assert.equal(f.copies.length, 0);
+    assert.equal(f.events.includes("submit"), false);
+    assert.deepEqual(f.scopes, []);
+  });
+}
+
+test("copy consumers retain pending allocation validation before readback publication", async () => {
+  const f = transferFixture();
+  let reject;
+  const preparation = { promise: new Promise((_, fail) => { reject = fail; }) };
+  f.host.pendingPreparations.set(f.host.buffers.get(21), preparation);
+  const finalRead = readback();
+  finalRead[1][0] = 11;
+  const result = f.host.executePacket(packet([upload(), imageCopy(), finalRead]));
+  reject(new Error("staging allocation failed"));
+  await assert.rejects(result, /staging allocation failed/);
+  await assert.rejects(f.host.readbackBuffer(20, 520), /staging allocation failed/);
+  assert.equal(f.events.at(-1), "unmap");
 });

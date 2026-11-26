@@ -395,6 +395,10 @@ pub const OPCODE_CREATE_PIPELINE_DEPTH_MULTISAMPLED: u16 = 26;
 pub const OPCODE_RENDER_PASS_DEPTH_RESOLVE: u16 = 27;
 /// Read texture pixels with an explicit encoder row pitch (legacy payload + u32).
 pub const OPCODE_COPY_TEXTURE_TO_BUFFER_LAYOUT: u16 = 28;
+/// Copy a staging buffer into a texture using an explicit encoder row pitch.
+pub const OPCODE_COPY_BUFFER_TO_TEXTURE: u16 = 29;
+/// Copy texture subresources, preserving mip levels, layers and extent.
+pub const OPCODE_COPY_TEXTURE_TO_TEXTURE: u16 = 30;
 
 /// Compute binding type: uniform buffer (`GPUBufferBindingType.uniform`).
 pub const BINDING_TYPE_UNIFORM: u32 = 0;
@@ -784,6 +788,36 @@ pub enum GpuCommand {
         bytes_per_row: u32,
         /// Semantic epoch of the source texture state region.
         epoch: Epoch,
+    },
+    /// Upload a staging buffer into mip zero, layer zero of a texture.
+    CopyBufferToTexture {
+        /// Source staging buffer identifier.
+        buffer_id: u32,
+        /// Destination texture identifier.
+        texture_id: u32,
+        /// Width in pixels to copy.
+        width: u32,
+        /// Height in pixels to copy.
+        height: u32,
+        /// Explicit encoder row pitch, aligned to 256 bytes.
+        bytes_per_row: u32,
+    },
+    /// Copy a rectangular mip/layer range between texture residencies.
+    CopyTextureToTexture {
+        /// Source texture identifier.
+        source_texture_id: u32,
+        /// Source mip level.
+        source_mip_level: u32,
+        /// First source array layer.
+        source_array_layer: u32,
+        /// Destination texture identifier.
+        destination_texture_id: u32,
+        /// Destination mip level.
+        destination_mip_level: u32,
+        /// First destination array layer.
+        destination_array_layer: u32,
+        /// Pixel width, height and number of array layers.
+        extent: [u32; 3],
     },
     /// Command to pre-record a GPURenderBundle from a pipeline, vertex buffer, and optional uniform buffer.
     RecordBundle {
@@ -1380,6 +1414,29 @@ impl GpuSubmissionPacket {
                     command_records.extend_from_slice(&epoch_lo.to_le_bytes());
                     if let Some(bytes_per_row) = layout {
                         command_records.extend_from_slice(&bytes_per_row.to_le_bytes());
+                    }
+                }
+                GpuCommand::CopyBufferToTexture { buffer_id, texture_id, width, height, bytes_per_row } => {
+                    validate_texture_buffer_layout(*width, *height, *bytes_per_row)
+                        .map_err(PacketEncodeError::InvalidDimensions)?;
+                    command_records.extend_from_slice(&OPCODE_COPY_BUFFER_TO_TEXTURE.to_le_bytes());
+                    for value in [buffer_id, texture_id, width, height, bytes_per_row] {
+                        command_records.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+                GpuCommand::CopyTextureToTexture {
+                    source_texture_id, source_mip_level, source_array_layer,
+                    destination_texture_id, destination_mip_level, destination_array_layer, extent,
+                } => {
+                    validate_texture_copy_layers(*source_array_layer, *destination_array_layer, extent[2])
+                        .map_err(PacketEncodeError::InvalidDimensions)?;
+                    command_records.extend_from_slice(&OPCODE_COPY_TEXTURE_TO_TEXTURE.to_le_bytes());
+                    for value in [
+                        source_texture_id, source_mip_level, source_array_layer,
+                        destination_texture_id, destination_mip_level, destination_array_layer,
+                        &extent[0], &extent[1], &extent[2],
+                    ] {
+                        command_records.extend_from_slice(&value.to_le_bytes());
                     }
                 }
                 GpuCommand::RecordBundle {
@@ -2264,6 +2321,13 @@ fn validate_texture_buffer_layout(width: u32, height: u32, bytes_per_row: u32) -
     Ok(())
 }
 
+fn validate_texture_copy_layers(source_layer: u32, destination_layer: u32, layers: u32) -> Result<(), String> {
+    source_layer.checked_add(layers)
+        .and_then(|_| destination_layer.checked_add(layers))
+        .ok_or_else(|| "Texture copy layer range overflow".to_string())?;
+    Ok(())
+}
+
 /// Lowers a compiled `f3d_graph::ExecutionPlan` into a sequence of executable `GpuCommand` items.
 ///
 /// Consumes typed accessors on `ExecutionPlan`, `PlanSegment`, `ColorAttachment`, `Draw`, and `CopyCommand`.
@@ -2274,8 +2338,9 @@ fn validate_texture_buffer_layout(width: u32, height: u32, bytes_per_row: u32) -
 ///   The opening command of each render pass segment receives `PASS_FLAG_NEW_PASS` to enforce pass boundaries.
 ///   Each draw is lowered with its bound pipeline, vertex buffer ID (or 0), vertex count, 256-byte aligned
 ///   dynamic uniform offset, and uniform buffer ID (from declared uniform resource use, defaulting to 1).
-/// - **Copy Segments**: Texture readbacks preserve the graph's row pitch, selecting the
-///   explicit-layout opcode when the historical minimum-pitch encoding is insufficient.
+/// - **Copy Segments**: Buffer/texture transfers preserve row pitch and texture copies retain
+///   mip levels, array layers and extent. Readbacks use the explicit-layout opcode when the
+///   historical minimum-pitch encoding is insufficient.
 /// - **Compute Segments**: Lowers compute dispatches into `GpuCommand::DispatchCompute` (opcode 22)
 ///   using explicit group-0 buffer binding maps (`ComputeBufferBinding`), mapping resource IDs to
 ///   buffer IDs via the shared `.get()` convention, preserving per-use data versions and epochs.
@@ -2689,9 +2754,22 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                                 epoch: plan.canvas_epoch().unwrap_or(Epoch::ZERO),
                             });
                         }
-                        other => {
-                            return Err(PlanLoweringError::UnsupportedCopyCommand {
-                                reason: format!("Unsupported copy command variant: {other:?}"),
+                        CopyCommand::BufferToTexture { buffer_id, texture_id, width, height, bytes_per_row } => {
+                            validate_texture_buffer_layout(*width, *height, *bytes_per_row)
+                                .map_err(|reason| PlanLoweringError::InvalidCopyCommand { reason })?;
+                            commands.push(GpuCommand::CopyBufferToTexture {
+                                buffer_id: buffer_id.get(), texture_id: texture_id.get(),
+                                width: *width, height: *height, bytes_per_row: *bytes_per_row,
+                            });
+                        }
+                        CopyCommand::TextureToTexture { src, src_mip, src_layer, dst, dst_mip, dst_layer, extent } => {
+                            validate_texture_copy_layers(*src_layer, *dst_layer, extent[2])
+                                .map_err(|reason| PlanLoweringError::InvalidCopyCommand { reason })?;
+                            commands.push(GpuCommand::CopyTextureToTexture {
+                                source_texture_id: src.get(), source_mip_level: *src_mip,
+                                source_array_layer: *src_layer, destination_texture_id: dst.get(),
+                                destination_mip_level: *dst_mip, destination_array_layer: *dst_layer,
+                                extent: *extent,
                             });
                         }
                     }
@@ -8393,6 +8471,70 @@ mod tests {
     }
 
     #[test]
+    fn texture_transfer_lowering_and_wire_preserve_order_layout_and_subresources() {
+        use f3d_graph::{CopyCommand, Pass, PassId, PlanSegment, ResourceId};
+        let mut pass = Pass::new_copy(PassId::new(1), "texture_transfers");
+        pass.copies.push(CopyCommand::BufferToTexture {
+            buffer_id: ResourceId::new(7), texture_id: ResourceId::new(8),
+            width: 16, height: 2, bytes_per_row: 512,
+        });
+        pass.copies.push(CopyCommand::TextureToTexture {
+            src: ResourceId::new(8), src_mip: 2, src_layer: 3,
+            dst: ResourceId::new(9), dst_mip: 1, dst_layer: 5, extent: [4, 2, 2],
+        });
+        let plan = ExecutionPlan {
+            segments: vec![PlanSegment::from_pass(&pass)], canvas_epoch: None,
+            pass_count: 1, split_count: 0, split_reasons: Vec::new(),
+        };
+        let commands = lower_plan(&plan).unwrap();
+        assert_eq!(commands, vec![
+            GpuCommand::CopyBufferToTexture {
+                buffer_id: 7, texture_id: 8, width: 16, height: 2, bytes_per_row: 512,
+            },
+            GpuCommand::CopyTextureToTexture {
+                source_texture_id: 8, source_mip_level: 2, source_array_layer: 3,
+                destination_texture_id: 9, destination_mip_level: 1, destination_array_layer: 5,
+                extent: [4, 2, 2],
+            },
+        ]);
+        let bytes = GpuSubmissionPacket::from_commands(commands).encode().unwrap();
+        let word = |at| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!(bytes.len(), 76);
+        assert_eq!(u16::from_le_bytes(bytes[16..18].try_into().unwrap()), OPCODE_COPY_BUFFER_TO_TEXTURE);
+        assert_eq!((0..5).map(|i| word(18 + i * 4)).collect::<Vec<_>>(), vec![7, 8, 16, 2, 512]);
+        assert_eq!(u16::from_le_bytes(bytes[38..40].try_into().unwrap()), OPCODE_COPY_TEXTURE_TO_TEXTURE);
+        assert_eq!((0..9).map(|i| word(40 + i * 4)).collect::<Vec<_>>(), vec![8, 2, 3, 9, 1, 5, 4, 2, 2]);
+    }
+
+    #[test]
+    fn texture_transfer_layer_ranges_are_checked_without_rejecting_empty_copies() {
+        use f3d_graph::{CopyCommand, Pass, PassId, PlanSegment, ResourceId};
+        for (source_layer, destination_layer, layers, valid) in [
+            (u32::MAX, 0, 1, false), (0, u32::MAX, 1, false),
+            (u32::MAX, u32::MAX, 0, true), (2, 3, 0, true), (2, 3, 4, true),
+        ] {
+            let pass = Pass::new_copy(PassId::new(1), "texture_layers").with_copy(
+                CopyCommand::TextureToTexture {
+                    src: ResourceId::new(8), src_mip: 0, src_layer: source_layer,
+                    dst: ResourceId::new(9), dst_mip: 0, dst_layer: destination_layer,
+                    extent: [1, 1, layers],
+                },
+            );
+            let plan = ExecutionPlan {
+                segments: vec![PlanSegment::from_pass(&pass)], canvas_epoch: None,
+                pass_count: 1, split_count: 0, split_reasons: Vec::new(),
+            };
+            assert_eq!(lower_plan(&plan).is_ok(), valid);
+            let command = GpuCommand::CopyTextureToTexture {
+                source_texture_id: 8, source_mip_level: 0, source_array_layer: source_layer,
+                destination_texture_id: 9, destination_mip_level: 0, destination_array_layer: destination_layer,
+                extent: [1, 1, layers],
+            };
+            assert_eq!(GpuSubmissionPacket::from_commands(vec![command]).encode().is_ok(), valid);
+        }
+    }
+
+    #[test]
     fn negotiation_succeeds_when_profile_supported() {
         let req = GpuRequiredProfile {
             required_features: vec![String::from("depth-clip-control")],
@@ -13978,9 +14120,9 @@ mod tests {
             Err(PlanLoweringError::InvalidCopyCommand { .. })
         ));
 
-        let unsupp_seg = PlanSegment {
+        let texture_copy_seg = PlanSegment {
             pass_id: PassId::new(1),
-            name: "unsupp_copy".to_string(),
+            name: "texture_copy".to_string(),
             kind: PassKind::Copy,
             color_attachments: vec![],
             depth_stencil_attachment: None,
@@ -13998,17 +14140,25 @@ mod tests {
             versioned_reads: vec![],
             versioned_writes: vec![],
         };
-        let unsupp_plan = ExecutionPlan {
-            segments: vec![unsupp_seg],
+        let texture_copy_plan = ExecutionPlan {
+            segments: vec![texture_copy_seg],
             canvas_epoch: None,
             pass_count: 1,
             split_count: 0,
             split_reasons: vec![],
         };
-        assert!(matches!(
-            lower_plan(&unsupp_plan),
-            Err(PlanLoweringError::UnsupportedCopyCommand { .. })
-        ));
+        assert_eq!(
+            lower_plan(&texture_copy_plan).unwrap(),
+            vec![GpuCommand::CopyTextureToTexture {
+                source_texture_id: 1,
+                source_mip_level: 0,
+                source_array_layer: 0,
+                destination_texture_id: 2,
+                destination_mip_level: 0,
+                destination_array_layer: 0,
+                extent: [1, 1, 1],
+            }]
+        );
     }
 
     #[test]
