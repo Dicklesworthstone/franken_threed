@@ -12,20 +12,17 @@ const encoded = (text) => "data:text/javascript;base64," + Buffer.from(text).toS
 const sceneBoundary = encoded(
   "export async function createGpuAnimationScene(device,pose,drawables,options){return device.createScene(pose,drawables,options);}",
 );
-let gpuSource = readFileSync(new URL("./animation_model_gpu.mjs", import.meta.url), "utf8");
-for (const name of [
-  "animation_model.mjs",
-  "animation_runtime.mjs",
-  "animation_scene.mjs",
-  "animation_model_pick.mjs",
-])
-  gpuSource = gpuSource.replace(
-    "'./" + name + "'",
-    JSON.stringify(
-      name === "animation_scene.mjs" ? sceneBoundary : new URL("./" + name, import.meta.url).href,
-    ),
+// A data URL has no base for relative imports. Keep native boundaries explicit
+// while resolving every other static dependency against the real module.
+function testModule(name, replacements) {
+  const url = new URL(name, import.meta.url);
+  const source = readFileSync(url, "utf8").replace(
+    /\bfrom\s+(["'])(\.\/[^"']+)\1/g,
+    (_, quote, path) => "from " + JSON.stringify(replacements[path] ?? new URL(path, url).href),
   );
-const gpuModule = encoded(gpuSource);
+  return encoded(source);
+}
+const gpuModule = testModule("./animation_model_gpu.mjs", { "./animation_scene.mjs": sceneBoundary });
 const { createGpuGltfAnimationScene, createGpuDecodedAnimationScene } = await import(gpuModule);
 const near = (a, b, e = 1e-6) => {
   assert.equal(a.length, b.length);
@@ -594,15 +591,11 @@ const assetBoundary = encoded(
 const textureBoundary = encoded(
   "export class GltfTextureError extends Error {}\nexport async function createGltfTextureResources(device,requests,readImage,options){return device.textureResources(requests,readImage,options);}",
 );
-let loaderSource = readFileSync(new URL("./gltf_scene_loader.mjs", import.meta.url), "utf8");
-for (const [name, url] of [
-  ["gltf_asset.mjs", assetBoundary],
-  ["gltf_textures.mjs", textureBoundary],
-  ["animation_model_gpu.mjs", gpuModule],
-  ["animation_model.mjs", new URL("./animation_model.mjs", import.meta.url).href],
-])
-  loaderSource = loaderSource.replace("'./" + name + "'", JSON.stringify(url));
-const { loadGpuGltfAnimationScene } = await import(encoded(loaderSource));
+const { loadGpuGltfAnimationScene } = await import(testModule("./gltf_scene_loader.mjs", {
+  "./gltf_asset.mjs": assetBoundary,
+  "./gltf_textures.mjs": textureBoundary,
+  "./animation_model_gpu.mjs": gpuModule,
+}));
 async function loaded({ picking = true } = {}) {
   const f = fixture({ textured: true }),
     d = device();

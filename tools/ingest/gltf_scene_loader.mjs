@@ -231,16 +231,22 @@ export async function loadGpuGltfAnimationScene(
     throw error;
   }
   function release() {
+    // The model may reject disposal while a source getter is running. Ask it
+    // first so a live scene retains its presentation, textures and export data.
+    let released = false;
     try {
-      presentation?.dispose();
+      model.dispose();
+      released = true;
     } finally {
-      try {
-        model.dispose();
-      } finally {
-        resources.dispose();
-        exportSources = [];
-        sourceSnapshot = null;
-        sourceWriter = null;
+      if (released || model.disposed || model.failed) {
+        try {
+          presentation?.dispose();
+        } finally {
+          resources.dispose();
+          exportSources = [];
+          sourceSnapshot = null;
+          sourceWriter = null;
+        }
       }
     }
   }
