@@ -87,6 +87,59 @@ test('pinned upload oracle: stale CPU edits, source +1 coalescing, callbacks, em
   await gpu.whenIdle();gpu.dispose();
 });
 
+test('scene-owned full uploads compare float bits against each resident, including outside the draw range', () => {
+  const d = geometryDevice(), g = new BufferGeometry();
+  const backing = new Float32Array(30001), array = backing.subarray(1);
+  const bits = new Uint32Array(array.buffer, array.byteOffset, array.length);
+  const position = new BufferAttribute(array, 3);
+  let callbacks = 0;
+  position.onUpload(() => callbacks++);
+  g.setAttribute('position', position).setDrawRange(0, 3);
+  const history = createWebGLInstanceHistory({geometry: true});
+  const options = {instanceHistory: history, sceneOwnedBuffers: true};
+  const a = createGpuBufferGeometry(d, g, options), b = createGpuBufferGeometry(d, g, options);
+  const writes = () => d.writes.splice(0).map(({offset, input}) => [offset, input.byteLength]);
+  assert.deepEqual(writes(), [[0, array.byteLength], [0, array.byteLength]]);
+
+  bits[2] = 0x80000000; // -0 is a different upload from +0.
+  bits[4] = 0x7fc00001;
+  position.needsUpdate = true; a.update();
+  assert.deepEqual(writes(), [[8, 12]]);
+  bits[4] = 0x7fc00002;
+  position.needsUpdate = true; a.update();
+  assert.deepEqual(writes(), [[16, 4]]);
+  const tail = array.length - 1;
+  bits[tail] = 0x80808080;
+  position.addUpdateRange(tail, 1);
+  position.needsUpdate = true; a.update();
+  assert.deepEqual(writes(), [[tail * 4, 4]]);
+  bits[tail] = 0; // No version: a lagging destination must see the accepted bytes.
+  b.update();
+  assert.deepEqual(writes(), [[8, (tail - 1) * 4]]);
+  const resident = new Uint32Array(b.vertexBuffer.data);
+  assert.equal(resident[2], 0x80000000);
+  assert.equal(resident[4], 0x7fc00002);
+  assert.equal(resident[tail], 0x80808080);
+  assert.equal(callbacks, 4);
+
+  bits[tail] = resident[tail];
+  position.needsUpdate = true; a.update(); b.update();
+  assert.deepEqual(writes(), []);
+  assert.equal(callbacks, 5, 'a no-change full request still acknowledges the source upload');
+  a.dispose(); b.dispose(); history.dispose();
+});
+
+test('a full update restores externally modified bytes on a publicly borrowed geometry buffer', () => {
+  const d = geometryDevice(), array = new Float32Array(30000);
+  const position = new BufferAttribute(array, 3);
+  const g = new BufferGeometry().setAttribute('position', position), gpu = createGpuBufferGeometry(d, g);
+  d.queue.writeBuffer(gpu.vertexBuffer, 80, new Uint32Array([0xdeadbeef]));
+  position.needsUpdate = true; gpu.update();
+  assert.equal(new Uint32Array(gpu.vertexBuffer.data)[20], 0);
+  assert.equal(d.writes.at(-1).input.byteLength, array.byteLength);
+  gpu.dispose();
+});
+
 test('shared WebGL history sends sparse edits to a current buffer and repairs a lagging one', () => {
   const device = geometryDevice(), source = geometry(), position = source.attributes.position;
   const history = createWebGLInstanceHistory({geometry: true});

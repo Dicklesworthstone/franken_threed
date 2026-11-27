@@ -1314,7 +1314,7 @@ export async function createGpuThreeScene(device,scene,{
           gpu=byKey.get(compiled.attributesKey);
           if(!gpu){
             gpu=(native?createGpuProgramGeometry:programSupport.createGeometry)(device,item.programSource,native?compiled.attributes:compiled.program.reflection.attributes,{...geometryOptions,maxBytes:maxGeometryBytes,
-              instanceHistory,
+              instanceHistory,sceneOwnedBuffers:true,
               ...(native?{attributeTypes:'webgpu'}:{}),
               maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
             byKey.set(compiled.attributesKey,gpu);
@@ -1355,7 +1355,7 @@ export async function createGpuThreeScene(device,scene,{
         }else{
           gpu=geometries.get(item.geometry);
           if(!gpu){
-            try{gpu=createGpuBufferGeometry(device,item.geometry,{...geometryOptions,maxBytes:maxGeometryBytes,sourceAttributeCallbacks,instanceHistory,
+            try{gpu=createGpuBufferGeometry(device,item.geometry,{...geometryOptions,maxBytes:maxGeometryBytes,sourceAttributeCallbacks,instanceHistory,sceneOwnedBuffers:true,
               maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});}
             catch(error){
               // WebGL surface: a geometry layout the core cannot stream (e.g. an
@@ -2073,7 +2073,7 @@ export async function createGpuThreeScene(device,scene,{
           }
           let gpu=byKey.get(desc.program.attributesKey);
           if(!gpu){
-            gpu=programSupport.createGeometry(device,source,reflection.attributes,{...geometryOptions,maxBytes:maxGeometryBytes,
+            gpu=programSupport.createGeometry(device,source,reflection.attributes,{...geometryOptions,maxBytes:maxGeometryBytes,sceneOwnedBuffers:true,
               maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
             byKey.set(desc.program.attributesKey,gpu);
           }else gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});

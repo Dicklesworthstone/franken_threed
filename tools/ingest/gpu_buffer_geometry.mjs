@@ -264,7 +264,7 @@ export function bufferGeometrySnapshot(handle, device) {
 
 function createResidency(device, geometry, {
   maxBytes = 64 * 1024 * 1024, maxInitialBytes = maxBytes, maxAttributes = 128, label = 'f3d-buffer-geometry',
-  sourceAttributeCallbacks = true, instanceHistory = null,
+  sourceAttributeCallbacks = true, instanceHistory = null, sceneOwnedBuffers = false,
 } = {}, describeSource = describe, sourceRange = range, registry = states) {
   integer(maxBytes, 1, Number.MAX_SAFE_INTEGER, 'byte budget');
   integer(maxInitialBytes, 0, maxBytes, 'initial allocation budget');
@@ -343,7 +343,7 @@ function createResidency(device, geometry, {
     if (failed) throw stop(caught);
     return result;
   }
-  function write(record, array, start, end) {
+  function write(record, array, start, end, fullUpload = false) {
     if (record.divisor > 1) {
       if (start === end) return;
       const {stride, divisor, conversion, shadow} = record;
@@ -373,6 +373,18 @@ function createResidency(device, geometry, {
       native(() => device.queue.writeBuffer(record.buffer, start * 4, record.shadow, start * 4, (end - start) * 4));
       record.revision++; stats.uploads++; stats.uploadedBytes += (end - start) * 4;
       return;
+    }
+    // Only the scene bridge owns these buffers exclusively. Public residency
+    // handles can lend their buffer to another GPU writer. A full upload there
+    // must overwrite it even when the CPU bytes match our previous shadow.
+    if (sceneOwnedBuffers && fullUpload && record.version >= 0 &&
+        array instanceof Float32Array && array.byteLength >= 64 * 1024) {
+      const next = new Uint32Array(array.buffer, array.byteOffset, array.length);
+      const previous = new Uint32Array(record.shadow.buffer, 0, array.length);
+      // Compare representations to preserve signed zeros and NaN payloads.
+      // Only trim the edges, leaving at most one write per full upload.
+      while (start < end && next[end - 1] === previous[end - 1]) end--;
+      while (start < end && next[start] === previous[start]) start++;
     }
     const from = start * array.BYTES_PER_ELEMENT, to = end * array.BYTES_PER_ELEMENT;
     if (to === from) return;
@@ -470,7 +482,7 @@ function createResidency(device, geometry, {
         if (sourceAttributeCallbacks && instanceHistory?.eligible(entry)) {
           const state = instanceHistory.upload(owner, (accepted, ranges) => {
             if (!ranges) {
-              write(record, accepted, 0, accepted.length);
+              write(record, accepted, 0, accepted.length, true);
               return;
             }
             for (const {start, count} of ranges) {
@@ -487,7 +499,7 @@ function createResidency(device, geometry, {
           record.version = owner.version;
         } else if (record.version < owner.version) {
           const ranges = owner.updateRanges;
-          if (record.version === -1 || ranges.length === 0) write(record, array, 0, array.length);
+          if (record.version === -1 || ranges.length === 0) write(record, array, 0, array.length, true);
           else {
             mergeRanges(ranges);
             for (const r of ranges) {
