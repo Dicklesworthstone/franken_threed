@@ -1263,11 +1263,21 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   // A factory argument stays local only when every invocation of its owner
   // supplies one known synchronous function, and the parameter is solely used
   // as a direct call target. No callback aliases, forwarding or heap simulation.
+  // Index references by lexical binding once. A packaged library can have
+  // thousands of helper parameters sharing the same module-sized syntax tree.
+  const parameterUses = new Map();
+  for (const owner of closedHelpers) for (const parameter of owner.params) {
+    const cell = binding(parameter);
+    if (!helperWrites.has(cell)) parameterUses.set(cell, []);
+  }
+  if (parameterUses.size) for (const node of nodes) {
+    if (node.type === "Identifier") parameterUses.get(binding(node))?.push(node);
+  }
   for (const owner of closedHelpers) for (const parameter of owner.params) {
     if (callbackParameters.size >= 64) break;
     const cell = binding(parameter);
-    if (helperWrites.has(cell)) continue;
-    const uses = nodes.filter(node => node.type === "Identifier" && node !== parameter && binding(node) === cell);
+    if (!parameterUses.has(cell)) continue;
+    const uses = parameterUses.get(cell).filter(node => node !== parameter);
     if (!uses.length || uses.some(node => {
       const call = parents.get(node);
       return call?.type !== "CallExpression" || call.callee !== node || call.arguments.some(value => value.type === "SpreadElement");
