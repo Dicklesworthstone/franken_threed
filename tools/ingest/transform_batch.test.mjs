@@ -19,7 +19,7 @@ async function fixture(options={},withBundleGroup=false) {
   // Unrelated asset, geometry and animation compilers stay outside this fixture;
   // transform_batch_application.test.mjs still runs the complete production build.
   plugin.transform=(code,id)=>{
-    if(!code.includes('class Matrix4'))return null;
+    if(!code.includes('class Matrix4') && !code.includes('class BundleGroup'))return null;
     const matrix=specializeMatrixMultiply(code,{...options,runtimeModule:'\0f3d-matrix-multiply-adapter'});
     const batch=specializeTransformBatch(code,{...options,runtimeModule:'\0f3d-transform-batch-adapter'});
     const base=specializeMarchingCubesBase(code,{runtimeModule:'\0f3d-marching-cubes-adapter'});
@@ -164,11 +164,14 @@ test('a single-child chain is batched and add/remove/reparent edits rebuild sour
   }
 });
 
-test('H1 BundleGroup with 4000 Mesh children and one InstancedMesh updates all 4001 leaves in one Wasm call per frame',async()=>{
+test('H1 scene batches its light, BundleGroup, 4000 Mesh children and InstancedMesh in one world update',async()=>{
   const {api}=await fixture({},true),actual=group(api,4000,api.BundleGroup),expected=group(reference,4000,ReferenceBundleGroup);
   const instanced=new api.InstancedMesh(new api.BufferGeometry(),new api.MeshBasicMaterial(),10);
   const refInstanced=new reference.InstancedMesh(new reference.BufferGeometry(),new reference.MeshBasicMaterial(),10);
   actual.add(instanced);expected.add(refInstanced);
+  const scene=new api.Scene(),refScene=new reference.Scene();
+  scene.add(new api.DirectionalLight(),actual);
+  refScene.add(new reference.DirectionalLight(),expected);
   const identities=actual.children.map(child=>[child.matrix,child.matrix.elements,child.matrixWorld,child.matrixWorld.elements,
     child.position,child.rotation,child.quaternion,child.scale]);
   const matrix=new api.Matrix4(),rotation=new api.Matrix4(),refMatrix=new reference.Matrix4(),refRotation=new reference.Matrix4();
@@ -184,9 +187,9 @@ test('H1 BundleGroup with 4000 Mesh children and one InstancedMesh updates all 4
       matrix.multiply(rotation);refMatrix.multiply(refRotation);
       instanced.setMatrixAt(i,matrix);refInstanced.setMatrixAt(i,refMatrix);
     }
-    actual.updateMatrixWorld();expected.updateMatrixWorld();same(actual,expected);
+    scene.updateMatrixWorld();refScene.updateMatrixWorld();same(scene,refScene);
     assert.deepEqual(instanced.instanceMatrix.array,refInstanced.instanceMatrix.array);
-    assert.deepEqual(api.diagnostics(actual),{wasmCalls:frame+1,objects:4001*(frame+1),fallbackCalls:0,lastFailure:null});
+    assert.deepEqual(api.diagnostics(scene),{wasmCalls:frame+1,objects:4003*(frame+1),fallbackCalls:0,lastFailure:null});
   }
   for(let i=0;i<actual.children.length;i++){
     const child=actual.children[i];

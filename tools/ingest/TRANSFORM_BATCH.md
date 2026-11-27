@@ -16,6 +16,11 @@ witnesses. Mixed source/core graphs do not merge distinct class families.
 Modified arithmetic owners or an unregistered constructor keep the original
 JavaScript traversal, without inspecting an unknown constructor.
 
+H1’s default render-bundle group can participate in its parent scene’s transaction.
+The source module and both distributed WebGPU builds register the pinned
+`BundleGroup` prototype against its inherited world-update methods. The group’s
+`static` flag and `needsUpdate` setter retain their original behavior.
+
 Ordinary lights (including light probes and rectangle lights), lines and their
 loop/segment variants, points, sprites and LOD objects can share the same
 transaction with meshes and groups. Their pinned class modules register the

@@ -9,6 +9,7 @@ import {specializeTransformBatch,transformBatchSourceRole} from './transform_bat
 import {specializeMatrixMultiply} from './matrix_multiply_specialization.mjs';
 import {specializeMarchingCubesBase} from './marching_cubes_specialization.mjs';
 import * as reference from '../../upstream/three.js/src/Three.Core.js';
+import ReferenceBundleGroup from '../../upstream/three.js/src/renderers/common/BundleGroup.js';
 
 const upstream=fileURLToPath(new URL('../../upstream/three.js/',import.meta.url));
 const matrixSource=fs.readFileSync(path.join(upstream,'src/math/Matrix4.js'),'utf8');
@@ -42,7 +43,8 @@ async function fixture(options={},changedMatrix=false,withCore=false,production=
       transformed=transformed.slice(0,edit.start)+edit.text+transformed.slice(edit.end);
     return {code:matrix.header+batch.header+(base.header??'')+transformed+matrix.tail+batch.tail,map:null};
   };
-  const source=Object.entries(paths).map(([name,file])=>'export {'+name+'} from '+
+  const source='export {default as BundleGroup} from '+JSON.stringify(path.join(upstream,'src/renderers/common/BundleGroup.js'))+';'+
+    Object.entries(paths).map(([name,file])=>'export {'+name+'} from '+
     JSON.stringify(path.join(upstream,'src',file+'.js'))+';').join('\n')+
     (withCore?'export {Object3D as CoreObject3D,Group as CoreGroup} from '+JSON.stringify(path.join(upstream,'build/three.core.js'))+';':'')+
     'export {transformBatchDiagnostics as diagnostics} from '+JSON.stringify('\0f3d-transform-batch-adapter')+';';
@@ -203,7 +205,7 @@ test('source module spans preserve camera and skin barriers between ordinary obj
       }
       return {root,barrier};
     };
-    const actual=make(api),expected=make(reference);
+    const actual=make(api,api.BundleGroup),expected=make(reference,ReferenceBundleGroup);
     update(actual.root,method);update(expected.root,method);same(actual.root,expected.root);
     const field=kind==='Camera'?'matrixWorldInverse':'bindMatrixInverse';
     assert.deepEqual(actual.barrier[field].elements,expected.barrier[field].elements);
@@ -251,17 +253,22 @@ test('production source imports admit pinned inherited classes in mixed scenes',
     assert.equal(transformBatchSourceRole(source),kind);
     assert.equal(specializeTransformBatch(source+'\n').changed,false,'Modified '+kind+' must remain source-owned');
   }
+  for(const file of ['src/renderers/common/BundleGroup.js','build/three.webgpu.js','build/three.webgpu.nodes.js']) {
+    const source=fs.readFileSync(path.join(upstream,file),'utf8');
+    assert.equal(transformBatchSourceRole(source),'BundleGroup');
+    assert.equal(transformBatchSourceRole(source+'\n'),null);
+  }
   const {api}=await fixture({},false,false,true);
   for(const method of ['updateMatrixWorld','updateWorldMatrix']) {
-    const make=library=>{
-      const scene=new library.Scene(),branch=new library.Group();scene.add(branch,new library.Object3D());
+    const make=(library,BundleGroup)=>{
+      const scene=new library.Scene(),branch=new BundleGroup();scene.add(branch,new library.Object3D());
       for(const [i,kind]of kinds.entries()) {
         const child=new library[kind]();child.position.set(i/3,-i/7,1);child.rotation.set(i/11,-0.2,0.4);
         child.scale.set(-1,2,0.5);branch.add(child);
       }
       return scene;
     };
-    const actual=make(api),expected=make(reference);
+    const actual=make(api,api.BundleGroup),expected=make(reference,ReferenceBundleGroup);
     update(actual,method);update(expected,method);same(actual,expected);
     assert.equal(api.diagnostics(actual).wasmCalls,1,method);
     assert.equal(api.diagnostics(actual).fallbackCalls,0,method);

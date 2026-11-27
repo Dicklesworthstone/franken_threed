@@ -12,7 +12,7 @@ const objects=new WeakSet(),numbers=new WeakSet(),arrays=new WeakSet(),dispatche
 const registeredClasses=new WeakMap(),registeredConstructors=new WeakMap();
 const own=(object,key)=>{const d=descriptor(object,key);return d && ownKey(d,'value')?d:null;};
 const data=(object,key)=>own(object,key)?.value;
-const nodeKinds=['Object3D','Group','Scene','Bone','Mesh','InstancedMesh',
+const nodeKinds=['Object3D','Group','BundleGroup','Scene','Bone','Mesh','InstancedMesh',
   'Light','AmbientLight','DirectionalLight','HemisphereLight','LightProbe','PointLight','RectAreaLight','SpotLight',
   'Line','LineLoop','LineSegments','Points','Sprite','LOD'];
 const matrixKinds=['Matrix4'],fields=['position','quaternion','scale'];

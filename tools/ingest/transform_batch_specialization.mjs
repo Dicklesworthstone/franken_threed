@@ -6,6 +6,7 @@ import {normalClasses,normalMethod} from './geometry_normals_compile.mjs';
 import {compileNumericKernel} from './numeric_kernel.mjs';
 const coreHash='9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
 const sourceBlobs={Object3D:'a0a09156f7e781130de6a361cf2c443b8c27d925',
+  BundleGroup:'00608588423b8a1111a78c9340f307b1364bc25c',
   Group:'5acef7bc677d6830b514a56e6a0b8bd24d3e27fd',Scene:'21bcb96007df7bc1bfa98c5c6d613205de96795d',
   Bone:'6078326b104657e9357e4cbeea51ab59e5d50f3d',Mesh:'b80d3de8f403a696145ab131581b17263e510c59',
   InstancedMesh:'d55dc5d1311200f9ea7815c7cb7669a593f73948',
@@ -34,6 +35,9 @@ const unchanged=()=>({changed:false,edits:[],header:'',tail:''});
 export function transformBatchSourceRole(source) {
   const blob=sourceBlob(source);
   for(const [role,expected] of Object.entries(sourceBlobs))if(blob===expected)return role;
+  // The WebGPU distributions define BundleGroup beside their renderer and
+  // import its Group superclass from the distinct core module.
+  if(blob==='8cbb77a7bd36c6a89d397f18f8758fc60ff8146e' || blob==='fda563ffd328b99dc693d884f51fd39beb530a47')return 'BundleGroup';
   return createHash('sha256').update(source).digest('hex')===coreHash?'core':null;
 }
 const fresh=(source,name)=>{let value='__f3d_transforms_'+name;while(source.includes(value))value+='_';return value;};
@@ -53,7 +57,7 @@ export function specializeTransformBatch(source,{runtimeModule,matrixSource,maxM
   const register=fresh(source,'register'),numericAllocation=fresh(source,'numeric');
   if(!['core','Object3D'].includes(role)) {
     const imports=[];
-    if(nodeClasses.includes(role)) {
+    if(role==='BundleGroup' || nodeClasses.includes(role)) {
       const cls=classes.get(role);
       edits.push({start:cls.end,end:cls.end,text:'\n'+register+'(null,'+JSON.stringify(role)+','+role+');\n'});
       imports.push('registerTransformBatchClass as '+register);
