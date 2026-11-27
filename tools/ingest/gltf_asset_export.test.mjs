@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { parseGltfAsset } from "./gltf_asset.mjs";
+import { selectGltfMaterialVariant } from "./gltf_material_variants.mjs";
 import { exportGltfAssetGLB, GltfAssetExportError } from "./gltf_asset_export.mjs";
 
 const png = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10, 11, 12, 13]);
@@ -709,3 +711,51 @@ for (const interpolation of ["STEP", "LINEAR", "CUBICSPLINE"])
     assert.deepEqual([...new Float32Array(out.view(view).buffer)], values);
     assert.deepEqual(out.json.nodes[2].weights, [0.25]);
   });
+
+test("authored glass, fabric and variant-only images survive GLB export and variant selection", async () => {
+  const asset = fixture();
+  const variants = "KHR_materials_variants";
+  const glass = {
+    KHR_materials_dispersion: { dispersion: 0.2 },
+    KHR_materials_ior: { ior: 1.52 },
+    KHR_materials_iridescence: { iridescenceFactor: 0.4, iridescenceTexture: { index: 0 } },
+    KHR_materials_specular: { specularColorTexture: { index: 0 }, specularFactor: 0.9 },
+    KHR_materials_transmission: { transmissionFactor: 1, transmissionTexture: { index: 0 } },
+    KHR_materials_volume: { thicknessFactor: 0.8, attenuationColor: [0.7, 1, 0.9] },
+  };
+  const fabric = {
+    KHR_materials_anisotropy: { anisotropyStrength: 0.4, anisotropyTexture: { index: 1 } },
+    KHR_materials_sheen: { sheenColorFactor: [1, 0.5, 0.2], sheenColorTexture: { index: 1 } },
+  };
+  asset.json.materials = [{ name: "Glass", extensions: glass }, { name: "Silk", extensions: fabric }];
+  asset.json.extensionsUsed = [variants, ...Object.keys(glass), ...Object.keys(fabric)];
+  asset.json.extensionsRequired = ["KHR_materials_transmission", variants];
+  asset.json.extensions = { [variants]: { variants: [{ name: "Silk" }] } };
+  asset.json.meshes[0].primitives[0].extensions = {
+    [variants]: { mappings: [{ material: 1, variants: [0] }] },
+  };
+
+  // Simulate an unused fallback ahead of live accessors left by codec normalization.
+  asset.buffers.push(null);
+  asset.json.buffers.push({ byteLength: 4 });
+  asset.json.bufferViews.unshift({ buffer: 3, byteLength: 4 });
+  for (const accessor of asset.json.accessors) accessor.bufferView++;
+  asset.json.accessors.push({ bufferView: 0, componentType: 5126, type: "SCALAR", count: 1 });
+
+  const { json, bin } = parseGltfAsset(await exportGltfAssetGLB(asset));
+  assert.equal(json.accessors.length, asset.json.accessors.length - 1);
+  assert.deepEqual(json.extensionsRequired, asset.json.extensionsRequired);
+  assert.deepEqual(json.extensionsUsed, asset.json.extensionsUsed);
+  assert.deepEqual(json.materials, asset.json.materials);
+  assert.deepEqual(json.extensions, asset.json.extensions);
+  assert.deepEqual(json.meshes, asset.json.meshes);
+  const { json: selected } = selectGltfMaterialVariant(json, "Silk");
+  assert.equal(selected.meshes[0].primitives[0].material, 1);
+  assert.equal(json.meshes[0].primitives[0].material, 0);
+  const index = selected.materials[1].extensions.KHR_materials_sheen.sheenColorTexture.index;
+  const image = json.images[json.textures[index].source];
+  const view = json.bufferViews[image.bufferView];
+  assert.equal(image.mimeType, "image/jpeg");
+  assert.deepEqual(bin.slice(view.byteOffset, view.byteOffset + view.byteLength), jpeg);
+  assert.deepEqual(asset.calls, [0, 1]);
+});

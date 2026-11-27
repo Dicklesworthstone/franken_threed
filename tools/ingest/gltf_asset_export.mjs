@@ -26,6 +26,17 @@ const EXTENSIONS = new Set([
   "KHR_materials_unlit",
   "KHR_materials_emissive_strength",
   "KHR_materials_clearcoat",
+  // r186 physical material parameters reference stable texture indices. Variant
+  // mappings select materials by index; neither group addresses binary storage.
+  "KHR_materials_anisotropy",
+  "KHR_materials_dispersion",
+  "KHR_materials_ior",
+  "KHR_materials_iridescence",
+  "KHR_materials_sheen",
+  "KHR_materials_specular",
+  "KHR_materials_transmission",
+  "KHR_materials_volume",
+  "KHR_materials_variants",
   "KHR_texture_transform",
   "KHR_texture_basisu",
   "EXT_texture_webp",
