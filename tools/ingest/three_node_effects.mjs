@@ -81,14 +81,14 @@ export function createThreeNodeEffects(three, renderer, {fail, maxTargets = 64} 
     };
   }
 
-  function inspectPipelineState(state) {
+  function inspectPipelineState(state, code = 'PASS') {
     const owner = state?.viewOffsetOwner, captured = state && pipelineStates.get(state);
     if (owner === null && captured === undefined) return;
     // The effect claims this shared state while constructing its source graph,
     // before its PassTextureNode registers the producer. Runtime inspection
     // requires both relationships; assigning a lookalike context is insufficient.
     if (!owner || owner !== captured || !producers.has(owner))
-      fail('PASS', 'Native view offsets require the captured texture producer and source pipeline state');
+      fail(code, 'Native view offsets require the captured texture producer and source pipeline state');
     inspectProducer(owner);
   }
 

@@ -20,7 +20,7 @@ let lightingHookSerial = 0;
  * draws still reference an older context. The callable output hook has the same
  * authored-graph boundary as ordinary contexts; writable source fields do not
  * authenticate how a hook was created before its first observation. */
-function inspectDirectPipelineContext(three, node, data, child, renderer, code) {
+function inspectDirectPipelineContext(three, node, data, child, renderer, code, inspectPipelineState) {
   const pipeline = Object.getOwnPropertyDescriptor(data, 'renderPipeline')?.value;
   const source = three.DirectRenderPipeline?.prototype;
   if (!source || !pipeline || Object.getPrototypeOf(pipeline) !== source || !renderer)
@@ -43,8 +43,12 @@ function inspectDirectPipelineContext(three, node, data, child, renderer, code) 
       Object.hasOwn(values, 'toneMapping') !== Object.hasOwn(values, 'outputColorSpace'))
     fail('Native direct contexts require source pipeline callback and output metadata', code);
   const state = values.renderPipelineState?.value;
-  if (!state || ![Object.prototype, null].includes(Object.getPrototypeOf(state)) ||
-      Reflect.ownKeys(state).length !== 1 || Object.getOwnPropertyDescriptor(state, 'viewOffsetOwner')?.value !== null)
+  const ownerField = state && Object.getOwnPropertyDescriptor(state, 'viewOffsetOwner');
+  if (!ownerField || !('value' in ownerField) || Reflect.ownKeys(state).length !== 1 ||
+      ![Object.prototype, null].includes(Object.getPrototypeOf(state)))
+    fail('Native direct pipeline state requires its source view-offset data field', code);
+  if (inspectPipelineState) inspectPipelineState(state, code);
+  else if (ownerField.value !== null)
     fail('Native direct view offsets require their captured texture-producer owner', code);
   const descriptors = Object.getOwnPropertyDescriptors(data);
   if (Reflect.ownKeys(descriptors).length !== keys.length + 1 ||
@@ -83,7 +87,7 @@ export function inspectThreeNativeCamera(three, camera, code = 'CAMERA') {
  * retained builder; never evaluate them during admission.
  * Hook identity and ContextNode.version are structural, uniform values live.
  */
-export function inspectThreeLightingContext(three, context, code = 'GRAPH', matrixValues = true, renderer = null) {
+export function inspectThreeLightingContext(three, context, code = 'GRAPH', matrixValues = true, renderer = null, inspectPipelineState = null) {
   if (context == null) return null;
   const seen = new Set(), signature = [];
   let hasHooks = false;
@@ -101,7 +105,7 @@ export function inspectThreeLightingContext(three, context, code = 'GRAPH', matr
         Object.values(descriptors).some(descriptor => !('value' in descriptor)))
       fail('Native lighting contexts require source data properties and ContextNode children', code);
     const directFields = Object.hasOwn(data, 'renderPipeline')
-      ? inspectDirectPipelineContext(three, node, data, child, renderer, code) : null;
+      ? inspectDirectPipelineContext(three, node, data, child, renderer, code, inspectPipelineState) : null;
     const hooks = [];
     for (const key of Reflect.ownKeys(data)) {
       const descriptor = Object.getOwnPropertyDescriptor(data, key);

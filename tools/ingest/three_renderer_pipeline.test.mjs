@@ -70,11 +70,11 @@ function fixture(t, options = {}) {
   return {renderer, device, canvas, configurations, scene, camera, material, mesh};
 }
 
-function traaPipeline(t, f) {
+function traaPipeline(t, f, Pipeline = T.RenderPipeline) {
   const pass = N.pass(f.scene, f.camera);
   pass.setMRT(N.mrt({output: N.output, velocity: N.velocity}));
   const effect = traa(pass.getTextureNode(), pass.getTextureNode('depth'), pass.getTextureNode('velocity'), f.camera);
-  const pipeline = new T.RenderPipeline(f.renderer, effect);
+  const pipeline = new Pipeline(f.renderer, effect);
   t.after(() => { pipeline.dispose(); effect.dispose(); pass.dispose(); });
   return {pass, effect, pipeline};
 }
@@ -220,6 +220,53 @@ test('native TRAA retains source first-frame depth, jitter, velocity and GPU his
   assert.equal(effect._historyRenderTarget.depthBuffer, false);
   assert.equal(f.renderer._targets.capture(effect._historyRenderTarget).shape.depthAttachment, false);
   assert.equal(f.device.textureWrites.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('direct pipeline samples a TRAA producer inline and retains its source jitter lifecycle', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const {effect, pipeline} = traaPipeline(t, f, T.DirectRenderPipeline);
+  const context = f.renderer.contextNode, generations = [], jitter = [];
+  f.material.colorNode.onRenderUpdate(() => {
+    if (f.renderer.getMRT() !== null) jitter.push([f.camera.view.offsetX, f.camera.view.offsetY]);
+    return new T.Color(.25, .5, .75);
+  });
+  for (let frame = 0; frame < 3; frame++) {
+    if (frame === 2) pipeline.needsUpdate = true;
+    f.renderer._advanceAnimationFrame();
+    pipeline.render(f.scene, f.camera);
+    generations.push(pipeline._contextData);
+    assert.equal(f.camera.view.enabled, false);
+    assert.equal(f.renderer.contextNode, context);
+    assert.equal(effect._jitterIndex, frame + 1);
+  }
+  await drain(f.renderer);
+  assert.equal(generations[1], generations[0]);
+  assert.notEqual(generations[2], generations[0]);
+  for (const data of generations) {
+    assert.equal(data.renderPipelineState.viewOffsetOwner, effect);
+    assert.equal(data.onBeforePipelineCallbacks.length, 1);
+    assert.equal(data.onAfterPipelineCallbacks.length, 1);
+  }
+  assert.equal(new Set(jitter.map(JSON.stringify)).size, 3);
+  const draws = nativeDraws(f.device);
+  assert.equal(draws.length, 9, 'one scene producer, temporal resolve, and inline mesh per frame');
+  assert.equal(draws.filter(draw => draw.pipeline.fragment.targets.length === 2).length, 3);
+  assert.equal(f.device.textureCopies.length, 4);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('an accepted direct temporal pipeline rejects a replaced or cleared producer before further submission', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const {pipeline} = traaPipeline(t, f, T.DirectRenderPipeline);
+  f.renderer._advanceAnimationFrame(); pipeline.render(f.scene, f.camera); await drain(f.renderer);
+  const state = pipeline._contextData.renderPipelineState, count = f.device.submissions.length;
+  for (const owner of [new T.Node(), null]) {
+    state.viewOffsetOwner = owner;
+    f.renderer._advanceAnimationFrame();
+    assert.throws(() => pipeline.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_GRAPH'});
+    assert.equal(f.camera.view.enabled, false);
+    assert.equal(f.device.submissions.length, count);
+  }
 });
 
 test('queued TRAA preserves source history lag and accepted images across resize', async t => {

@@ -211,7 +211,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const frame = renderer._nodes.nodeFrame, cache = new WeakMap(), entries = new Set();
   const effects = createThreeNodeEffects(three, renderer, {fail});
   const inspectRendererContext = (code = 'GRAPH', matrixValues = true) =>
-    inspectThreeLightingContext(three, renderer.contextNode, code, matrixValues, renderer);
+    inspectThreeLightingContext(three, renderer.contextNode, code, matrixValues, renderer, effects.inspectPipelineState);
   const physicalPrototypes = [three.MeshPhysicalNodeMaterial.prototype,
     ...(three.MeshSSSNodeMaterial ? [three.MeshSSSNodeMaterial.prototype] : [])];
   const standardPrototypes = [three.MeshStandardNodeMaterial.prototype, ...physicalPrototypes];
@@ -2099,14 +2099,6 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     assertBatch(object, batchSignature);
     assertSkinning(object, skinSignature);
     assertMorphs(object, morphSignature);
-    const acceptedRendererContext = inspectRendererContext('CHANGED');
-    if (!construction?.materialProfile && acceptedRendererContext !== rendererContextSignature)
-      fail('CHANGED', 'Native lighting context changed during source graph construction');
-    // Context construction hooks may update the root context themselves.
-    // The source keeps this builder for the current draw and observes the
-    // resulting identity/version on the next RenderObject comparison.
-    rendererContextSignature = acceptedRendererContext;
-    rendererContextCache = inspectRendererContext('CHANGED', false);
     if ((inspectThreeMRT(three, renderer, material)?.key ?? null) !== mrtKey)
       fail('CHANGED', 'Native MRT context changed during source graph construction');
     const currentPrepared = prepareMaterial(material, materialPrototype(preparedMaterial));
@@ -2172,6 +2164,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     // Producer inspection above registers source-owned pipeline state created
     // during setup (including TRAA's view-offset owner).
+    const acceptedRendererContext = inspectRendererContext('CHANGED');
+    if (!construction?.materialProfile && acceptedRendererContext !== rendererContextSignature)
+      fail('CHANGED', 'Native lighting context changed during source graph construction');
+    // Context construction hooks may update the root context themselves.
+    // The source keeps this builder for the current draw and observes the
+    // resulting identity/version on the next RenderObject comparison.
+    rendererContextSignature = acceptedRendererContext;
+    rendererContextCache = inspectRendererContext('CHANGED', false);
     if (inspectThreePipelineContext(three, renderer, material, object, effects) !== pipelineSignature)
       fail('CHANGED', 'Native material context changed during source graph construction');
     if (bindings.length > Math.min(maxBindGroups, renderer._device?.limits?.maxBindGroups ?? 4))
@@ -2936,7 +2936,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (bundleRefresh(bundleRecord(state, context), context) === three.RenderObjectRefreshType.NONE) return;
     return withFrame(state, context, () => { for (const node of state.builder.updateAfterNodes) frame.updateAfterNode(node); });
   }
-  const api = Object.freeze({inspect, compile, preparePMREM, refresh, before, capture, captureDraw, after, retainFogResources,
+  const api = Object.freeze({inspectPipelineState: effects.inspectPipelineState, inspect, compile, preparePMREM, refresh, before, capture, captureDraw, after, retainFogResources,
     hasCompilationUpdates(descriptor) {
       const state = stateOf(descriptor);
       // Extension setup can create any ordinary source update phase. Public
