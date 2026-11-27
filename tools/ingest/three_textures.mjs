@@ -495,6 +495,11 @@ export function createGpuThreeTextures(device,{
         (!accepted.video||accepted.nativeMedia||
           t.update===T.VideoTexture.prototype.update&&instance(t.image,'HTMLVideoElement')&&
           'requestVideoFrameCallback' in t.image))return accepted;
+    // setTextureCube binds WebGL's default cube before the first requested
+    // upload, even while CubeTextureLoader has only filled some face slots.
+    if(webglVersioning&&!nativeMedia&&!options?.initialize&&t?.isCubeTexture&&
+        t instanceof T.CubeTexture&&!t.isRenderTargetTexture&&!t.isDepthTexture&&t.version===0)
+      fail('NOT_READY','Cube texture has not requested its first upload');
     const d=describe(t,options);
     // A ready rVFC video has no source upload until its first requested version.
     // Automatic bindings use their existing default texture while it is pending.

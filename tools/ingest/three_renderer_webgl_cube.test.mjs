@@ -190,3 +190,38 @@ test('GPU cube capture feeds source PMREM and regenerates the same atlas without
   assert.equal(await pmrem.generate(target.texture), atlas); assert.equal(pmrem.binding(atlas), binding);
   assert.equal(atlas.pmremVersion, 2); assert.equal(device.textureWrites.length, 0);
 });
+
+for (const mapping of [T.CubeReflectionMapping, T.CubeRefractionMapping])
+test(`WebGL Lambert cube mapping ${mapping} draws through asynchronous face loading`, async t => {
+  const {renderer, device} = await rendererFixture(t);
+  const envMap = new T.CubeTexture();
+  envMap.mapping = mapping;
+  const material = new T.MeshLambertMaterial({envMap}), geometry = new T.BoxGeometry();
+  const scene = new T.Scene(), camera = new T.PerspectiveCamera(45, 1, .1, 100);
+  scene.add(new T.Mesh(geometry, material)); camera.position.z = 4;
+  t.after(() => {envMap.dispose(); material.dispose(); geometry.dispose();});
+
+  const draw = async () => {
+    renderer.render(scene, camera);
+    while (renderer._drain) await renderer._drain;
+    await renderer.waitForGPU();
+    const views = device.snapshots.flat().flatMap(draw => [...draw.groups.values()])
+      .flatMap(({group}) => group.entries.map(entry => entry.resource));
+    return views.filter(view => view.dimension === 'cube').at(-1).texture;
+  };
+  const fallback = await draw();
+  assert.equal(fallback.label, 'f3d-default-texture');
+  assert.equal(fallback.depthOrArrayLayers, 6);
+  const face = new T.DataTexture(new Uint8Array(16).fill(127), 2, 2);
+  t.after(() => face.dispose());
+  envMap.image[5] = face;
+  assert.equal(await draw(), fallback, 'face six can finish first');
+  envMap.image.fill(face);
+  assert.equal(await draw(), fallback, 'ready pixels still need an upload request');
+  assert.equal(device.textureWrites.length, 0);
+  envMap.needsUpdate = true;
+  const uploaded = await draw();
+  assert.notEqual(uploaded, fallback);
+  assert.equal(uploaded.depthOrArrayLayers, 6);
+  assert.deepEqual(device.textureWrites.map(([destination]) => destination.origin[2]), [0, 1, 2, 3, 4, 5]);
+});
