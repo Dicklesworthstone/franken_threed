@@ -58,7 +58,7 @@ There is no claim of complete Three.js interaction/control compatibility.
 
 A median-split bounding-volume hierarchy (BVH) with at most eight triangles per
 leaf is built on the first query of each selected mesh. Subsequent deformation
-versions refit its world-space bounds without rebuilding its topology. Repeated
+versions refit its world-space bounds. Repeated
 queries of unchanged outputs reuse both positions and bounds. Nearest-only
 traversal visits nearer boxes first and prunes boxes beyond the best known hit.
 
@@ -75,8 +75,12 @@ comparison or to avoid its additional storage reservation.
 All selected mesh data is validated/refitted before spatial rejection. Invalid
 new geometry cannot be hidden by stale scene bounds. This still entails checking
 selected version stamps and preparing all newly selected or changed geometry;
-the hierarchy does not make the first full-scene query constant-cost. Extreme
-deformation can reduce hierarchy quality, but bounds remain current. This is a
+the hierarchy does not make the first full-scene query constant-cost. For trees with at least 31 nodes, refits compare the current estimated traversal
+cost with the last build. The estimate sums node surface areas, weights each
+leaf by its item count, and divides by the root area. When the cost exceeds
+three times the build cost, the hierarchy regroups its triangles or meshes in
+the existing storage. A seven-refit cooldown limits repeated rebuilds during
+rapid movement. Unchanged selections and geometry skip cost evaluation. This is a
 CPU data-structure path, not a measured GPU or application-level speedup.
 
 `maxTriangles` bounds the aggregate topology (default and hard maximum 1,048,576).
@@ -92,7 +96,8 @@ eligible for source draw/face tie-breaking.
 `bufferBytes` reports retained typed storage. `lastQuery` reports successful-query
 counts and the pose version. `meshesTested` counts mesh-BVH visits; `boxesTested`
 counts boxes inside mesh BVHs. `sceneBoxesTested`, `sceneRebuilds`, and `sceneRefits`
-report the separate scene work. A rebuild includes a refit. Failed queries leave
+report the separate scene work. A rebuild includes a refit. `meshRebuilds` counts mesh topology builds,
+including first use and regroups after deformation. Failed queries leave
 prior hit snapshots and statistics intact; a failed refit is retried on the next
 valid query.
 

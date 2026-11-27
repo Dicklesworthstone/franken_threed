@@ -420,3 +420,27 @@ test("deterministic oblique rays match an independent brute-force triangle oracl
     assert.deepEqual(first, actual.slice(0, 1));
   }
 });
+
+test("deformed triangles repartition in bounded storage and preserve original face IDs", () => {
+  const count = 1024;
+  const positions = new Float32Array(count * 9);
+  function placeFace(output, face, slot) {
+    output.set([4 * slot - 1, -1, 0, 4 * slot + 1, -1, 0, 4 * slot, 1, 0], face * 9);
+  }
+  for (let face = 0; face < count; face++) placeFace(positions, face, face);
+  const { caster, descriptors, pose } = setup([{ positions }]);
+  caster.raycast(ray());
+  assert.equal(caster.lastQuery.meshRebuilds, 1);
+  const bytes = caster.bufferBytes, mesh = descriptors[0].deformer;
+  const slot = face => (face * 513) % count;
+  for (let face = 0; face < count; face++) placeFace(mesh.positions, face, slot(face));
+  mesh.version++;
+  mesh.poseVersion = ++pose.version;
+  for (const face of [511, 1, 100, 1000]) {
+    const hits = caster.raycast(ray([slot(face) * 4, 0, 2]));
+    assert.deepEqual(hits.map(hit => hit.faceIndex), [face]);
+    assert.equal(caster.lastQuery.meshRebuilds, face === 511 ? 1 : 0);
+    assert.ok(caster.lastQuery.trianglesTested <= 8);
+    assert.equal(caster.bufferBytes, bytes);
+  }
+});

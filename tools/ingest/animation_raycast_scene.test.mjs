@@ -163,3 +163,21 @@ test('randomized rays, affine transforms, subsets and pose updates match complet
     advance(d=>{if(random()>0.25)return false;d.worldMatrix[12]+=(random()-0.5)*8;d.worldMatrix[14]+=(random()-0.5)*3;return true;});
   }
 });
+
+test('scene regrouping after large mesh motion preserves source order and bounds visits', t => {
+  const count = 1024;
+  const { compare, tree, advance } = fixture(t, count);
+  compare(ray(0));
+  const bytes = tree.bufferBytes;
+  // Adjacent source IDs now land on opposite sides of the scene. The old
+  // topology would visit most meshes for a ray through the center.
+  const slot = node => (node * 513) % count;
+  advance(d => { d.worldMatrix[12] = slot(d.node) * 4; return true; });
+  for (const node of [512, 1, 411, 1023]) {
+    const hit = compare(ray(slot(node) * 4), { firstHitOnly: true })[0];
+    assert.equal(hit.drawIndex, node);
+    assert.equal(tree.lastQuery.sceneRebuilds, node === 512 ? 1 : 0);
+    assert.ok(tree.lastQuery.meshesTested <= 4);
+    assert.equal(tree.bufferBytes, bytes);
+  }
+});

@@ -1,5 +1,5 @@
 /** Current-pose geometric queries over borrowed CPU deformation outputs.
- * BVHs are built once, refitted on changed deformation versions, and traversed
+ * BVHs refit on changed deformation versions, regroup when degraded, and traverse
  * synchronously. No device, readback, animation clock, events or source routing.
  * Positions are the deformer's mesh-local Float32 outputs; world-space query
  * coordinates must remain finite/f32-representable, as on the renderer route.
@@ -87,6 +87,51 @@ function sourceInfo(source, node, drawIndex) {
   return Object.freeze(result);
 }
 const compareHits = (a, b) => a.distance - b.distance || a.drawIndex - b.drawIndex || a.faceIndex - b.faceIndex;
+
+// Surface-area heuristic for this binary tree. Internal nodes cost one box
+// visit and leaves cost their item count. Normalizing by the root area makes
+// translation and uniform rescaling irrelevant. Flat triangles retain area.
+function hierarchyCost(tree) {
+  const { bounds, count, used } = tree;
+  let cost = 0, rootArea = 0;
+  for (let node = 0; node < used; node++) {
+    const offset = node * 6;
+    const x = bounds[offset + 3] - bounds[offset];
+    const y = bounds[offset + 4] - bounds[offset + 1];
+    const z = bounds[offset + 5] - bounds[offset + 2];
+    const area = x * y + x * z + y * z;
+    if (node === 0) {
+      if (area === 0) return 0;
+      rootArea = area;
+    }
+    cost += area * (count[node] || 1);
+  }
+  return cost / rootArea;
+}
+
+function updateHierarchy(tree, needsBuild, build, fitBounds) {
+  if (needsBuild) build();
+  fitBounds();
+  // Tiny trees have little traversal to save. On larger trees let ordinary
+  // motion refit and rebuild only when the current partitions have degraded.
+  if (tree.used < 31) return needsBuild;
+  if (!needsBuild && tree.rebuildCooldown > 0) {
+    tree.rebuildCooldown--;
+    return false;
+  }
+  const cost = hierarchyCost(tree);
+  if (needsBuild || !tree.buildCost) {
+    tree.buildCost = cost;
+    tree.rebuildCooldown = 0;
+    return needsBuild;
+  }
+  if (cost <= 3 * tree.buildCost) return false;
+  build();
+  fitBounds();
+  tree.buildCost = hierarchyCost(tree);
+  tree.rebuildCooldown = 7;
+  return true;
+}
 
 /** descriptors: [{deformer, indices?, texCoords?, doubleSided?, source?}].
  * Borrowed pose/deformers are never updated or disposed. Selected deformers must
@@ -178,7 +223,8 @@ export function createAnimationRaycaster(pose, descriptors, {
         t.positions[i*3+a]=value;
       }
     }
-    if (!t.used) {
+    function buildTopology() {
+      t.used = 0;
       const centers=new Float64Array(n*3);
       for(let f=0;f<n;f++)for(let a=0;a<3;a++)centers[f*3+a]=(t.positions[indices[f*3]*3+a]+t.positions[indices[f*3+1]*3+a]+t.positions[indices[f*3+2]*3+a])/3;
       function build(start,count) {
@@ -192,19 +238,22 @@ export function createAnimationRaycaster(pose, descriptors, {
       }
       build(0,n);
     }
-    for(let node=t.used-1;node>=0;node--) {
-      const offset=node*6;
-      if(t.count[node]) {
-        for(let a=0;a<3;a++){t.bounds[offset+a]=Infinity;t.bounds[offset+3+a]=-Infinity;}
-        for(let i=t.start[node];i<t.start[node]+t.count[node];i++)for(let c=0;c<3;c++) {
-          const vertex=indices[t.order[i]*3+c]*3;
-          for(let a=0;a<3;a++){const v=t.positions[vertex+a];t.bounds[offset+a]=Math.min(t.bounds[offset+a],v);t.bounds[offset+3+a]=Math.max(t.bounds[offset+3+a],v);}
+    function fitBounds() {
+      for(let node=t.used-1;node>=0;node--) {
+        const offset=node*6;
+        if(t.count[node]) {
+          for(let a=0;a<3;a++){t.bounds[offset+a]=Infinity;t.bounds[offset+3+a]=-Infinity;}
+          for(let i=t.start[node];i<t.start[node]+t.count[node];i++)for(let c=0;c<3;c++) {
+            const vertex=indices[t.order[i]*3+c]*3;
+            for(let a=0;a<3;a++){const v=t.positions[vertex+a];t.bounds[offset+a]=Math.min(t.bounds[offset+a],v);t.bounds[offset+3+a]=Math.max(t.bounds[offset+3+a],v);}
+          }
+        }else for(let a=0;a<3;a++) {
+          t.bounds[offset+a]=Math.min(t.bounds[(node+1)*6+a],t.bounds[t.right[node]*6+a]);
+          t.bounds[offset+3+a]=Math.max(t.bounds[(node+1)*6+3+a],t.bounds[t.right[node]*6+3+a]);
         }
-      }else for(let a=0;a<3;a++) {
-        t.bounds[offset+a]=Math.min(t.bounds[(node+1)*6+a],t.bounds[t.right[node]*6+a]);
-        t.bounds[offset+3+a]=Math.max(t.bounds[(node+1)*6+3+a],t.bounds[t.right[node]*6+3+a]);
       }
     }
+    if (updateHierarchy(t, !t.used, buildTopology, fitBounds)) stats.meshRebuilds++;
     mesh.stamp=d.version;mesh.valid=true;stats.refittedMeshes++;
   }
   function refitScene(active, stats) {
@@ -213,7 +262,7 @@ export function createAnimationRaycaster(pose, descriptors, {
       order:new Uint32Array(sceneMeshCount),meshes:[],used:0};
     const t=sceneTree, rebuild=t.meshes.length!==active.length || t.meshes.some((m,i)=>m!==active[i]);
     if(!rebuild&&!sceneDirty)return t;
-    if(rebuild) {
+    function buildTopology() {
       t.meshes=active;t.used=0;
       for(let i=0;i<active.length;i++)t.order[i]=i;
       const center=(i,a)=>{const b=active[i].tree.bounds;return (b[a]+b[a+3])/2;};
@@ -228,24 +277,27 @@ export function createAnimationRaycaster(pose, descriptors, {
         t.order.subarray(start,start+count).sort((a,b)=>center(a,axis)-center(b,axis)||active[a].drawIndex-active[b].drawIndex);
         const half=Math.floor(count/2);build(start,half);t.right[node]=build(start+half,count-half);return node;
       }
-      build(0,active.length);stats.sceneRebuilds++;
+      build(0,active.length);
     }
-    for(let node=t.used-1;node>=0;node--) {
-      const offset=node*6;
-      if(t.count[node]) {
-        for(let a=0;a<3;a++){t.bounds[offset+a]=Infinity;t.bounds[offset+3+a]=-Infinity;}
-        for(let i=t.start[node];i<t.start[node]+t.count[node];i++) {
-          const bounds=active[t.order[i]].tree.bounds;
-          for(let a=0;a<3;a++) {
-            t.bounds[offset+a]=Math.min(t.bounds[offset+a],bounds[a]);
-            t.bounds[offset+3+a]=Math.max(t.bounds[offset+3+a],bounds[3+a]);
+    function fitBounds() {
+      for(let node=t.used-1;node>=0;node--) {
+        const offset=node*6;
+        if(t.count[node]) {
+          for(let a=0;a<3;a++){t.bounds[offset+a]=Infinity;t.bounds[offset+3+a]=-Infinity;}
+          for(let i=t.start[node];i<t.start[node]+t.count[node];i++) {
+            const bounds=active[t.order[i]].tree.bounds;
+            for(let a=0;a<3;a++) {
+              t.bounds[offset+a]=Math.min(t.bounds[offset+a],bounds[a]);
+              t.bounds[offset+3+a]=Math.max(t.bounds[offset+3+a],bounds[3+a]);
+            }
           }
+        }else for(let a=0;a<3;a++) {
+          t.bounds[offset+a]=Math.min(t.bounds[(node+1)*6+a],t.bounds[t.right[node]*6+a]);
+          t.bounds[offset+3+a]=Math.max(t.bounds[(node+1)*6+3+a],t.bounds[t.right[node]*6+3+a]);
         }
-      }else for(let a=0;a<3;a++) {
-        t.bounds[offset+a]=Math.min(t.bounds[(node+1)*6+a],t.bounds[t.right[node]*6+a]);
-        t.bounds[offset+3+a]=Math.max(t.bounds[(node+1)*6+3+a],t.bounds[t.right[node]*6+3+a]);
       }
     }
+    if (updateHierarchy(t, rebuild, buildTopology, fitBounds)) stats.sceneRebuilds++;
     sceneDirty=false;stats.sceneRefits++;return t;
   }
   function box(t,node,ray,far,stats,counter='boxesTested') {
@@ -298,7 +350,7 @@ export function createAnimationRaycaster(pose, descriptors, {
       live();if(pose.version!==poseVersion)fail('CHANGED','Pose changed during query input capture');
       const active=selected?meshes.filter(mesh=>selected.has(mesh.drawIndex)):meshes;
       const stamps=active.map(mesh=>{check(mesh,poseVersion);return mesh.d.version;});
-      const stats={poseVersion,meshesTested:0,boxesTested:0,trianglesTested:0,refittedMeshes:0,hitCount:0,
+      const stats={poseVersion,meshesTested:0,boxesTested:0,trianglesTested:0,refittedMeshes:0,meshRebuilds:0,hitCount:0,
         sceneBoxesTested:0,sceneRebuilds:0,sceneRefits:0},hits=[];
       let best=null;
       const nonempty=active.filter(mesh=>mesh.n!==0);
