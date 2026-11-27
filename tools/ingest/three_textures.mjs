@@ -915,7 +915,9 @@ export function createThreeTextureBindings(device,state) {
     catch(error){
       // The renderer's deferred-preparation boundary recognizes scene errors,
       // not the shared owner's lower-level error namespace.
-      if(error?.code==='THREE_TEXTURE_PREPARE')fail('PREPARE',error.message);
+      // A material can introduce a still-loading texture after scene preparation.
+      // Rescan it so it joins the same placeholder-to-upload lifecycle.
+      if(error?.code==='THREE_TEXTURE_PREPARE'||error?.code==='THREE_TEXTURE_NOT_READY')fail('PREPARE',error.message);
       throw error;
     }
     state.frameTextures?.add(t);

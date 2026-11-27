@@ -212,6 +212,12 @@ test(`WebGL Lambert cube mapping ${mapping} draws through asynchronous face load
   const fallback = await draw();
   assert.equal(fallback.label, 'f3d-default-texture');
   assert.equal(fallback.depthOrArrayLayers, 6);
+  const other = new T.CubeTexture();
+  other.mapping = mapping;
+  t.after(() => other.dispose());
+  material.envMap = other;
+  assert.equal(await draw(), fallback, 'a warmed scene can select a second pending cube');
+  material.envMap = envMap;
   const face = new T.DataTexture(new Uint8Array(16).fill(127), 2, 2);
   t.after(() => face.dispose());
   envMap.image[5] = face;
