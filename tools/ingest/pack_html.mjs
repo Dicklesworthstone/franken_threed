@@ -40,6 +40,34 @@ const quote = (text) =>
   String(text).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 const text = (bytes) => new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 const dataUrl = (bytes, mime) => `data:${mime};base64,${Buffer.from(bytes).toString("base64")}`;
+// A multi-megabyte renderer chunk made Chromium crash while linking its
+// data: URL. Keep source bytes in the document and module URLs short.
+const LARGE_MODULE_BYTES = 512 * 1024;
+const scriptJson = value => JSON.stringify(value).replace(/</g, "\\u003c");
+
+// Serialized into standalone HTML. Each source identity receives its own
+// document-lifetime URL, shared by imports, module scripts and preloads.
+function installModuleBlobs(imports, modules) {
+  for (const [key, alias, mime, encoded] of modules) {
+    const binary = atob(encoded), bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const url = URL.createObjectURL(new Blob([bytes], {type: mime}));
+    imports[key] = url;
+    if (alias) imports[alias] = url;
+  }
+  const map = document.createElement("script");
+  map.type = "importmap";
+  map.textContent = JSON.stringify({imports});
+  document.currentScript.after(map);
+  // Direct src/href attributes do not consult import maps. Insert the actual
+  // tag at its original parser position, retaining async, integrity and events.
+  const write = document.write.bind(document);
+  return (key, before, after) => {
+    const marker = document.currentScript;
+    write(before + imports[key] + after);
+    marker.remove();
+  };
+}
 const MIME = {
   ".js": "text/javascript",
   ".mjs": "text/javascript",
@@ -1097,10 +1125,9 @@ export function packHtml(
       : kind === "css" && record.mime === "text/css"
         ? css(text(record.original), url, {ignoreImports: true}) : record.original;
     // The suffix prevents same-byte modules at different source URLs coalescing.
-    record.data =
-      dataUrl(record.source, record.mime) +
-      "#" +
-      record.key.slice("f3d-packed/".length);
+    const bytes = Buffer.from(record.source);
+    if (bytes.length >= LARGE_MODULE_BYTES) record.base64 = bytes.toString("base64");
+    else record.data = dataUrl(bytes, record.mime) + "#" + record.key.slice("f3d-packed/".length);
     return record;
   }
   function css(source, from, options = {}) {
@@ -1173,7 +1200,7 @@ export function packHtml(
       .map((part) => `${part[1]}-${createHash(part[1]).update(output).digest("base64")}`)
       .join(" ");
   }
-  const replacements = [...mapRanges];
+  const replacements = [...mapRanges], blobTags = [];
   let firstScript = html.length,
     inlineId = 0;
   for (const tag of tags) {
@@ -1184,6 +1211,14 @@ export function packHtml(
     if (!name || name === "base" || name === "script" && !tag.closed) continue;
     let body = tag.body,
       changedBody = false;
+    let blobTag;
+    const moduleUrl = record => {
+      if (record.data !== undefined) return record.data;
+      let marker = "__f3d_module_url__";
+      while (tag.text.includes(marker)) marker += "_";
+      blobTag = {key: record.key, marker};
+      return marker;
+    };
     const get = (key) => (attrs[key] === undefined ? null : entities(attrs[key]));
     const rewriteResource = (key, stylesheet = false, module = false) => {
       const value = get(key);
@@ -1200,7 +1235,7 @@ export function packHtml(
       const url = local(value, base);
       if (module) {
         const record = moduleFor(url);
-        changes[key] = record.data;
+        changes[key] = moduleUrl(record);
         if (attrs.integrity)
           changes.integrity = integrity(
             get("integrity"),
@@ -1228,7 +1263,7 @@ export function packHtml(
           // Identity distinguishes inline scripts; import-map scope selection
           // and relative imports still use the real source document base.
           const record = moduleFor(inlineUrl.href, body, "javascript", base);
-          changes.src = record.data;
+          changes.src = moduleUrl(record);
           body = "";
           changedBody = true;
         }
@@ -1281,6 +1316,7 @@ export function packHtml(
         value: body === undefined ? open : open + body +
           tag.text.slice(tag.bodyStart - tag.start + tag.body.length),
       });
+      if (blobTag) blobTags.push({...blobTag, replacement: replacements.at(-1)});
     }
   }
   if (documentFetchUsed && documentFetchMutated)
@@ -1297,13 +1333,30 @@ export function packHtml(
   }
   // Emit one map before executable code. All identities are now known; circular
   // modules refer to stable keys, never recursively nested data URLs.
-  const map = Object.fromEntries([...modules.values()].flatMap((record) =>
-    [[record.key, record.data], ...(record.urlKey ? [[record.urlKey, record.data]] : [])]));
+  const map = {}, blobs = [];
+  for (const record of modules.values()) {
+    if (record.base64 !== undefined) blobs.push([record.key, record.urlKey ?? null, record.mime, record.base64]);
+    else {
+      map[record.key] = record.data;
+      if (record.urlKey) map[record.urlKey] = record.data;
+    }
+  }
   const insertion = mapRanges.length ? Math.min(firstScript, mapRanges[0].start) : firstScript;
   // A single parser-ordered classic prelude shares lazy URL factories across
   // inline, repeated external, async and deferred classic scripts. It adds no
   // window properties and leaves every source script's directive/global scope.
-  const prelude = (modules.size ? `<script type="importmap">${JSON.stringify({ imports: map }).replace(/</g, "\\u003c")}</script>\n` : "") +
+  let importMap = modules.size ? `<script type="importmap">${scriptJson({imports: map})}</script>\n` : "";
+  if (blobs.length) {
+    let writer = "__f3d_write_module";
+    while (documentNames.has(writer)) writer += "_";
+    const binding = blobTags.length ? `const ${writer} = ` : "";
+    importMap = `<script>${binding}(${installModuleBlobs})(${scriptJson(map)},${scriptJson(blobs)});</script>\n`;
+    for (const {key, marker, replacement} of blobTags) {
+      const [before, after] = replacement.value.split(marker);
+      replacement.value = `<script>${writer}(${scriptJson(key)},${scriptJson(before)},${scriptJson(after)});</script>`;
+    }
+  }
+  const prelude = importMap +
     (declarations.length ? `<script src="${dataUrl(declarations.join("\n"), "text/javascript")}"></script>\n` : "");
   if (prelude)
     replacements.push({

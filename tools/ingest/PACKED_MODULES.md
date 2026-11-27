@@ -4,6 +4,14 @@
 The ordinary multi-file build is not modified. This is retained-JavaScript
 packaging (F3D-10), not a renderer, compiler specialization or speedup claim.
 
+For sources of 512 KiB or more in the document's module graph, the single HTML
+file embeds the bytes and creates a short, document-local Blob URL for each module identity.
+This lets Chromium link multi-megabyte renderer bundles. Static imports,
+dynamic imports, directly loaded modules and module preloads share the same
+URL for a given identity. Small modules keep their data URLs. If the hosting
+server supplies a Content Security Policy, it must allow the generated inline
+bootstrap and the module URL schemes used by the document.
+
 ## Applications with origin-root URLs
 
 Declare the local directory that corresponds to the browser origin root when an
