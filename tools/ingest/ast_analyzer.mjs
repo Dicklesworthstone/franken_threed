@@ -216,6 +216,17 @@ export function createDynamicImportClassifier(ast, resolveImportedString = null)
   // Sloppy scripts can introduce bindings with direct eval/with. Their existing
   // literal-only path remains conservative; ES modules are always strict.
   if (ast.sourceType === "script") return node => classifyDynamicImportArgument(node);
+  // Literal branches need no lexical scopes. Index this module on the first
+  // identifier/member lookup, then reuse that resolver for subsequent queries.
+  let resolveReference;
+  const resolve = node => {
+    resolveReference ??= createStringReferenceResolver(ast, resolveImportedString);
+    return resolveReference(node);
+  };
+  return node => classifyDynamicImportArgument(node, resolve);
+}
+
+function createStringReferenceResolver(ast, resolveImportedString) {
   const scopes = new WeakMap(), enclosing = new WeakMap(), values = new WeakMap(), selections = new WeakMap();
   const parents = new WeakMap(), destructured = new WeakMap(), imported = new WeakMap(), nodes = [];
   const functions = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
@@ -372,7 +383,7 @@ export function createDynamicImportClassifier(ast, resolveImportedString = null)
     cache.set(key, candidates);
     return candidates;
   };
-  return node => classifyDynamicImportArgument(node, resolveReference);
+  return resolveReference;
 }
 
 /** A const binding alone does not freeze its object. Admit a lookup only after
@@ -2045,7 +2056,6 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}, consumerContract
       ecmaVersion: "latest",
       sourceType: "module",
       locations: true,
-      ranges: true,
     });
   } catch (err) {
     const span = err.loc
