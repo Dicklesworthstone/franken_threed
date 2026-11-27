@@ -468,7 +468,15 @@ function createResidency(device, geometry, {
           record.releasePrivate = instanceHistory?.onPrivateRetire?.(owner, () => retirePrivate(owner, record));
         }
         if (sourceAttributeCallbacks && instanceHistory?.eligible(entry)) {
-          const state = instanceHistory.upload(owner, accepted => write(record, accepted, 0, accepted.length), () => {
+          const state = instanceHistory.upload(owner, (accepted, ranges) => {
+            if (!ranges) {
+              write(record, accepted, 0, accepted.length);
+              return;
+            }
+            for (const {start, count} of ranges) {
+              write(record, accepted, start, count === 0 ? accepted.length : start + count);
+            }
+          }, () => {
             remember(owner, array); owner.onUploadCallback();
           }, record.historyRevision);
           record.version = state.version; record.historyRevision = state.revision;

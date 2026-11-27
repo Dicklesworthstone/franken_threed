@@ -87,6 +87,38 @@ test('pinned upload oracle: stale CPU edits, source +1 coalescing, callbacks, em
   await gpu.whenIdle();gpu.dispose();
 });
 
+test('shared WebGL history sends sparse edits to a current buffer and repairs a lagging one', () => {
+  const device = geometryDevice(), source = geometry(), position = source.attributes.position;
+  const history = createWebGLInstanceHistory({geometry: true});
+  const options = {instanceHistory: history};
+  const first = createGpuBufferGeometry(device, source, options);
+  const second = createGpuBufferGeometry(device, source, options);
+  const expected = geometry().attributes.position, gl = glReplica();
+  gl.update(expected, 0);
+  const upload = (handle, ranges) => {
+    const before = device.writes.length;
+    for (const attribute of [position, expected]) {
+      for (const [start, count] of ranges) attribute.addUpdateRange(start, count);
+      attribute.needsUpdate = true;
+    }
+    handle.update();
+    gl.update(expected, 0);
+    same(handle.vertexBuffer, gl.get(expected).buffer);
+    return device.writes.slice(before).map(write => [write.offset, write.input.length]);
+  };
+  position.array.fill(9);
+  expected.array.fill(9);
+  assert.deepEqual(upload(first, [[2, 1], [4, 1], [7, 0]]), [[8, 12], [28, 8]]);
+  // The second residency missed both ranges. A fresh edit alone cannot catch it up.
+  assert.deepEqual(upload(second, [[1, 1]]), [[0, 36]]);
+  assert.deepEqual(upload(second, [[5, 1]]), [[20, 4]]);
+  first.update();
+  same(first.vertexBuffer, gl.get(expected).buffer);
+  assert.equal(device.writes.at(-1).input.length, 36);
+  assert.equal(new Float32Array(first.vertexBuffer.data)[0], 0);
+  first.dispose(); second.dispose(); history.dispose();
+});
+
 test('Uint16 partial uploads fill alignment gaps from GPU history, not CPU arrays',async()=>{
   const d=geometryDevice(),g=geometry(),o=geometry(),gl=glReplica();
   g.setIndex(attribute([0,1,2,0,2,1],1,Uint16Array));o.setIndex(attribute([0,1,2,0,2,1],1,Uint16Array));

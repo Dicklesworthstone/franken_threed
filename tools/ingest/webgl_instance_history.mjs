@@ -67,7 +67,10 @@ export function createWebGLInstanceHistory({maxBytes = 128 * 1024 * 1024, maxAtt
           .set(new Uint8Array(source.buffer, source.byteOffset + range.start * width, (end - range.start) * width));
       }
     }
-    sink(array);
+    // A destination at the preceding revision already contains every byte
+    // outside the merged ranges. A new or lagging destination needs the
+    // complete accepted image, including edits consumed by another draw.
+    sink(array, partial && residentRevision === previous.revision ? ranges : null);
     if (!previous) bytes += array.byteLength;
     const current = {array, version: previous?.version ?? -1, revision: ++revision};
     histories.set(attribute, current);
