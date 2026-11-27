@@ -478,6 +478,14 @@ function surfaceShader(
         `let ${names[slot]}_texel = textureSample(${names[slot]}_texture, ${names[slot]}_sampler, ${coordinates(slot)});`,
     )
     .join("\n  ");
+  const normalMatrix = occluded || normalMapped || phong
+    ? "mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)"
+    : "draw_info.normal_from_local";
+  const transformedNormal = `${normalMatrix} * ${localNormal}`;
+  // r186 normal_vertex and transformNormalToView normalize at each vertex. If
+  // deferred until the fragment, a longer gradient pulls the interpolated normal
+  // toward its own direction (visible on MarchingCubes and nonuniform scales).
+  const varyingNormal = threeLights && !flat ? `unit_vector(${transformedNormal})` : transformedNormal;
   const matcapColor = matcap ? /* wgsl */ `// r186 MatcapUV: perspective view direction is normalized -positionView;
   // the orthographic direction is constant, independent of fragment position.
   let view_position = vec3<f32>(dot(lighting.view_x, vec4<f32>(input.world, 1.0)), dot(lighting.view_y, vec4<f32>(input.world, 1.0)), dot(lighting.view_z, vec4<f32>(input.world, 1.0)));
@@ -671,7 +679,7 @@ struct VertexOutput {
   out.color = ${colorWidth === 3 ? "vec4<f32>(color, 1.0)" : colorWidth === 4 ? "color" : "vec4<f32>(1.0)"};
   ${instanceColor ? "out.color = vec4<f32>(out.color.rgb * instance_color, out.color.a);" : ""}
   ${lit || clippingCapacity ? "out.world = (draw_info.world_from_local * " + localPosition + ").xyz;" : ""}
-  ${lit && !normalInput ? "out.normal = vec3<f32>(0.0);" : ""}${normalInput ? "out.normal = " + (occluded || normalMapped || phong ? "mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)" : "draw_info.normal_from_local") + " * " + localNormal + ";" : ""}
+  ${lit && !normalInput ? "out.normal = vec3<f32>(0.0);" : ""}${normalInput ? `out.normal = ${varyingNormal};` : ""}
   ${tangentAttribute ? "out.tangent = vec4<f32>((draw_info.world_from_local * vec4<f32>(" + localTangent + ", 0.0)).xyz, tangent.w * draw_info.uv_y.w);" : ""}
   ${mapSlots(mappedMask)
     .map(slot => {

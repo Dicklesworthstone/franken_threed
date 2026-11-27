@@ -27,10 +27,11 @@ export async function runPhongToonChecks(device) {
     const depth=own(device.createTexture({size:[64,64],format:'depth32float',usage:16}));
     const readback=own(device.createBuffer({size:64*256,usage:9}));
     const colorView=target.createView(),depthView=depth.createView();
-    function geometry(normal=[0,0,1]) {
+    function geometry(normal=[0,0,1],topNormal=normal) {
       const buffer=own(device.createBuffer({size:120,usage:40}));
       const vertices=[];
-      for(const position of [[-.8,-.8,.5],[.8,-.8,.5],[0,.8,.5]])vertices.push(...position,...normal,1,0,0,1);
+      for(const [position,vertexNormal] of [[[-.8,-.8,.5],normal],[[.8,-.8,.5],normal],[[0,.8,.5],topNormal]])
+        vertices.push(...position,...vertexNormal,1,0,0,1);
       device.queue.writeBuffer(buffer,0,new Float32Array(vertices));
       return {vertexCount:3,vertexBuffer:buffer,worldMatrix:I(),
         whenIdle:()=>device.queue.onSubmittedWorkDone(),vertexLayout:{arrayStride:40,stepMode:'vertex',attributes:[
@@ -50,6 +51,14 @@ export async function runPhongToonChecks(device) {
     const specularTexture=texture([0,255,255,255]);
     const normalTexture=texture([128,128,255,255]);
     const baseColorTexture=texture([255,255,255,0]);
+    async function centerPixel() {
+      const encoder=device.createCommandEncoder();
+      encoder.copyTextureToBuffer({texture:target},{buffer:readback,bytesPerRow:256},[64,64]);
+      device.queue.submit([encoder.finish()]);
+      await readback.mapAsync(1);
+      try{return Array.from(new Uint8Array(readback.getMappedRange(),32*256+32*4,4));}
+      finally{readback.unmap();}
+    }
     for(const instancing of [false,true])for(const renderBundles of [false,true]){
       renderer=await createGpuAnimationRenderer(device,{format:'rgba8unorm',depthFormat:'depth32float',
         maxDraws:2,maxMeshes:12,instancing,renderBundles});
@@ -67,12 +76,7 @@ export async function runPhongToonChecks(device) {
         renderer.render({colorView,depthView,viewProjection:I(),draws:[draw],lighting:{viewDirection:[0,0,1],
           lights:[light??{type:'directional',direction:direction(cosine),intensity:Math.PI}]}});
         await renderer.whenIdle();
-        const encoder=device.createCommandEncoder();
-        encoder.copyTextureToBuffer({texture:target},{buffer:readback,bytesPerRow:256},[64,64]);
-        device.queue.submit([encoder.finish()]);
-        await readback.mapAsync(1);
-        let pixel;
-        try{pixel=Array.from(new Uint8Array(readback.getMappedRange(),32*256+32*4,4));}finally{readback.unmap();}
+        const pixel=await centerPixel();
         const wanted=[...expected,alpha].map(v=>Math.round(255*Math.min(1,Math.max(0,v))));
         if(pixel.some((v,i)=>Math.abs(v-wanted[i])>3))
           throw new Error(`${name} instances=${instancing} bundles=${renderBundles}: ${pixel} versus ${wanted}`);
@@ -99,6 +103,19 @@ export async function runPhongToonChecks(device) {
       if(renderBundles&&renderer.bundleDiagnostics.reuses<1)throw new Error('Native material checks did not reuse a render bundle');
       renderer.dispose();renderer=null;
     }
+    // A MarchingCubes gradient can be much longer than the adjacent normals.
+    // r186 gives each vertex unit length before perspective interpolation.
+    renderer=await createGpuAnimationRenderer(device,{format:'rgba8unorm',depthFormat:'depth32float',threeLights:true});
+    const gradient=await renderer.addMesh(geometry([0,0,1],[64,0,0]),{shading:'lambert'});
+    renderer.render({colorView,depthView,viewProjection:I(),draws:[gradient],lighting:{viewDirection:[0,0,1],
+      lights:[{type:'directional',direction:[0,0,-1],intensity:Math.PI}]}});
+    await renderer.whenIdle();
+    const pixel=await centerPixel();
+    const topWeight=(.8-1/64)/1.6;
+    const expected=Math.round(255*(1-topWeight)/Math.hypot(topWeight,1-topWeight));
+    if(pixel.slice(0,3).some(value=>Math.abs(value-expected)>1)||pixel[3]!==255)
+      throw new Error(`Three smooth normal interpolation: ${pixel} versus ${expected}`);
+    results.push({name:'Three smooth normal interpolation',pixel});
     await device.queue.onSubmittedWorkDone();
     if(errors.length)throw new Error(errors.join('\n'));
     return {status:'passed',cases:results,execution:'actual WebGPU Phong/toon pixels',speedupClaim:false};
