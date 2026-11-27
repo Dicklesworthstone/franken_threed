@@ -966,7 +966,12 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   const retainedModuleUrls = new Map(); // exact source URL -> relative output URL
   const retainedHtmlModules = new Map(), runtimeModuleUrls = new Set(), changedRetainedModules = new Set();
   let hasRuntimeImports = false;
-  let runtimeGraph;
+  // Both native import maps and renderer routing inspect the same normalized
+  // source graph. Keep it local to this build, including its frontend options.
+  let moduleGraphPromise;
+  const getModuleGraph = () => moduleGraphPromise ??= buildModuleGraph(resolvedEntryAbs, {
+    documentRoot, _moduleSources: moduleSources, packageRootUrl: options.packageRootUrl,
+  });
   let nativeMapRouting = false;
   const classicWorkerSources = new Map(), classicScriptRewrites = new Map();
   const documentWorkerGlobals = new Set();
@@ -978,8 +983,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     // is a networked route, not a proof that the dynamic module graph closes.
     const parsed = parseHtmlEntries(fs.readFileSync(resolvedEntryAbs, "utf8"), pathToFileURL(resolvedEntryAbs).href, {documentRoot});
     if (Object.keys(parsed.importMap.imports ?? {}).length || Object.keys(parsed.importMap.scopes ?? {}).length) {
-      const graph = runtimeGraph = await buildModuleGraph(resolvedEntryAbs, {documentRoot,
-        _moduleSources: moduleSources, packageRootUrl: options.packageRootUrl});
+      const graph = await getModuleGraph();
       // Keep compiler-only package inputs on the established bundler path.
       // A conservative document-wide check also covers parents later retained
       // to avoid resolving an import-map target a second time.
@@ -1437,7 +1441,8 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   collectHtmlAssets(null, new Set(htmlFileName ? [htmlFileName] : []), true);
   if (isHtml && hasRuntimeImports) {
     const parsed = parseHtmlEntries(fs.readFileSync(resolvedEntryAbs, "utf8"), pathToFileURL(resolvedEntryAbs).href, {documentRoot});
-    const nodes = new Map(Object.values(runtimeGraph.modules).map(node => [node.source_url, node]));
+    const { modules } = await getModuleGraph();
+    const nodes = new Map(Object.values(modules).map(node => [node.source_url, node]));
     const incoming = new Map(), children = new Map();
     for (const node of nodes.values()) {
       const targets = [...node.static_imports, ...node.dynamic_imports.flatMap(request => request.resolved_targets ?? [request])]
@@ -1494,7 +1499,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   }
   const rendererRoute =
     options.routeWebGPURenderer || options.routeWebGLRenderer
-      ? await decideRendererRoutes(resolvedEntryAbs, options.packageRootUrl, {
+      ? decideRendererRoutes(await getModuleGraph(), resolvedEntryAbs, options.packageRootUrl, {
           webgpu: Boolean(options.routeWebGPURenderer),
           webgl: Boolean(options.routeWebGLRenderer),
         }, moduleSources, documentRoot)
@@ -1626,8 +1631,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
  * this route cannot provide. Anything else keeps the retained upstream build
  * unchanged, with the reason recorded.
  */
-async function decideRendererRoutes(entryAbs, packageRootUrl, enabled, moduleSources, documentRoot) {
-  const graph = await buildModuleGraph(entryAbs, { packageRootUrl, _moduleSources: moduleSources, documentRoot });
+function decideRendererRoutes(graph, entryAbs, packageRootUrl, enabled, moduleSources, documentRoot) {
   let decisions = evaluateGraphRoutes(graph, decideRendererRoute, {
     packageRootUrl,
     generalWebGPUAvailable: enabled.webgpu,
