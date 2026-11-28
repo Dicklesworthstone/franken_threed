@@ -32,20 +32,25 @@ export function triangulateMarchingCubes(
     for (let y = 1; y < end; y++) {
       const yOffset = zOffset + size * y;
       const fy = (y - halfsize) / halfsize;
+      // Adjacent cubes share one face. Classify that face once and carry its
+      // four bits to the next cube. The field is read-only for this transaction.
+      const first = yOffset + 1;
+      let left = 0;
+      if (field[first] < isolation) left += 1;
+      if (field[first + yd] < isolation) left += 8;
+      if (field[first + zd] < isolation) left += 16;
+      if (field[first + yd + zd] < isolation) left += 128;
       for (let x = 1; x < end; x++) {
-        const fx = (x - halfsize) / halfsize;
         const q = yOffset + x;
-        let cube = 0;
-        if (field[q] < isolation) cube |= 1;
-        if (field[q + 1] < isolation) cube |= 2;
-        if (field[q + yd] < isolation) cube |= 8;
-        if (field[q + 1 + yd] < isolation) cube |= 4;
-        if (field[q + zd] < isolation) cube |= 16;
-        if (field[q + 1 + zd] < isolation) cube |= 32;
-        if (field[q + yd + zd] < isolation) cube |= 128;
-        if (field[q + 1 + yd + zd] < isolation) cube |= 64;
+        let cube = left;
+        left = 0;
+        if (field[q + 1] < isolation) { cube += 2; left += 1; }
+        if (field[q + 1 + yd] < isolation) { cube += 4; left += 8; }
+        if (field[q + 1 + zd] < isolation) { cube += 32; left += 16; }
+        if (field[q + 1 + yd + zd] < isolation) { cube += 64; left += 128; }
         const bits = edgeTable[cube];
         if (bits === 0) continue;
+        const fx = (x - halfsize) / halfsize;
         const fx2 = fx + delta, fy2 = fy + delta, fz2 = fz + delta;
         for (let edge = 0; edge < 12; edge++) {
           if ((bits & (1 << edge)) === 0) continue;
