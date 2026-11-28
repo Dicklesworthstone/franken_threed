@@ -84,7 +84,8 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
         for (const bytes of planned) {
           const staged = new Uint8Array(bytes);
           const buffer = device.createBuffer({label: `${label}/program-uniforms`, size: bytes, usage: 64 | 8});
-          const page = {buffer, size: bytes, staged, used: 0};
+          const page = {buffer, size: bytes, staged, used: 0,
+            uploadedEnd: 0, dirtyStart: bytes, dirtyEnd: 0};
           added.push(page); resources.add(page); allocatedBytes += bytes;
         }
         for (const b of [...oldBindings, binding]) for (const page of b === binding ? [...pages, ...added] : added) {
@@ -152,18 +153,47 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
       for (const page of pages) {
         const offset = Math.ceil(page.used / alignment) * alignment, group = binding.packet ? null : binding.groups.get(page);
         if ((!binding.packet && !group) || offset + binding.size > page.size) continue;
-        page.staged.set(bytes, offset);
-        page.used = offset + binding.size; draws++;
+        const end = offset + binding.size;
+        let changed = end > page.uploadedEnd;
+        if (!changed) {
+          // Compare bytes, including NaN payloads and signed zero. Source
+          // arrays may be mutable and reused between two logical draws.
+          for (let i = 0; i < binding.size; i++) {
+            if (page.staged[offset + i] !== bytes[i]) { changed = true; break; }
+          }
+        }
+        if (changed) {
+          page.staged.set(bytes, offset);
+          // Extending the known prefix includes alignment padding. It can
+          // become shader-visible if a later draw uses a different block size.
+          page.dirtyStart = Math.min(page.dirtyStart, offset, page.uploadedEnd);
+          page.dirtyEnd = end;
+        }
+        page.used = end; draws++;
         // Borrowed buffer metadata lets native source layouts combine this
         // arena slice with texture/sampler bindings without owning another arena.
         return {group, offset, resource: {buffer: page.buffer, size: binding.size}};
       }
       limit('Program uniform byte budget exhausted for this frame');
     },
-    begin() { live(); draws = 0; for (const page of pages) page.used = 0; },
+    begin() {
+      live(); draws = 0;
+      for (const page of pages) {
+        // Validation/encoding can abandon a frame after stage but before
+        // write. Its staged suffix is no longer proof of queued GPU contents.
+        page.uploadedEnd = Math.min(page.uploadedEnd, page.dirtyStart);
+        page.used = 0; page.dirtyStart = page.size; page.dirtyEnd = 0;
+      }
+    },
     write() {
       live();
-      for (const page of pages) if (page.used) device.queue.writeBuffer(page.buffer, 0, page.staged, 0, page.used);
+      for (const page of pages) {
+        const start = page.dirtyStart, end = page.dirtyEnd;
+        if (end <= start) continue;
+        device.queue.writeBuffer(page.buffer, start, page.staged, start, end - start);
+        page.uploadedEnd = Math.max(page.uploadedEnd, end);
+        page.dirtyStart = page.size; page.dirtyEnd = 0;
+      }
     },
     dispose() { stop(error('ANIMATION_RENDER_DISPOSED', 'Program uniform arena is disposed')); },
     async whenIdle() { await Promise.race([validation, stopped]); live(); },

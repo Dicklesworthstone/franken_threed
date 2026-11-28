@@ -203,6 +203,44 @@ test('empty frames write nothing and a smaller next frame uploads only its used 
   f.stage(s, 99); f.owner.write(); assert.equal(f.writes.length, 9); assert.equal(f.writes.at(-1).bytes.length, 16);
 });
 
+test('abandoned frames cannot publish their staging shadow to subsequent draws', async t => {
+  const f = fixture(t), small = await f.add(16), large = await f.add(512);
+  const frame = (...values) => {
+    f.owner.begin();
+    return values.map(value => f.stage(small, value));
+  };
+  const before = frame(1, 2, 3); f.owner.write();
+  frame(1, 9, 10); // Preparation failed before queue writes.
+  frame(1); f.owner.write();
+  assert.equal(f.writes.length, 1);
+  assert.equal(contents(before[1])[0], 2);
+  const after = frame(1, 9, 10); f.owner.write();
+  assert.equal(f.writes.length, 2); assert.equal(f.writes[1].offset, 256);
+  assert.equal(contents(after[1])[0], 9); assert.equal(contents(after[2])[0], 10);
+
+  f.owner.begin(); f.stage(large, 77); // Overwrites previously unused padding.
+  frame(1, 9, 10); f.owner.write();
+  f.owner.begin();
+  const wide = f.stage(large, 77); f.owner.write();
+  assert.ok(contents(wide).every(value => value === 77));
+});
+
+test('retrying a partially queued frame writes only pages still pending', async t => {
+  const f = fixture(t, {maxDraws: 2, maxBufferSize: 65536}), record = await f.add(65536);
+  const first = f.stage(record, 12), second = f.stage(record, 42);
+  const write = f.device.queue.writeBuffer;
+  f.device.queue.writeBuffer = (...args) => {
+    if (f.writes.length === 1) throw new Error('queue interrupted');
+    write(...args);
+  };
+  assert.throws(() => f.owner.write(), /queue interrupted/);
+  assert.equal(contents(first)[0], 12); assert.equal(contents(second)[0], 0);
+  f.device.queue.writeBuffer = write;
+  f.owner.write(); f.owner.write();
+  assert.equal(f.writes.length, 2);
+  assert.equal(contents(second)[0], 42);
+});
+
 test('scalar uniform blocks retain their native four-byte binding size', async t => {
   const f = fixture(t, {maxDraws: 2}), r = await f.add(4);
   const a = f.stage(r, 1), b = f.stage(r, 2); f.owner.write();

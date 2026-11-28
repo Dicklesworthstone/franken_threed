@@ -191,6 +191,32 @@ test('submission writes no native allocations and empty frames write no uniform 
   assert.deepEqual([f.buffers.length, f.bindGroups.length], allocations); assert.equal(f.writes.length, writes + 2);
   f.owner.begin(); f.owner.write(); assert.equal(f.writes.length, writes + 2);
 });
+test('4,000 static native draws retain their object packets when only the camera moves', async t => {
+  const count = 4000, f = rig(t, {maxDraws: count, maxUniformBytes: 8 * 1024 * 1024});
+  const record = await f.add([128, 96]);
+  function frame(camera, changedIndex = -1) {
+    f.owner.begin();
+    let inspected;
+    for (let i = 0; i < count; i++) {
+      const command = f.stage(record, [i === changedIndex ? 255 : i % 251, camera]);
+      if (i === changedIndex) inspected = command;
+    }
+    f.owner.write(); return inspected;
+  }
+  frame(1); const coldWrites = f.writes.slice(-2);
+  assert.deepEqual(coldWrites.map(write => write.bytes.length), [256 * (count - 1) + 128, 256 * (count - 1) + 96]);
+  const cold = f.writes.length;
+  frame(1); assert.equal(f.writes.length, cold);
+  frame(2); assert.equal(f.writes.length, cold + 1);
+  assert.equal(f.writes.at(-1).buffer, coldWrites[1].buffer);
+  const changed = frame(2, 1350);
+  assert.equal(f.writes.length, cold + 2);
+  assert.equal(f.writes.at(-1).buffer, coldWrites[0].buffer);
+  assert.equal(f.writes.at(-1).offset, 1350 * 256);
+  assert.equal(f.writes.at(-1).bytes.length, 128);
+  assert.ok(packet(changed, 0).every(value => value === 255));
+  assert.ok(packet(changed, 1).every(value => value === 2));
+});
 test('malformed packets fail before consuming a draw slot', async t => {
   const f = rig(t, {maxDraws: 1}), record = await f.add([16, 32]);
   assert.throws(() => f.stage(record, [1], {nodeUniforms: [new Uint8Array(16), new Uint8Array(16)]}), {code: 'ANIMATION_RENDER_VALUE'});
