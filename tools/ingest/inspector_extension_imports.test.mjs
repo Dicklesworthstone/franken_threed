@@ -121,6 +121,9 @@ test('unknown runtime extension URLs and errors retain native import semantics a
 
 test('networked HTML embeds both builtin extensions and keeps a live import based at the authored Settings URL', async t => {
   const f = fixture(), out = path.join(f.root, 'dist');
+  fs.appendFileSync(path.join(f.root, 'src/main.js'), "export {WebGPURenderer as AppRenderer} from 'three/webgpu';");
+  fs.appendFileSync(path.join(f.root, 'src/three.js'), 'export const pluginOnly = {version:1};');
+  fs.writeFileSync(f.entry, fs.readFileSync(f.entry, 'utf8').replace('"three/webgpu":', '"three":"./src/three.js","three/webgpu":'));
   const result = await buildApplication(f.entry, out, {networkedImports: true});
   const emitted = path.join(out, result.htmlFile);
   assert.throws(() => packHtml(emitted, path.join(f.root, 'strict.html')), {code: 'DYNAMIC_IMPORT_OPEN'});
@@ -129,8 +132,11 @@ test('networked HTML embeds both builtin extensions and keeps a live import base
   assert.equal(report.deployment, 'networked-html');
   assert.equal(report.liveImportSites, 1);
   const html = fs.readFileSync(packed, 'utf8');
-  assert.ok(html.includes('"three/webgpu":"./src/three.js"'), 'a live module can still use the authored import map');
+  const sourceMap = JSON.parse(/<script type="importmap" data-f3d-public-modules>([\s\S]*?)<\/script>/.exec(fs.readFileSync(emitted, 'utf8'))[1]);
+  assert.equal(sourceMap.imports.three, sourceMap.imports['three/webgpu']);
   const map = JSON.parse(/<script type="importmap">([\s\S]*?)<\/script>/.exec(html)[1]);
+  assert.equal(map.imports.three, map.imports['three/webgpu']);
+  assert.ok(Object.entries(map.imports).some(([key, url]) => key.startsWith('f3d-packed/') && url === map.imports.three));
   const sources = Object.values(map.imports).map(url => Buffer.from(url.split(',')[1].split('#')[0], 'base64').toString());
   for (const name of ['ColorGrading', 'TSLGraphEditor']) assert.ok(sources.some(source => source.includes('class ' + name)));
   assert.ok(sources.every(source => !source.includes(f.root)), 'host build paths do not become runtime URLs');
@@ -144,6 +150,9 @@ test('networked HTML embeds both builtin extensions and keeps a live import base
   globalThis.document = {URL: pathToFileURL(page).href};
   fs.renameSync(path.join(f.root, 'src'), path.join(f.root, 'unavailable'));
   const api = await import(pathToFileURL(path.join(out, result.entryFiles[0])).href);
+  const peer = await import(new URL(sourceMap.imports.three, pathToFileURL(emitted)).href);
+  assert.equal(peer.WebGPURenderer, api.AppRenderer);
+  assert.deepEqual(peer.pluginOnly, {version:1});
   globalThis.document.URL = pathToFileURL(path.join(f.root, 'moved', 'after-pushstate.html')).href;
   const standard = api.records['Color Grading'];
   standard.url = '../extensions/unused/../color-grading/ColorGrading.js';

@@ -766,6 +766,7 @@ export function rewriteLinkTagAttributes(
 export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = {}, options = {}) {
   let moduleScriptIndex = 0;
   let sourceModuleIndex = 0;
+  let publicMapEmitted = false;
   const preloadChunkMap = options.preloadChunkMap || null;
   const entryDir = options.entryDir || "";
   const documentUrl =
@@ -792,6 +793,17 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
         const attrs = parseTagAttributes(scriptAttrs);
         const scriptType = (attrs.type || "text/javascript").toLowerCase();
 
+        if (scriptType === "importmap" && Object.keys(options.publicImports ?? {}).length) {
+          const encode = map => JSON.stringify(map).replace(/</g, "\\u003c");
+          const sourceMap = JSON.parse(scriptBody);
+          const names = Object.keys(sourceMap.imports ?? {}).filter(name => Object.hasOwn(options.publicImports, name));
+          for (const name of names) delete sourceMap.imports[name];
+          const original = names.length ? `<script${scriptAttrs}>${encode(sourceMap)}</script>` : match;
+          if (publicMapEmitted) return original;
+          publicMapEmitted = true;
+          const imports = Object.fromEntries(Object.entries(options.publicImports).map(([name, file]) => [name, chunkPrefix + file]));
+          return `<script type="importmap" data-f3d-public-modules>${encode({imports})}</script>\n${original}`;
+        }
         if (scriptType === "module") {
           const sourceScript = parsedHtml.moduleScripts[sourceModuleIndex++];
           const retained = options.retainedHtmlModules?.get(sourceScript.id);
@@ -1551,7 +1563,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         bundleResult.entryFiles,
         bundleResult.files,
         { preloadChunkMap, entryDir, documentUrl: entryBaseUrl, documentRoot, classicScriptRewrites,
-          retainedHtmlModules, changedRetainedModules },
+          retainedHtmlModules, changedRetainedModules, publicImports: bundleResult.publicImports },
       ),
     );
   }

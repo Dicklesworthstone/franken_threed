@@ -340,6 +340,13 @@ export function f3dRollupPlugin(options = {}) {
   return {
     name: "f3d-ingest-resolver",
 
+    moduleParsed({id}) {
+      // An extension can read any export, including exports unused by the
+      // initial page. Publish the real module's complete namespace lazily.
+      const peer = options.publicPeers?.get(id);
+      if (peer) this.emitFile({type: "chunk", id, fileName: peer.fileName, preserveSignature: "strict"});
+    },
+
     async generateBundle(_outputOptions, bundle) {
       for (const { requests, id } of defaultManagerExposed ? [] : documentRequests) {
         const admitted = managerConstructorExposed ? requests.filter(request => !request.localManager) : requests;
@@ -1047,6 +1054,21 @@ export async function bundleWithRollup(entryPath, options = {}) {
   }
 
   const routePlugin = options.rendererRoute ? rendererRoutePlugin(options.rendererRoute) : null;
+  const publicPeers = new Map();
+  if (options.networkedImports && isHtml) {
+    for (const [name, value] of Object.entries(importMap.imports ?? {})) {
+      if (!name || name.endsWith("/") || name.startsWith("f3d-packed/") || /^(?:[./]|[a-z][\w+.-]*:)/i.test(name) ||
+          typeof value !== "string" || !/^(?:\.\.?\/|\/)/.test(value)) continue;
+      const url = resolveDocumentUrl(value, mapBaseUrl, documentRoot);
+      if (!url.startsWith("file:") || !/\.m?js$/i.test(new URL(url).pathname)) continue;
+      const id = options.rendererRoute?.targets.some(target => target.url === url) ? ROUTED_RENDERER_PREFIX + url : url;
+      if (!publicPeers.has(id)) {
+        const digest = createHash("sha256").update(name).digest("hex").slice(0, 16);
+        publicPeers.set(id, {fileName: `f3d-public-${digest}.js`, names: []});
+      }
+      publicPeers.get(id).names.push(name);
+    }
+  }
   let bundle;
   try {
     bundle = await rollup({
@@ -1093,6 +1115,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
           retainedModuleUrls: options.retainedModuleUrls,
           prepareStandaloneLoaders: options.prepareStandaloneLoaders,
           networkedImports: options.networkedImports,
+          publicPeers,
           workerHostBindings: options.workerHostBindings,
           ...(isHtml ? { documentUrl: entryUrl } : {}),
         }),
@@ -1233,6 +1256,9 @@ export async function bundleWithRollup(entryPath, options = {}) {
       // Multi-chunk & dynamic chunk support
       isMultiChunk: chunks.length > 1,
       entryFiles,
+      ...(publicPeers.size ? {publicImports: Object.fromEntries([...publicPeers].flatMap(([id, peer]) =>
+        chunks.some(chunk => chunk.fileName === peer.fileName && chunk.facadeModuleId === id)
+          ? peer.names.map(name => [name, peer.fileName]) : []))} : {}),
       files,
       outputChunks,
       chunks: outputChunks,

@@ -47,13 +47,13 @@ const scriptJson = value => JSON.stringify(value).replace(/</g, "\\u003c");
 
 // Serialized into standalone HTML. Each source identity receives its own
 // document-lifetime URL, shared by imports, module scripts and preloads.
-function installModuleBlobs(imports, modules) {
-  for (const [key, alias, mime, encoded] of modules) {
+function installModuleBlobs(entries, modules) {
+  const imports = Object.fromEntries(entries);
+  for (const [keys, mime, encoded] of modules) {
     const binary = atob(encoded), bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     const url = URL.createObjectURL(new Blob([bytes], {type: mime}));
-    imports[key] = url;
-    if (alias) imports[alias] = url;
+    for (const key of keys) Object.defineProperty(imports, key, {value: url, enumerable: true, configurable: true});
   }
   const map = document.createElement("script");
   map.type = "importmap";
@@ -347,7 +347,7 @@ export function packHtml(
     baseSeen = false,
     baseDependentSeen = false;
   const sourceMaps = [],
-    mapRanges = [];
+    mapRanges = [], publicNames = new Set(), publicMapRanges = [];
   for (const tag of tags) {
     const name = tag.name, attrs = attributes(tag.attributes);
     if (name === "script" && !tag.closed) continue;
@@ -412,7 +412,12 @@ export function packHtml(
       if (map.integrity && Object.keys(map.integrity).length)
         fail("IMPORT_MAP_INTEGRITY", "Integrity-pinned import maps require the normal build");
       sourceMaps.push(map);
-      mapRanges.push({ start: tag.start, end: tag.end, value: "" });
+      const range = { start: tag.start, end: tag.end, value: "" };
+      mapRanges.push(range);
+      if (networkedImports && Object.hasOwn(attrs, "data-f3d-public-modules")) {
+        for (const key of Object.keys(map.imports ?? {})) publicNames.add(key);
+        publicMapRanges.push(range);
+      }
     } else if (type === "module" || JS_TYPES.has(type)) executableSeen = true;
   }
   // Import maps are resolved in the source environment before any URLs change.
@@ -1219,7 +1224,7 @@ export function packHtml(
   // Live plugins can themselves import bare names through the document's
   // original maps and scopes. Install the packed map first and retain those
   // original maps in parser order on the networked profile.
-  const replacements = networkedImports ? [] : [...mapRanges], blobTags = [];
+  const replacements = networkedImports ? [...publicMapRanges] : [...mapRanges], blobTags = [];
   let firstScript = html.length,
     inlineId = 0;
   for (const tag of tags) {
@@ -1338,6 +1343,14 @@ export function packHtml(
       if (blobTag) blobTags.push({...blobTag, replacement: replacements.at(-1)});
     }
   }
+  const publicKeys = new Map();
+  for (const name of publicNames) {
+    const url = imports.get(name)?.value;
+    if (!url?.startsWith("file:")) fail("IMPORT_MAP", "A bundled public namespace needs a local module");
+    const record = moduleFor(url);
+    if (!publicKeys.has(record)) publicKeys.set(record, []);
+    publicKeys.get(record).push(name);
+  }
   if (documentFetchUsed && documentFetchMutated)
     fail("FETCH_URL", "A document script replaces fetch; keep its original networked host route");
   if (documentRequestUsed && documentRequestMutated)
@@ -1352,13 +1365,11 @@ export function packHtml(
   }
   // Emit one map before executable code. All identities are now known; circular
   // modules refer to stable keys, never recursively nested data URLs.
-  const map = {}, blobs = [];
+  const map = Object.create(null), blobs = [];
   for (const record of modules.values()) {
-    if (record.base64 !== undefined) blobs.push([record.key, record.urlKey ?? null, record.mime, record.base64]);
-    else {
-      map[record.key] = record.data;
-      if (record.urlKey) map[record.urlKey] = record.data;
-    }
+    const keys = [record.key, ...(record.urlKey ? [record.urlKey] : []), ...(publicKeys.get(record) ?? [])];
+    if (record.base64 !== undefined) blobs.push([keys, record.mime, record.base64]);
+    else for (const key of keys) map[key] = record.data;
   }
   const insertion = mapRanges.length ? Math.min(firstScript, mapRanges[0].start) : firstScript;
   // A single parser-ordered classic prelude shares lazy URL factories across
@@ -1369,7 +1380,7 @@ export function packHtml(
     let writer = "__f3d_write_module";
     while (documentNames.has(writer)) writer += "_";
     const binding = blobTags.length ? `const ${writer} = ` : "";
-    importMap = `<script>${binding}(${installModuleBlobs})(${scriptJson(map)},${scriptJson(blobs)});</script>\n`;
+    importMap = `<script>${binding}(${installModuleBlobs})(${scriptJson(Object.entries(map))},${scriptJson(blobs)});</script>\n`;
     for (const {key, marker, replacement} of blobTags) {
       const [before, after] = replacement.value.split(marker);
       replacement.value = `<script>${writer}(${scriptJson(key)},${scriptJson(before)},${scriptJson(after)});</script>`;

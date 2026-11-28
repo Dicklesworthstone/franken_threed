@@ -25,8 +25,13 @@ node tools/ingest/cli.mjs upstream/three.js/examples/webgpu_performance_renderbu
 
 Both built-ins still load on demand. A custom relative URL uses the original
 Settings module's location relative to the served page. Serve custom modules
-and their dependencies at those authored locations. Source import maps remain
-available to live plugins. The report labels this deployment `networked-html`
+and their dependencies at those authored locations. Global bare names mapped
+directly to local ES modules in the bundle expose their complete exports to
+live plugins. For H1, `three` and `three/webgpu` resolve to the same embedded
+module and `three/tsl` uses the matching TSL module. A plugin therefore shares
+the application's renderer and math constructors. Other source import-map
+entries, including prefixes and scoped overrides, retain their host routes.
+The report labels this deployment `networked-html`
 and counts open absolute URL import sites. Strict standalone packing continues
 to require closed module imports. The packed page retains the source renderer
 and the Inspector's external TSL Graph editor service.
