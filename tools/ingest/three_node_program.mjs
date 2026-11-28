@@ -2241,7 +2241,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
             textureLayout.sampleType === 'float' ? 'filtering' : 'non-filtering'})});
       });
       uniformBytes += byteLength;
-      return Object.freeze({index, name: group.name, byteLength, uniforms: Object.freeze(uniforms), entries: Object.freeze(entries)});
+      const sharedUniforms = uniforms.length > 0 && uniforms.every(member =>
+        group.bindings[member.binding].groupNode.shared === true);
+      return Object.freeze({index, name: group.name, byteLength, sharedUniforms,
+        uniforms: Object.freeze(uniforms), entries: Object.freeze(entries)});
     });
     if (uniformBytes > maxUniformBytes) fail('LIMIT', 'Native node draw exceeds its uniform byte budget');
     const {attributes, generated, named} = geometryMetadata(builder, object.geometry, object, construction?.namedGeometry === true);

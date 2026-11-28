@@ -38,6 +38,8 @@ function fixture(t, {material = new T.MeshBasicNodeMaterial(), instances = null,
 test('static bundle local uniforms stay frozen while the camera group remains current', t => {
   const f = fixture(t), initial = f.draw(1);
   assert.equal(initial.refreshType, FULL);
+  assert.equal(f.descriptor.groups.find(group => group.name === 'render').sharedUniforms, true);
+  assert.equal(f.descriptor.groups.find(group => group.name === 'object').sharedUniforms, false);
   const oldLocal = f.bytes(initial, 'object').slice(), oldCamera = f.bytes(initial, 'render').slice();
   f.object.position.x = 3; f.material.color.setRGB(.2, .4, .6); f.camera.position.x = 2;
   const warm = f.draw(2);

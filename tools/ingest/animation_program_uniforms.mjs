@@ -11,6 +11,19 @@
  */
 import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
 
+// Compare representations, including NaN payloads and signed zero. A caller
+// may reuse and mutate the same Uint8Array between two logical draws.
+function samePacket(page, offset, bytes) {
+  if (bytes.byteOffset % 4 === 0 && bytes.length >= 32) {
+    const words = new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.length / 4);
+    const start = offset / 4;
+    for (let i = 0; i < words.length; i++) if (page.words[start + i] !== words[i]) return false;
+    return true;
+  }
+  for (let i = 0; i < bytes.length; i++) if (page.staged[offset + i] !== bytes[i]) return false;
+  return true;
+}
+
 export function createProgramUniformArena(device, {maxDraws, label, fail, scoped, lost = device.lost, maxBytes = 64 * 1024 * 1024}) {
   const limit = message => fail('ANIMATION_RENDER_LIMIT', message);
   const alignment = device.limits.minUniformBufferOffsetAlignment ?? 256;
@@ -23,6 +36,7 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
       !Number.isSafeInteger(bindingLimit) || bindingLimit < 4)
     limit('Invalid program uniform arena capacity or alignment');
   const pages = [], resources = new Set(), bindings = new Map();
+  let lastShared = null;
   let allocatedBytes = 0, draws = 0, stoppedError = null, serial = Promise.resolve(), rejectStopped;
   let registering = 0, validation = Promise.resolve(), releaseDeviceLoss = null;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
@@ -38,7 +52,7 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
     stoppedError = reason;
     releaseDeviceLoss?.(); releaseDeviceLoss = null;
     rejectStopped(reason);
-    pages.length = 0; bindings.clear();
+    pages.length = 0; bindings.clear(); lastShared = null;
     for (const page of resources) destroy(page);
   }
   releaseDeviceLoss = subscribeGpuDeviceLoss(lost,
@@ -84,7 +98,7 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
         for (const bytes of planned) {
           const staged = new Uint8Array(bytes);
           const buffer = device.createBuffer({label: `${label}/program-uniforms`, size: bytes, usage: 64 | 8});
-          const page = {buffer, size: bytes, staged, used: 0,
+          const page = {buffer, size: bytes, staged, words: new Uint32Array(staged.buffer), used: 0,
             uploadedEnd: 0, dirtyStart: bytes, dirtyEnd: 0};
           added.push(page); resources.add(page); allocatedBytes += bytes;
         }
@@ -142,7 +156,7 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
     registerImmediate,
     register(size) { return register(size, false); },
     registerPacket(size) { return register(size, true); },
-    stage(binding, bytes) {
+    stage(binding, bytes, shared = false) {
       live();
       if (!binding || bindings.get(keyOf(binding.size, binding.packet)) !== binding)
         fail('ANIMATION_RENDER_VALUE', 'Program uniform binding is not registered in this arena');
@@ -150,25 +164,26 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
           !(bytes.buffer instanceof ArrayBuffer) || bytes.buffer.resizable)
         fail('ANIMATION_RENDER_VALUE', 'Program uniforms need exact, fixed unshared byte storage');
       if (draws >= maxDraws) limit('Program uniform draw capacity exhausted for this frame');
+      // Slices are append-only until begin(). Reuse an identical shared
+      // camera/render packet, even if it was captured independently per draw.
+      // A callback changing its bytes selects a fresh offset immediately.
+      if (shared && lastShared?.binding === binding && samePacket(lastShared.page, lastShared.offset, bytes)) {
+        const {page, offset} = lastShared;
+        draws++;
+        return {group: binding.packet ? null : binding.groups.get(page), offset, resource: {buffer: page.buffer, size: binding.size}};
+      }
       for (const page of pages) {
         const offset = Math.ceil(page.used / alignment) * alignment, group = binding.packet ? null : binding.groups.get(page);
         if ((!binding.packet && !group) || offset + binding.size > page.size) continue;
         const end = offset + binding.size;
-        let changed = end > page.uploadedEnd;
-        if (!changed) {
-          // Compare bytes, including NaN payloads and signed zero. Source
-          // arrays may be mutable and reused between two logical draws.
-          for (let i = 0; i < binding.size; i++) {
-            if (page.staged[offset + i] !== bytes[i]) { changed = true; break; }
-          }
-        }
-        if (changed) {
+        if (end > page.uploadedEnd || !samePacket(page, offset, bytes)) {
           page.staged.set(bytes, offset);
           // Extending the known prefix includes alignment padding. It can
           // become shader-visible if a later draw uses a different block size.
           page.dirtyStart = Math.min(page.dirtyStart, offset, page.uploadedEnd);
           page.dirtyEnd = end;
         }
+        if (shared) lastShared = {binding, page, offset};
         page.used = end; draws++;
         // Borrowed buffer metadata lets native source layouts combine this
         // arena slice with texture/sampler bindings without owning another arena.
@@ -177,7 +192,7 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
       limit('Program uniform byte budget exhausted for this frame');
     },
     begin() {
-      live(); draws = 0;
+      live(); draws = 0; lastShared = null;
       for (const page of pages) {
         // Validation/encoding can abandon a frame after stage but before
         // write. Its staged suffix is no longer proof of queued GPU contents.

@@ -193,7 +193,8 @@ test('submission writes no native allocations and empty frames write no uniform 
 });
 test('4,000 static native draws retain their object packets when only the camera moves', async t => {
   const count = 4000, f = rig(t, {maxDraws: count, maxUniformBytes: 8 * 1024 * 1024});
-  const record = await f.add([128, 96]);
+  const program = f.program([128, 96]); program.groups[1].sharedUniforms = true;
+  const record = await f.add([], {nodeProgram: program});
   function frame(camera, changedIndex = -1) {
     f.owner.begin();
     let inspected;
@@ -204,11 +205,12 @@ test('4,000 static native draws retain their object packets when only the camera
     f.owner.write(); return inspected;
   }
   frame(1); const coldWrites = f.writes.slice(-2);
-  assert.deepEqual(coldWrites.map(write => write.bytes.length), [256 * (count - 1) + 128, 256 * (count - 1) + 96]);
+  assert.deepEqual(coldWrites.map(write => write.bytes.length), [256 * (count - 1) + 128, 96]);
   const cold = f.writes.length;
   frame(1); assert.equal(f.writes.length, cold);
   frame(2); assert.equal(f.writes.length, cold + 1);
   assert.equal(f.writes.at(-1).buffer, coldWrites[1].buffer);
+  assert.equal(f.writes.at(-1).bytes.length, 96);
   const changed = frame(2, 1350);
   assert.equal(f.writes.length, cold + 2);
   assert.equal(f.writes.at(-1).buffer, coldWrites[0].buffer);
@@ -216,6 +218,23 @@ test('4,000 static native draws retain their object packets when only the camera
   assert.equal(f.writes.at(-1).bytes.length, 128);
   assert.ok(packet(changed, 0).every(value => value === 255));
   assert.ok(packet(changed, 1).every(value => value === 2));
+});
+test('shared packets compare each accepted value, preserve float bits and charge every logical draw', async t => {
+  const f = rig(t, {maxDraws: 4}), program = f.program([4]);
+  program.groups[0].sharedUniforms = true;
+  const record = await f.add([], {nodeProgram: program}), source = new Uint32Array(1);
+  const draw = word => {
+    source[0] = word;
+    return f.stage(record, [], {nodeUniforms: [new Uint8Array(source.buffer)]});
+  };
+  const commands = [draw(0), draw(0), draw(0x80000000), draw(0x7fc12435)];
+  assert.deepEqual(commands.map(c => c.nodeProgram.groups[0].offset), [0, 0, 256, 512]);
+  assert.equal(f.owner.uniformDiagnostics.draws, 4);
+  assert.throws(() => draw(0x7fc12435), {code: 'ANIMATION_RENDER_LIMIT'});
+  f.owner.write();
+  assert.deepEqual(commands.map(c => new Uint32Array(packet(c, 0).buffer)[0]), [0, 0, 0x80000000, 0x7fc12435]);
+  f.owner.begin();
+  assert.equal(draw(0x7fc12435).nodeProgram.groups[0].offset, 0);
 });
 test('malformed packets fail before consuming a draw slot', async t => {
   const f = rig(t, {maxDraws: 1}), record = await f.add([16, 32]);

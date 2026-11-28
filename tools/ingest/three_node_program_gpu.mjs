@@ -151,7 +151,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     entries.sort((a, b) => a.binding - b.binding);
     const arena = uniforms.length ? arenaAt(index) : null;
     arena?.checkPacketSize(byteLength);
-    return {index, byteLength, arena, uniforms: Object.freeze(uniforms), entries,
+    return {index, byteLength, arena, sharedUniforms: group.sharedUniforms === true, uniforms: Object.freeze(uniforms), entries,
       resources: entries.filter(entry => entry.buffer?.type !== 'uniform'),
       arenaLayout: entries.length === 1 && uniforms[0]?.binding === 0 && uniforms[0].offset === 0 && entries[0].visibility === 3};
   }
@@ -432,7 +432,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     }
     for (const [buffer, writable] of buffers) checkBufferUsage(buffer, writable);
     const groups = record.groups.map((group, index) => {
-      const packet = group.arena ? group.arena.stage(record.uniformBindings[index], bytes[index]) : null;
+      const packet = group.arena ? group.arena.stage(record.uniformBindings[index], bytes[index], group.sharedUniforms) : null;
       const offsets = Object.freeze(group.uniforms.map(() => packet.offset));
       if (group.arenaLayout) return {...packet, offsets};
       const output = {group: null, offset: packet?.offset ?? null, offsets};
