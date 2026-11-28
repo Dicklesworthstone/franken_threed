@@ -87,7 +87,7 @@ test('unchanged H1 instance loop and renamed premultiply shape derive arithmetic
 test('the H1 update uses one transaction, preserves every instance, final scratch state, identities and upload version',()=>{
   const f=pair(),a=f.actual,identity=[a.mesh.instanceMatrix,a.mesh.instanceMatrix.array,a.rotation,a.rotation.elements,a.scratch,a.scratch.elements];
   for(let i=0;i<5;i++){
-    advance(f);assert.deepEqual(f.api.diagnostics(a.mesh),{wasmCalls:i+1,instances:(i+1)*10,fallbackCalls:0,lastFailure:null});
+    advance(f);assert.deepEqual(f.api.diagnostics(a.mesh),{wasmCalls:i+1,instances:(i+1)*10,reusedRotations:i*10,fallbackCalls:0,lastFailure:null});
   }
   assert.deepEqual([a.mesh.instanceMatrix,a.mesh.instanceMatrix.array,a.rotation,a.rotation.elements,a.scratch,a.scratch.elements],identity);
   assert.equal(f.api.multiplyDiagnostics(a.scratch).wasmCalls,0,'no per-instance multiply bridge crossings');
@@ -97,6 +97,34 @@ test('literal allocation witnesses preserve new-expression precedence for array-
   const trace=[],sourceTrace=[];
   assert.deepEqual(compiled.api.selectedConstructors(trace),sourceConstructors(sourceTrace));
   assert.deepEqual(compiled.api.selectedConstructors([]),[17,23,29]);assert.deepEqual(trace,sourceTrace);
+});
+
+test('cached rotations follow live speed values, signed zero, Euler order and source-visible edits',()=>{
+  const f=pair(9),last=8;
+  for(const side of [f.actual,f.expected])side.speeds[last].x=0;
+  advance(f);
+  for(const side of [f.actual,f.expected]){
+    side.speeds[1].order='YZX';
+    side.speeds[3].z+=1;
+    side.speeds[last].x=-0;
+    side.mesh.instanceMatrix.array[0]=123.5;
+    side.rotation.elements.fill(17);
+    side.scratch.elements.fill(-42);
+  }
+  advance(f);
+  assert.equal(f.api.diagnostics(f.actual.mesh).reusedRotations,6);
+  // An observed speed makes the entire source loop run. The earlier dirty
+  // key must not survive this failed preparation with its old matrix.
+  for(const side of [f.actual,f.expected]){
+    side.speeds[0].x+=.25;
+    Object.defineProperty(side.speeds[5],'x',{get(){return this._x;},configurable:true});
+  }
+  advance(f);
+  for(const side of [f.actual,f.expected])delete side.speeds[5].x;
+  advance(f);
+  assert.equal(f.api.diagnostics(f.actual.mesh).reusedRotations,6);
+  f.api.reverse(...args(f.actual));reverse(...args(f.expected));same(f.actual,f.expected);
+  assert.equal(f.api.diagnostics(f.actual.mesh).reusedRotations,15);
 });
 
 test('all Euler orders, projective matrices, premultiply and Float64 instance storage retain Number results',()=>{

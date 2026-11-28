@@ -142,7 +142,7 @@ test('changed Mesh or EventDispatcher superclasses cannot witness returned Proxy
       api.update(...args(f.actual));updateReference(...args(f.expected));
       assert.deepEqual(globalThis.__f3dInstanceSourceTrace,trace);
       assert.equal(globalThis.__f3dInstanceSourceProbes,probes);assert.equal(probes,0);
-      assert.deepEqual(api.diagnostics(f.actual.mesh),{wasmCalls:0,instances:0,fallbackCalls:0,lastFailure:null});same(f.actual,f.expected);
+      assert.deepEqual(api.diagnostics(f.actual.mesh),{wasmCalls:0,instances:0,reusedRotations:0,fallbackCalls:0,lastFailure:null});same(f.actual,f.expected);
     }
   } finally {
     delete globalThis.__f3dProxyOwnerClass;delete globalThis.__f3dInstanceSourceTrace;delete globalThis.__f3dInstanceSourceProbes;

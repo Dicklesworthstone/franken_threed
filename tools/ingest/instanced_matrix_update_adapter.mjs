@@ -5,7 +5,7 @@ import {matrixNumericElements} from './matrix_multiply_adapter.mjs';
 import {eulerUpdateNumericSnapshot,eulerUpdatePlatformIntact} from './euler_update_adapter.mjs';
 import {isNumericObject} from './numeric_objects.mjs';
 const host=globalThis,apply=Reflect.apply,descriptor=Object.getOwnPropertyDescriptor,prototype=Object.getPrototypeOf;
-const hasOwn=Object.hasOwn,freeze=Object.freeze,create=Object.create,integer=Number.isSafeInteger;
+const hasOwn=Object.hasOwn,freeze=Object.freeze,create=Object.create,integer=Number.isSafeInteger,same=Object.is;
 const get=WeakMap.prototype.get,set=WeakMap.prototype.set,has=WeakSet.prototype.has,add=WeakSet.prototype.add;
 const F64=Float64Array,U8=Uint8Array,decode=host.atob,charCode=String.prototype.charCodeAt;
 const typed=prototype(F64.prototype),tag=descriptor(typed,Symbol.toStringTag).get;
@@ -21,7 +21,7 @@ const methods=['makeRotationFromEuler','multiply','premultiply','multiplyMatrice
 
 export function createInstancedMatrixKernel(base64,orders,maxMemoryPages){
   const token=freeze({}),capacity=(maxMemoryPages*65536-128)/(39*8);
-  apply(set,records,[token,{base64,orders,maxRows:capacity-capacity%1,classes:create(null),attempted:false,kernel:null}]);
+  apply(set,records,[token,{base64,orders,maxRows:capacity-capacity%1,classes:create(null),attempted:false,kernel:null,workspace:null}]);
   return token;
 }
 export function registerInstancedMatrixClass(token,name,Class){
@@ -65,7 +65,16 @@ function input(record,mesh,speeds,rotation,scratch,reverse){
       !apply(byteLength,backing,[])||(resizable&&apply(resizable,backing,[]))||
       (immutable&&apply(immutable,backing,[])))return null;
   }catch{return null;}
-  const state=new F64(count*39);
+  // One private workspace per compiled kernel. It holds only numeric values,
+  // so it can be reused even across meshes, with no scene objects kept alive.
+  // Take it out of circulation until the entire transaction succeeds. A late
+  // refusal, failed Wasm call or reentrant initializer cannot reuse dirty keys.
+  const previous=record.workspace;
+  record.workspace=null;
+  const reuse=previous?.count===count;
+  const workspace=reuse?previous:{count,state:new F64(count*39),angles:new F64(count*4)};
+  const {state,angles}=workspace;
+  let reusedRotations=0;
   for(let i=0;i<count;i++){
     const speed=data(speeds,i),angle=eulerUpdateNumericSnapshot(speed);
     if(!angle)return null;
@@ -74,11 +83,22 @@ function input(record,mesh,speeds,rotation,scratch,reverse){
     if(order<0)return null;
     const offset=i*39;
     for(let j=0;j<16;j++)state[offset+j]=storage[i*16+j];
-    // Match the source's cos(x),sin(x),cos(y),sin(y),cos(z),sin(z) order.
-    for(let j=0;j<3;j++){state[offset+16+j*2]=cos(angle.values[j]);state[offset+17+j*2]=sin(angle.values[j]);}
-    state[offset+22]=order;
+    const key=i*4,x=angle.values[0],y=angle.values[1],z=angle.values[2];
+    // Keep signed zeros distinct and recompute NaNs, whose payload bits can
+    // differ even when Object.is reports equality. Always reread live angles,
+    // their getters' identities, source instance storage and the rotation order.
+    if(reuse && angles[key+3]===order && x===x && y===y && z===z &&
+        same(angles[key],x) && same(angles[key+1],y) && same(angles[key+2],z)){
+      state[offset+22]=-1;
+      reusedRotations++;
+    }else{
+      // Source order: cos(x),sin(x),cos(y),sin(y),cos(z),sin(z).
+      for(let j=0;j<3;j++){state[offset+16+j*2]=cos(angle.values[j]);state[offset+17+j*2]=sin(angle.values[j]);}
+      state[offset+22]=order;
+      angles[key]=x;angles[key+1]=y;angles[key+2]=z;angles[key+3]=order;
+    }
   }
-  return {count,state,storage,rotate,result};
+  return {count,state,storage,rotate,result,workspace,reusedRotations};
 }
 function kernel(record){
   if(!record.attempted){
@@ -95,7 +115,7 @@ function kernel(record){
 export function tryInstancedMatrixLoop(mesh,speeds,rotation,scratch,reverse=false){
   const record=lookup(owners,mesh);if(!record)return false;
   let stats=lookup(statistics,mesh);
-  if(!stats){stats={wasmCalls:0,instances:0,fallbackCalls:0,lastFailure:null};apply(set,statistics,[mesh,stats]);}
+  if(!stats){stats={wasmCalls:0,instances:0,reusedRotations:0,fallbackCalls:0,lastFailure:null};apply(set,statistics,[mesh,stats]);}
   const fallback=reason=>{stats.fallbackCalls++;stats.lastFailure=reason;return false;};
   if(!eulerUpdatePlatformIntact()||data(host,'Math')!==math||data(math,'cos')!==cos||data(math,'sin')!==sin)
     return fallback('INSTANCE_MATRIX_PLATFORM');
@@ -116,8 +136,9 @@ export function tryInstancedMatrixLoop(mesh,speeds,rotation,scratch,reverse=fals
   for(let i=0;i<prepared.count;i++)for(let j=0;j<16;j++)prepared.storage[i*16+j]=prepared.state[i*39+j];
   const last=(prepared.count-1)*39;
   for(let j=0;j<16;j++){prepared.rotate[j]=prepared.state[last+23+j];prepared.result[j]=prepared.state[last+j];}
-  stats.wasmCalls++;stats.instances+=prepared.count;stats.lastFailure=null;return true;
+  record.workspace=prepared.workspace;
+  stats.wasmCalls++;stats.instances+=prepared.count;stats.reusedRotations+=prepared.reusedRotations;stats.lastFailure=null;return true;
 }
 export function instancedMatrixUpdateDiagnostics(mesh){
-  return freeze({...lookup(statistics,mesh)??{wasmCalls:0,instances:0,fallbackCalls:0,lastFailure:null}});
+  return freeze({...lookup(statistics,mesh)??{wasmCalls:0,instances:0,reusedRotations:0,fallbackCalls:0,lastFailure:null}});
 }

@@ -61,7 +61,8 @@ export function specializeInstancedMatrixBase(source,{runtimeModule,matrixSource
     te:index=>'state[offset+'+index+']',
   })).join('\n');
   const kernelSource='function rotateInstanceMatrices(state,count,reverse){for(let i=0;i<count;i++){const offset=i*'+INSTANCE_MATRIX_STRIDE+';'+
-    ['a','b','c','d','e','f'].map((name,index)=>'const '+name+'=state[offset+'+(16+index)+'];').join('')+rotate+'\n'+product+'}}';
+    'if(state[offset+22]>=0){'+['a','b','c','d','e','f'].map((name,index)=>'const '+name+'=state[offset+'+(16+index)+'];').join('')+
+    rotate+'}\n'+product+'}}';
   const artifact=compileNumericKernel(kernelSource,{parameterTypes:['f64[]','f64','f64'],generalControl:true,
     maxMemoryPages,maxIterations,sourceName:'pinned Matrix4.makeRotationFromEuler / multiplyMatrices instanced loop'});
   const token=fresh(source,'kernel'),create=fresh(source,'create'),owner=fresh(source,'owner'),bind=fresh(source,'bind');
