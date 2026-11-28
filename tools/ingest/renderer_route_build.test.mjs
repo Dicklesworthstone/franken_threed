@@ -694,10 +694,11 @@ test("served capability reads (getMaxAnisotropy) do not veto the WebGL route", a
   assert.equal(r.rendererRoute.routed, true);
 });
 
-test("H2 routes through the new backend after its verified controls ownership edge closes", async () => {
+test("H2 routes through the new backend with a relative Three.js package root", async () => {
   const out = fs.mkdtempSync(path.join(tmpdir(), "f3d_route_h2_"));
   const entry = path.resolve(upstreamBuild, "../examples/webgl_marchingcubes.html");
-  const result = await buildApplication(entry, path.join(out, "out"), { routeWebGLRenderer: true });
+  const packageRootUrl = path.relative(process.cwd(), path.dirname(upstreamBuild));
+  const result = await buildApplication(entry, path.join(out, "out"), { routeWebGLRenderer: true, packageRootUrl });
   assert.equal(result.rendererRoute.routed, true);
   assert.equal(result.rendererRoute.decisions[0].route, "general-webgpu");
   assert.deepEqual(result.rendererRoute.substitutedModules, [pathToFileURL(path.join(upstreamBuild, "three.module.js")).href]);

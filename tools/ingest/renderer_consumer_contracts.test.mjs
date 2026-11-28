@@ -107,9 +107,13 @@ test('RendererInspector proof follows source and resolved dependency identity, i
 });
 
 test('the original H2 graph becomes eligible while H1 retains its Inspector backend mutation', async () => {
-  const h2 = await buildModuleGraph(fileURLToPath(new URL('examples/webgl_marchingcubes.html', upstream)));
+  const packageRootUrl = path.relative(process.cwd(), fileURLToPath(upstream));
+  const h2 = await buildModuleGraph(fileURLToPath(new URL('examples/webgl_marchingcubes.html', upstream)), {packageRootUrl});
+  assert.equal(h2.package_root_url,upstream.href);
   assert.deepEqual(extractGraphRoutingFacts(h2).escapes, []);
   assert.equal(evaluateGraphRoutes(h2, decideRendererRoute, environment)[0].decision.route, 'general-webgpu');
+  const wrongRoot = upstream.href.replace(/\/$/, '-copy/');
+  assert.equal(evaluateGraphRoutes(h2, decideRendererRoute, {...environment,packageRootUrl:wrongRoot})[0].decision.route, 'exact-backend');
   const h1 = await buildModuleGraph(fileURLToPath(new URL('examples/webgpu_performance_renderbundle.html', upstream)));
   assert.equal(evaluateGraphRoutes(h1, decideRendererRoute, environment)[0].decision.route, 'exact-backend');
   assert.ok(extractGraphRoutingFacts(h1).escapes.some(escape => escape.module_id.endsWith('/inspector/tabs/Settings.js') &&

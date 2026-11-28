@@ -44,7 +44,7 @@ import {
   htmlContextTags,
   rewriteHtmlContextTags,
 } from "./html_parser.mjs";
-import { normalizeSpecifierKey, resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
+import { normalizeSpecifierKey, resolveModuleSpecifier, urlToFilePath, withCanonicalPackageRoot } from "./resolver.mjs";
 import { buildModuleGraph } from "./module_graph.mjs";
 import { IngestionParseError } from "./types.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
@@ -934,6 +934,7 @@ function pathExistsOrSymlink(targetPath) {
  * }>}
  */
 export async function buildApplication(entryPath, outDir, options = {}) {
+  options = withCanonicalPackageRoot(options);
   const moduleSources = moduleSourcesFor(options);
   const target = moduleSources.target ?? 'browser';
   if (!entryPath || typeof entryPath !== "string") {

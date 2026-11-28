@@ -18,6 +18,15 @@ import { normalizeDocumentRoot, resolveDocumentUrl, documentRelativePath, isRoot
 export { resolveExportTargetValue, resolvePackageExports } from "./package_exports.mjs";
 export { normalizeModuleTarget } from "./node_package_resolver.mjs";
 
+// Filesystem roots are relative to the invoking process, just as in package
+// resolution. Resolve once before passing the override to URL-based ownership
+// checks. Graph module IDs and browser import specifiers remain untouched.
+export function withCanonicalPackageRoot(options) {
+  const root = options.packageRootUrl;
+  if (!root || (!path.isAbsolute(root) && URL.canParse(root))) return options;
+  return { ...options, packageRootUrl: pathToFileURL(path.resolve(root) + path.sep).href };
+}
+
 /**
  * Normalizes a base URL (strips fragment like #inline-module-1).
  * @param {string} url

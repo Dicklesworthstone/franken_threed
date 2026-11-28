@@ -16,7 +16,7 @@ import { closeRendererModuleOwnership } from "./renderer_module_ownership.mjs";
 import { transformThreePostProcessing } from "./postprocessing_contracts.mjs";
 import { transformThreeGpuComputation } from "./gpu_computation_contracts.mjs";
 import { parseHtmlEntries } from "./html_parser.mjs";
-import { getBaseUrl, resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
+import { getBaseUrl, resolveModuleSpecifier, urlToFilePath, withCanonicalPackageRoot } from "./resolver.mjs";
 import { IngestionResolutionError, SCHEMA_VERSION } from "./types.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
 import { createImportedStringResolver } from "./module_string_constants.mjs";
@@ -102,6 +102,7 @@ function findCycles(adj) {
  * @returns {Promise<Object>} The versioned module graph bundle
  */
 export async function buildModuleGraph(entryPath, options = {}) {
+  options = withCanonicalPackageRoot(options);
   const documentRoot = normalizeDocumentRoot(options.documentRoot);
   const moduleSources = moduleSourcesFor(options);
   const target = moduleSources.target ?? 'browser';
@@ -639,6 +640,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
 
   const bundle = {
     schema_version: SCHEMA_VERSION,
+    ...(options.packageRootUrl ? {package_root_url: options.packageRootUrl} : {}),
     target,
     entry_type: isHtml ? "html" : "module",
     entry_path: resolvedEntryAbs,
