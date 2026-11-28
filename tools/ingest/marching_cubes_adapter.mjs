@@ -94,7 +94,7 @@ function kernelFor(record) {
       for (let k=0;k<binary.length;k++) bytes[k]=apply(charCodeAt,binary,[k]);
       // Independent storage is essential: do NOT enable preserveAliasing.
       record.kernel=instantiateNumericKernel(bytes,{resolveMath:record.resolveMath??null,
-        resultPrefixWidths:record.resultPrefixWidths??null});
+        resultPrefixWidths:record.resultPrefixWidths??null,fitResultPrefixes:record.resultPrefixWidths===vertexWidths});
     } catch {
       // Host policy may throw arbitrary values with effectful accessors.
       record.initializationFailure='MARCHING_CUBES_INITIALIZATION';
@@ -307,7 +307,7 @@ export function attachMarchingCubesFields(token,specifications,resolveMath) {
       if (parameter.kind==='local' && index<0) throw new TypeError('Missing field local binding');
       return Object.freeze({...parameter,index});
     });
-    fields.set(name,{base64,parameters:Object.freeze(bindings),localCount:locals.length,
+    fields.set(name,{base64,parameters:Object.freeze(bindings),localCount:locals.length,resultPrefixWidths:specification.resultPrefixWidths,
       color:bindings.some(p=>p.kind==='color'),resolveMath,
       attempted:false,kernel:null,initializationFailure:null});
   }

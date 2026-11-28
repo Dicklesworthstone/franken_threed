@@ -65,6 +65,12 @@ The source's operations are not replaced with an algebraically similar formula.
 Reset preserves the y/z normal-cache components; blur keeps the exact neighbor
 order and progressively rounded scalar accumulator from upstream.
 
+Reset transfers the updated field and RGB palette prefixes back to their
+original arrays without first copying the values it will overwrite. The normal
+cache still travels in both directions because two components per cell survive
+reset. Blur reads its source snapshot and publishes only the overwritten
+cubic-grid prefix. Edited strides that leave holes use the original loop.
+
 Color conversion, scalar setup, and blur's `field.slice()` execute once in the
 original method before the native attempt. A refused attempt resumes at the
 original loop, not the method entry. Color/owner accessors, proxy Colors,

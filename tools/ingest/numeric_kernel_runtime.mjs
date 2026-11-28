@@ -450,14 +450,17 @@ function planNumericStorage(records, refuse) {
  * retain JavaScript. The default keeps the existing independent-prefix ABI.
  * A library kernel can supply resultPrefixWidths when its body never reads
  * the named outputs and overwrites each nonempty view densely from zero to
- * result * width. Empty optional views must be unused. Full view lengths still
- * govern all kernel address checks, memory bounds and alias guards.
+ * result * width. Empty optional views must be unused. fitResultPrefixes is
+ * an additional producer guarantee: these kernels never inspect output lengths
+ * except in generated bounds checks. Their private destinations may be smaller
+ * than the source views; exceeding one traps before publication.
  */
 export function instantiateNumericKernel(bytes, {
   fallback = null, maxMemoryBytes = null, resolveMath = null, preserveAliasing = false, captureGuard = null,
-  resultPrefixWidths = null,
+  resultPrefixWidths = null, fitResultPrefixes = false,
 } = {}) {
   if (typeof preserveAliasing !== 'boolean') throw new TypeError('preserveAliasing must be a boolean');
+  if (typeof fitResultPrefixes !== 'boolean') throw new TypeError('fitResultPrefixes must be a boolean');
   if (fallback !== null && typeof fallback !== 'function') throw new TypeError('fallback must be a function or null');
   if (resolveMath !== null && typeof resolveMath !== 'function') throw new TypeError('resolveMath must be a function or null');
   if (captureGuard !== null && typeof captureGuard !== 'function') throw new TypeError('captureGuard must be a function or null');
@@ -488,6 +491,8 @@ export function instantiateNumericKernel(bytes, {
       prefixWidths.set(index, width);
     }
   }
+  if (fitResultPrefixes && !prefixWidths?.size)
+    throw new TypeError('Fitting output storage requires a result-sized output contract');
   const boundParameters = checkedIndexing ? manifest.lengthParameters
     : pipeline ? manifest.boundParameters : [manifest.boundParameter];
   const boundSet = new Set(boundParameters);
@@ -577,7 +582,7 @@ export function instantiateNumericKernel(bytes, {
       record.ptr = align(requiredBytes, record.elementBytes);
       requiredBytes = record.ptr + record.byteLength;
     }
-    if (!preserveAliasing && (!Number.isSafeInteger(requiredBytes) || requiredBytes > limit)) {
+    if (!isSafeInteger(requiredBytes) || (!preserveAliasing && !fitResultPrefixes && requiredBytes > limit)) {
       refuse('KERNEL_MEMORY_LIMIT', `Packed update requires ${requiredBytes} bytes; limit is ${limit}`);
     }
     for (const record of records) {
@@ -599,6 +604,37 @@ export function instantiateNumericKernel(bytes, {
     }
     const storage = preserveAliasing ? planNumericStorage(records, refuse) : null;
     if (storage) requiredBytes = storage.requiredBytes;
+    // MarchingCubes reserves its maximum polygon capacity once, even for a
+    // nearly empty surface. Keep the full alias checks above. Under memory
+    // pressure, fit as many complete output records as the private pages allow.
+    // Inputs, caches, lookup tables and ordinary writable arrays stay whole.
+    const pageLimit = limit - limit % PAGE_BYTES;
+    if (fitResultPrefixes && requiredBytes > pageLimit) {
+      const layout = (capacity, install) => {
+        let end = 0;
+        for (const record of records) {
+          const width = prefixWidths.get(record.index);
+          const count = width === undefined || capacity * width >= record.length
+            ? record.count : capacity * width;
+          const ptr = align(end, record.elementBytes);
+          end = ptr + count * record.elementBytes;
+          if (install) { record.ptr = ptr; record.count = count; }
+        }
+        return end;
+      };
+      let low = 0, high = pageLimit;
+      while (low < high) {
+        const middle = low + ((high - low + 1) >>> 1);
+        if (layout(middle, false) <= pageLimit) low = middle;
+        else high = middle - 1;
+      }
+      requiredBytes = layout(low, true);
+      // The checked ABI takes one length per array, in declaration order.
+      // A store outside a private output window must never reach the next array.
+      for (let i = 0; i < records.length; i++) {
+        if (prefixWidths.has(records[i].index)) counts[i] = records[i].count;
+      }
+    }
     if (!Number.isSafeInteger(requiredBytes) || requiredBytes > limit) {
       refuse('KERNEL_MEMORY_LIMIT', `Packed update requires ${requiredBytes} bytes; limit is ${limit}`);
     }
@@ -627,7 +663,7 @@ export function instantiateNumericKernel(bytes, {
       for (const record of records) {
         const width = prefixWidths?.get(record.index);
         if (width !== undefined) {
-          if (record.count) prefixes.push({ record, width });
+          if (record.length) prefixes.push({ record, width });
           continue;
         }
         const source = new record.ArrayType(record.buffer, record.offset, record.count);

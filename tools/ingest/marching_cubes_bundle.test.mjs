@@ -24,8 +24,6 @@ async function write(name,content) {
   const file=path.join(root,name);await fs.mkdir(path.dirname(file),{recursive:true});await fs.writeFile(file,content);return file;
 }
 async function executeBuild(build) {
-  // Build output .js files are browser ES modules; declare that in the Node harness.
-  await fs.writeFile(path.join(build.outDir,'package.json'),'{"type":"module"}',{flag:'wx'});
   return import(pathToFileURL(path.join(build.outDir,build.entryFiles[0])).href);
 }
 function compare(actual,expected) {
@@ -52,6 +50,8 @@ before(async()=>{
   assert.equal(createHash('sha256').update(core).digest('hex'),
     '9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6');
   root=await fs.mkdtemp(path.join(os.tmpdir(),'f3d-marching-build-'));
+  // Direct Rollup output inherits this scope; application builds own their own.
+  await write('package.json','{"type":"module"}');
   const actualEntry=await write('native-entry.mjs',diagnosticEntry);
   const expectedEntry=await write('retained-entry.mjs',ordinaryEntry);
   actualBuild=await buildApplication(actualEntry,path.join(root,'native'),{packageRootUrl,specializeNumeric:true});
@@ -122,6 +122,42 @@ test('polygonizer transfers only emitted attribute prefixes and preserves all re
   }
 });
 
+test('reset and blur skip overwritten inputs but preserve source array tails, cache lanes and sparse edits',()=>{
+  const [a,b]=pair(6);
+  for(const effect of [a,b]){
+    for(const key of ['field','palette','normal_cache']){
+      const words=new Uint32Array(effect[key].length+8).fill(0xffc12345);
+      effect[key]=new Float32Array(words.buffer,8,words.length-4);
+    }
+    effect.reset();
+    effect.blur();
+    for(let i=0;i<effect.size3;i++)effect.field[i]=i/17;
+  }
+  const sameBytes=()=>{for(const key of ['field','palette','normal_cache'])
+    assert.deepEqual(new Uint8Array(a[key].buffer),new Uint8Array(b[key].buffer),key);};
+  const stats=name=>actualModule.diagnostics(a).fieldKernels[name];
+  const previousReset=stats('reset').kernel.copiedBytes,previousBlur=stats('blur').kernel.copiedBytes;
+  for(const effect of [a,b])effect.blur(.25);
+  sameBytes();
+  assert.equal(stats('blur').kernel.copiedBytes-previousBlur,a.field.byteLength+4*a.size3);
+  for(const effect of [a,b]){
+    effect.size3=7;
+    effect.palette.fill(-0);
+    effect.normal_cache.fill(17);
+    effect.reset();
+  }
+  sameBytes();
+  assert.equal(stats('reset').kernel.copiedBytes-previousReset,2*a.normal_cache.byteLength+7*4*(1+3));
+  // This is a valid source operation with overlapping rows and untouched
+  // destinations. A private dense-prefix result cannot represent its writes.
+  for(const effect of [a,b]){effect.size2=2;effect.blur(.75);}
+  sameBytes();
+  assert.equal(stats('blur').lastFailure,'KERNEL_RESULT_EXTENT');
+  for(const effect of [a,b]){effect.size3=7.5;effect.reset();}
+  sameBytes();
+  assert.equal(stats('reset').lastFailure,'KERNEL_RESULT_EXTENT');
+});
+
 test('full objects retain animated fields, material changes, stale normals and reinitialization',()=>{
   const [a,b]=pair(),method=a.update;
   for(let frame=0;frame<7;frame++) {
@@ -180,6 +216,15 @@ test('caller memory/fuel budgets propagate through the existing build API to who
     const built=await buildApplication(path.join(root,'native-entry.mjs'),path.join(root,suffix),{packageRootUrl,specializeNumeric:settings});
     const m=await executeBuild(built);
     assert.equal(built.numericSpecialization.libraryKernels.marchingCubes[suffix],1);
+    if(settings.maxMemoryPages===1) {
+      const small=new m.MarchingCubes(8,new m.MeshPhongMaterial(),true,true,100000);
+      const reference=new expectedModule.MarchingCubes(8,new expectedModule.MeshPhongMaterial(),true,true,100000);
+      for(const effect of [small,reference])cubeField(effect,1);
+      update(small,reference);
+      assert.ok(small.count>0);
+      assert.equal(m.diagnostics(small).wasmCalls,1);
+      assert.equal(m.diagnostics(small).kernel.memoryBytes,65536);
+    }
     const a=new m.MarchingCubes(18,new m.MeshPhongMaterial(),true,true,2000);
     const b=new expectedModule.MarchingCubes(18,new expectedModule.MeshPhongMaterial(),true,true,2000);
     for(const effect of [a,b])effect.addBall(0.5,0.5,0.5,1,9);
@@ -369,7 +414,9 @@ test('late field bounds and alias failures do not publish speculative density be
 });
 
 test('the source-tree import-map route registers Color and EventDispatcher without requiring the built core',async()=>{
-  const map={imports:{three:new URL('src/Three.js',packageRootUrl).href,'three/addons/':new URL('examples/jsm/',packageRootUrl).href}};
+  const map={imports:{three:new URL('src/Three.js',packageRootUrl).href,'three/addons/':new URL('examples/jsm/',packageRootUrl).href,
+    // Graph discovery resolves this test-only import before Rollup installs its virtual module.
+    ['\0f3d-marching-cubes-adapter']:new URL('./marching_cubes_adapter.mjs',import.meta.url).href}};
   const entry=await write('source-route.html',`<script type="importmap">${JSON.stringify(map)}</script><script type="module" src="./native-entry.mjs"></script>`);
   const built=await buildApplication(entry,path.join(root,'source-route'),{specializeNumeric:true});
   const m=await executeBuild(built),a=new m.MarchingCubes(8,new m.MeshPhongMaterial());

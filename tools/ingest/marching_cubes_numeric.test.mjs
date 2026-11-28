@@ -124,6 +124,46 @@ test('fuel exhaustion and memory budgets fail before publication, not after part
   }
 });
 
+test('a bounded Wasm heap polygonizes into the original H2 capacity without allocating its unused tail',()=>{
+  const budget=16*65536;
+  const kernel=instantiateNumericKernel(artifact.wasm,{maxMemoryBytes:budget,
+    resultPrefixWidths:{position:3,normal:3,uv:2,color:3},fitResultPrefixes:true});
+  const [actual,expected]=pair(28,7,100000);
+  assert.ok(actual.positionArray.byteLength>budget);
+  for(const effect of [actual,expected]) {
+    effect.addBall(.5,.5,.5,1,12);
+    effect.positionArray.fill(-0);
+    effect.uvArray.fill(13);
+  }
+  update(kernel,actual,expected);
+  assert.ok(actual.count>0);
+  assert.ok(kernel.diagnostics.memoryBytes<=budget);
+
+  // Two full source views overlap only far beyond either private window.
+  const normal=actual.normalArray;
+  const shared=new ArrayBuffer(actual.positionArray.byteLength*2-4);
+  actual.positionArray=new Float32Array(shared,0,normal.length);
+  actual.normalArray=new Float32Array(shared,actual.positionArray.byteLength-4,normal.length);
+  assert.throws(()=>kernel.run(...args(actual)),{code:'KERNEL_ARRAY_ALIAS'});
+});
+
+test('a dense surface over the private window publishes nothing and a later sparse surface recovers',()=>{
+  const kernel=instantiateNumericKernel(artifact.wasm,{maxMemoryBytes:65536,
+    resultPrefixWidths:{position:3,normal:3,uv:2,color:3},fitResultPrefixes:true});
+  const [actual,expected]=pair(10,7,3000);
+  for(const effect of [actual,expected]) {
+    for(let z=0;z<10;z++)for(let y=0;y<10;y++)for(let x=0;x<10;x++)
+      effect.field[z*100+y*10+x]=(x+y+z)%2;
+    effect.isolation=.5;
+  }
+  const before=snapshot(actual);
+  assert.throws(()=>kernel.run(...args(actual)),{code:'KERNEL_EXECUTION_FAILED'});
+  unchanged(actual,before);
+  for(const effect of [actual,expected])cubeField(effect,1);
+  update(kernel,actual,expected);
+  assert.equal(kernel.diagnostics.wasmCalls,1);
+});
+
 test('aliased output storage is refused because upstream cross-attribute store order is observable',()=>{
   const [effect]=pair();cubeField(effect,1);
   effect.normalArray=effect.positionArray;

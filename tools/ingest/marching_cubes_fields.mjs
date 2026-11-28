@@ -95,12 +95,24 @@ export function compileMarchingCubesFields(source,{maxMemoryPages=2048,maxIterat
     // them. Their uninitialized JS values do not escape the method or loop.
     const scratch=fn.body.body.filter(node=>node.type==='VariableDeclaration' && node.start<loop.start)
       .flatMap(node=>node.declarations.filter(item=>item.init===null).map(item=>item.id.name));
+    // reset overwrites every field and RGB palette cell in its iteration
+    // domain. blur reads the separate source fieldCopy and writes a dense
+    // prefix only on the ordinary cubic grid. An edited grid may leave holes:
+    // a negative extent makes the checked host discard all private writes.
+    let resultPrefixWidths=null,extent='';
+    if(name==='reset'){
+      resultPrefixWidths={__f3d_field:1,__f3d_palette:3};
+      extent='\nreturn __f3d_size3;';
+    }else if(name==='blur'){
+      resultPrefixWidths={field:1};
+      extent='\nreturn size === (size >>> 0) && size2 === size*size ? size*size2 : -1;';
+    }
     const kernelSource=`function ${name}(${parameters.map(p=>p.name).join(',')}) {\n`+
-      (scratch.length?`let ${scratch.map(local=>local+'=0').join(',')};\n`:'')+body+'\n}';
+      (scratch.length?`let ${scratch.map(local=>local+'=0').join(',')};\n`:'')+body+extent+'\n}';
     const artifact=compileNumericKernel(kernelSource,{parameterTypes:parameters.map(p=>p.type),
       sourceName:`f3d:marching-cubes-r186:${name}`,allowMath:true,generalControl:true,maxMemoryPages,maxIterations});
     const locals=parameters.filter(p=>p.kind==='local').map(p=>p.property);
-    result.push(Object.freeze({name,...artifact,kernelSource,parameters:Object.freeze(parameters.map(p=>Object.freeze({...p}))),
+    result.push(Object.freeze({name,...artifact,kernelSource,resultPrefixWidths,parameters:Object.freeze(parameters.map(p=>Object.freeze({...p}))),
       locals:Object.freeze(locals),color:parameters.some(p=>p.kind==='color'),
       sourceSpan:Object.freeze({start:loop.start,end:loop.end})}));
   }

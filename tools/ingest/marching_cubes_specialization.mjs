@@ -92,7 +92,7 @@ export function specializeMarchingCubesModule(source,{
   // table/dispatch registration the original function supplies its own TDZ/error.
   let registration=`\n${token}=${createName}(${JSON.stringify(Buffer.from(artifact.wasm).toString('base64'))},edgeTable,triTable);\n`;
   if (fields.length) {
-    const specifications=fields.map(field=>({name:field.name,parameters:field.parameters,locals:field.locals,
+    const specifications=fields.map(field=>({name:field.name,parameters:field.parameters,locals:field.locals,resultPrefixWidths:field.resultPrefixWidths,
       base64:Buffer.from(field.wasm).toString('base64')}));
     registration+=`${attach}(${token},${JSON.stringify(specifications)},()=>Math);\n`;
     registration+=`${attachBalls}(${token},${JSON.stringify(Buffer.from(balls.wasm).toString('base64'))},()=>Math);\n`;

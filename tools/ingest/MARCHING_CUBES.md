@@ -24,7 +24,12 @@ In particular, upstream's insufficient-capacity count/warning behavior must
 not become a partial mesh or a new user-facing refusal.
 
 The defaults are 128 MiB private Wasm memory and 100 million loop-body entries.
-These bound the native attempt, not the application's retained JavaScript.
+The JavaScript fallback keeps the source application's original capacities.
+With a smaller build-time memory budget the addon keeps its full public output
+arrays and fits private vertex, normal, UV and color buffers to the available
+pages. Each store checks its private buffer limit. A surface that exceeds that
+space resumes the original update before any new geometry or cache is published.
+Inputs and caches still require their complete working storage.
 Buffers are copied by the current host, not zero-copy. No GPU submission,
 attribute upload, material callback, render control, or performance gate is
 established by numerical equivalence alone. Field-building methods remain

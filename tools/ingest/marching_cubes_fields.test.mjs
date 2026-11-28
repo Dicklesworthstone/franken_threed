@@ -20,12 +20,12 @@ async function instrument(options) {
     code=code.slice(0,start)+`if (!${invocation}) {\n`+code.slice(start,end)+'\n}'+code.slice(end);
   }
   code=`import {runField as __testField} from './field-harness.mjs';\n`+code;
-  const records=fields.map(field=>({name:field.name,parameters:field.parameters,locals:field.locals,
+  const records=fields.map(field=>({name:field.name,parameters:field.parameters,locals:field.locals,resultPrefixWidths:field.resultPrefixWidths,
     base64:Buffer.from(field.wasm).toString('base64')}));
   const harness=`import {instantiateNumericKernel} from ${JSON.stringify(runtime)};
     const records=${JSON.stringify(records)};
     const kernels=new Map(records.map(record=>[record.name,{...record,
-      kernel:instantiateNumericKernel(Uint8Array.from(atob(record.base64),c=>c.charCodeAt(0)),{resolveMath:()=>Math}),calls:0,refusals:0}]));
+      kernel:instantiateNumericKernel(Uint8Array.from(atob(record.base64),c=>c.charCodeAt(0)),{resolveMath:()=>Math,resultPrefixWidths:record.resultPrefixWidths}),calls:0,refusals:0}]));
     export function diagnostics(name) {const r=kernels.get(name);return {calls:r.calls,refusals:r.refusals,...r.kernel.diagnostics};}
     export function runField(name,owner,locals,color) {
       const record=kernels.get(name);
@@ -55,7 +55,7 @@ test('six field kernels are derived from exact source loops with bounded import-
     assert.equal(artifact.manifest.automaticRouteAdmission,false);
     assert.equal(artifact.manifest.maxMemoryPages,2048);
     assert.equal(artifact.manifest.maxIterations,100000000);
-    assert.equal(artifact.manifest.resultType,'void');
+    assert.equal(artifact.manifest.resultType,['reset','blur'].includes(artifact.name)?'f64':'void');
     assert.ok(artifact.manifest.loopCount>=1);
   });
   assert.deepEqual(artifacts[0].manifest.mathIntrinsics,['sqrt']);
