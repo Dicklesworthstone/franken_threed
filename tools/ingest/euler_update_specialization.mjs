@@ -13,7 +13,7 @@ const CORE_HASH='9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e
 const SOURCE_BLOBS={Object3D:'a0a09156f7e781130de6a361cf2c443b8c27d925',
   Euler:'5a19278c75a36e01454ae988d59c178a8295a14a',Quaternion:'c9faca31665218cee87a7110e2badc7ba868beca'};
 const XYZ=['x','y','z'],OPERATORS=['+','-','*','/'];
-export const EULER_UPDATE_STRIDE=17;
+export const EULER_UPDATE_STRIDE=7;
 const fresh=(source,name)=>{let value='__f3d_euler_'+name;while(source.includes(value))value+='_';return value;};
 const property=node=>node?.type!=='MemberExpression' || node.optional?null:
   !node.computed && node.property.type==='Identifier'?node.property.name:
@@ -58,22 +58,27 @@ export function specializeEulerUpdateBase(source,{runtimeModule,eulerSource,quat
     const edits=[];
     walk.simple(node,{MemberExpression(value){
       if(value.object.type==='ThisExpression' && ['_x','_y','_z','_w'].includes(property(value)))
-        edits.push({start:value.start,end:value.end,text:'state['+base+'+'+(13+['_x','_y','_z','_w'].indexOf(property(value)))+']'});
+        edits.push({start:value.start,end:value.end,text:'state['+base+'+'+(3+['_x','_y','_z','_w'].indexOf(property(value)))+']'});
     }});
     let text=quaternionText.slice(node.start,node.end);
     for(const edit of edits.sort((a,b)=>b.start-a.start))text=text.slice(0,edit.start-node.start)+edit.text+text.slice(edit.end-node.start);
     return text;
   }
-  // Each argument is evaluated before any Euler field is written. The six
-  // trigonometric inputs were computed with those same Number arguments during
-  // the guarded packing pass. Only the pinned quaternion arithmetic is inlined.
+  // The pinned source aliases Math.cos and Math.sin. Bind its original calls
+  // to guarded native imports, preserving the exact arguments and call order.
+  const trig=method.body.body.filter(node=>node.type==='VariableDeclaration' &&
+    ['cos','sin'].includes(node.declarations[0].init?.callee?.name)).map(node=>{
+    const call=node.declarations[0].init;
+    return quaternionText.slice(node.start,call.start)+'Math.'+quaternionText.slice(call.start,node.end);
+  }).join('\n');
+  // Read the three Euler inputs, three velocity terms and order before writing
+  // the seven public outputs into those same cells. No trig staging is needed.
   const kernelSource='function updateEulerChildren(state,plan,count){for(let i=0;i<count;i++){const offset=i*'+EULER_UPDATE_STRIDE+';'+
-    XYZ.map((axis,index)=>'const '+axis+'='+component(index)+';').join('')+
+    'const order=state[offset+6];'+XYZ.map((axis,index)=>'const '+axis+'='+component(index)+';').join('')+trig+
     XYZ.map((axis,index)=>'state[offset+'+index+']='+axis+';').join('')+
-    ['c1','c2','c3','s1','s2','s3'].map((name,index)=>'const '+name+'=state[offset+'+(index+6)+'];').join('')+
-    branches.map((branch,index)=>(index?'else ':'')+'if(state[offset+12]==='+index+'){'+
+    branches.map((branch,index)=>(index?'else ':'')+'if(order==='+index+'){'+
       branch.consequent.filter(node=>node.type!=='BreakStatement').map(arithmetic).join('\n')+'}').join('')+'}}';
-  const artifact=compileNumericKernel(kernelSource,{parameterTypes:['f64[]','f64[]','f64'],generalControl:true,
+  const artifact=compileNumericKernel(kernelSource,{parameterTypes:['f64[]','f64[]','f64'],generalControl:true,allowMath:true,
     maxMemoryPages,maxIterations,sourceName:'pinned Euler.set / Object3D.onRotationChange / Quaternion.setFromEuler'});
   const token=fresh(source,'kernel'),create=fresh(source,'create_kernel'),register=fresh(source,'class');
   const numeric=fresh(source,'numeric'),owner=fresh(source,'owner'),data=fresh(source,'data'),bind=fresh(source,'bind'),edits=[];
@@ -91,8 +96,8 @@ export function specializeEulerUpdateBase(source,{runtimeModule,eulerSource,quat
   return {changed:true,edits,header:'import {createEulerUpdateKernel as '+create+',registerEulerUpdateClass as '+register+
     ',registerEulerUpdateNumeric as '+numeric+',registerEulerUpdateOwner as '+owner+',registerEulerUpdateData as '+data+',bindEulerUpdateClass as '+bind+
     '} from '+JSON.stringify(runtimeModule)+';\nvar '+token+'='+create+'('+JSON.stringify(Buffer.from(artifact.wasm).toString('base64'))+
-    ','+JSON.stringify(orders)+','+maxMemoryPages+');\n',
-    report:{kind:'pinned-euler-kernel',role,sourceDerived:true,wasmBytes:artifact.wasm.length,
+    ','+JSON.stringify(orders)+','+maxMemoryPages+','+EULER_UPDATE_STRIDE+');\n',
+    report:{kind:'pinned-euler-kernel',role,sourceDerived:true,wasmBytes:artifact.wasm.length,bytesPerObject:EULER_UPDATE_STRIDE*8,
       upstreamCommit:'148ef33ecb6d2502ff796d4554abd1549c95d519',retainedMath:['cos','sin'],accelerationClaim:false}};
 }
 

@@ -57,7 +57,7 @@ async function fixture(options={}){
   }finally{await bundle.close();}
 }
 let compiled,limited;
-before(async()=>{compiled=await fixture();limited=await fixture({maxIterations:1});});
+before(async()=>{compiled=await fixture({maxMemoryPages:4});limited=await fixture({maxIterations:1});});
 function group(api,count=4){
   const root=new api.Group(),geometry=new api.BufferGeometry(),material=new api.MeshBasicMaterial();
   const orders=['XYZ','YXZ','ZXY','ZYX','YZX','XZY'];
@@ -88,11 +88,11 @@ test('only pinned core arithmetic registers the Euler kernel and the unchanged H
   assert.equal(compiled.report.compiledModules,1);assert.equal(compiled.report.compiledLoops,4);
   assert.equal(compiled.report.accelerationClaim,false);
   const kernel=compiled.report.modules.find(record=>record.kind==='pinned-euler-kernel');
-  assert.ok(kernel.wasmBytes>0);assert.deepEqual(kernel.retainedMath,['cos','sin']);
+  assert.ok(kernel.wasmBytes>0);assert.equal(kernel.bytesPerObject,56);assert.deepEqual(kernel.retainedMath,['cos','sin']);
   assert.equal(specializeEulerUpdateLoops(moduleSource,{runtimeModule:'./runtime.mjs'}).report.compiledLoops,1);
 });
 
-test('4000 source H1 mesh updates use one Wasm transaction per frame and preserve Euler/quaternion identity',()=>{
+test('4000 source H1 mesh updates fit four Wasm pages and preserve Euler/quaternion identity',()=>{
   const f=pair(compiled.api,4000),identities=f.actual.children.map(child=>[child.rotation,child.quaternion,child.userData.rotationSpeed]);
   for(let frame=0;frame<3;frame++){
     advance(f);assert.deepEqual(f.api.diagnostics(f.actual),{wasmCalls:frame+1,objects:4000*(frame+1),fallbackCalls:0,lastFailure:null});

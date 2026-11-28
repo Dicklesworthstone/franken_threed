@@ -159,8 +159,11 @@ and source Euler values reached through witnessed data objects such as the
 original `Object3D.userData`.
 
 One Wasm call computes Euler results and the pinned `Quaternion.setFromEuler`
-arithmetic for all six rotation orders. The original JavaScript engine's native
-`Math.cos` and `Math.sin` calls remain in the packing pass, in source order.
+arithmetic for all six rotation orders. The kernel calls the original JavaScript
+engine's guarded native `Math.cos` and `Math.sin` in source order. Each row's
+three angles, three velocity terms and order occupy 56 bytes. The kernel reuses
+the same cells to return the three Euler and four quaternion components. The
+pinned 4,000-mesh loop fits four 64-KiB Wasm pages with this layout.
 The public Euler and Quaternion objects keep identity and remain authoritative
 between calls. This is a copying transaction, not persistent packed ownership or
 a measured performance result.
@@ -205,9 +208,11 @@ mesh.instanceMatrix.needsUpdate = true;
 ```
 
 The compiler derives rotation and multiplication arithmetic from the pinned
-`Matrix4` source. All six Euler orders and `premultiply` are covered. Native
-JavaScript `cos` and `sin` remain in source evaluation order; one Wasm call
-computes the complete loop. Instance stores retain Float32 or Float64 conversion,
+`Matrix4` source. All six Euler orders and `premultiply` are covered. A private
+numeric workspace reuses a row's rotation matrix when its three live angles and
+order match, including signed-zero checks. Changed rows compute native JavaScript
+`cos` and `sin` in source order. Every row multiplies the current public instance
+matrix in one bulk Wasm call. Instance stores retain Float32 or Float64 conversion,
 while both public scratch matrices retain their full-precision final values and
 array identities. The upload request remains at its original source boundary.
 

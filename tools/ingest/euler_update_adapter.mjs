@@ -21,9 +21,9 @@ const nativeWasm=wasm && ['Module','Instance','Memory'].every(name=>native(data(
 const fields=['_x','_y','_z'],quaternionFields=['_x','_y','_z','_w'];
 const lookup=(map,key)=>apply(get,map,[key]);
 
-export function createEulerUpdateKernel(base64,orders,maxMemoryPages){
-  const token=freeze({}),capacity=(maxMemoryPages*65536-256)/(17*8);
-  apply(set,kernels,[token,{base64,orders,classes:create(null),maxRows:capacity-capacity%1,attempted:false,kernel:null}]);
+export function createEulerUpdateKernel(base64,orders,maxMemoryPages,stride){
+  const token=freeze({}),capacity=(maxMemoryPages*65536-9*8)/(stride*8);
+  apply(set,kernels,[token,{base64,orders,stride,classes:create(null),maxRows:capacity-capacity%1,attempted:false,kernel:null}]);
   return token;
 }
 export function registerEulerUpdateClass(token,name,Class){
@@ -91,7 +91,6 @@ function method(object,key,cls){
   const value=descriptor(object,key)??descriptor(cls.proto,key),expected=cls.properties[key];
   return !!value && hasOwn(value,'value') && value.value===expected?.value && typeof value.value==='function';
 }
-function term(a,b,operation){return operation===0?a+b:operation===1?a-b:operation===2?a*b:a/b;}
 function input(group,bound,plan,scale){
   if(typeof scale!=='number')return null;
   const root=lookup(owners,group),children=data(group,'children');
@@ -104,7 +103,8 @@ function input(group,bound,plan,scale){
     count=data(bound,plan.boundField);
   }
   if(!isInteger(count) || count<0 || count>root.record.maxRows || count>data(children,'length'))return null;
-  const state=new F64(count*17),entries=[],targets=new SetType(),speeds=[];
+  const {stride}=root.record;
+  const state=new F64(count*stride),entries=[],targets=new SetType(),speeds=[];
   for(let i=0;i<count;i++){
     const child=data(children,i),owner=lookup(owners,child);
     if(!owner || owner.record!==root.record || apply(setHas,targets,[child]) ||
@@ -127,20 +127,14 @@ function input(group,bound,plan,scale){
     }
     const velocity=velocityValues(speed);if(!velocity)return null;
     speeds[i]=speed;
-    const offset=i*17,ops=plan.operations,angles=[];
+    const offset=i*stride,ops=plan.operations;
     for(let j=0;j<3;j++){
       state[offset+j]=euler.values[j];
       const delta=velocity[ops[j*3+1]],mode=plan.scales[j];
       const step=mode==='none'?delta:mode==='multiply'?delta*scale:mode==='divide'?delta/scale:scale*delta;
       state[offset+j+3]=step;
-      angles[j]=term(euler.values[ops[j*3]],step,ops[j*3+2]);
     }
-    // Pinned Quaternion.setFromEuler takes cos(x/2),cos(y/2),cos(z/2),
-    // then the corresponding sin calls. Native Number inputs cannot call user
-    // code; modified Math functions refuse the entire attempt before packing.
-    for(let j=0;j<3;j++)state[offset+6+j]=cos(angles[j]/2);
-    for(let j=0;j<3;j++)state[offset+9+j]=sin(angles[j]/2);
-    state[offset+12]=orderIndex;
+    state[offset+6]=orderIndex;
     entries[i]={rotation:owner.rotation,quaternion:owner.quaternion,order:order.value,offset};
   }
   // Read-only speeds can be shared, but none may alias ANY output, including
@@ -154,7 +148,7 @@ function kernel(record){
     try{
       const binary=apply(decode,host,[record.base64]),bytes=new U8(binary.length);
       for(let i=0;i<binary.length;i++)bytes[i]=apply(charCode,binary,[i]);
-      record.kernel=instantiateNumericKernel(bytes);
+      record.kernel=instantiateNumericKernel(bytes,{resolveMath:()=>math});
     }catch{record.failure='EULER_UPDATE_INITIALIZATION';}
     record.base64=null;
   }
@@ -184,7 +178,7 @@ export function tryEulerUpdateLoop(group,bound,token,scale){
     const entry=prepared.entries[i],offset=entry.offset;
     for(let j=0;j<3;j++)entry.rotation[fields[j]]=prepared.state[offset+j];
     entry.rotation._order=entry.order;
-    for(let j=0;j<4;j++)entry.quaternion[quaternionFields[j]]=prepared.state[offset+13+j];
+    for(let j=0;j<4;j++)entry.quaternion[quaternionFields[j]]=prepared.state[offset+3+j];
   }
   stats.wasmCalls++;stats.objects+=prepared.count;stats.lastFailure=null;return true;
 }
