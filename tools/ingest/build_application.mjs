@@ -1515,6 +1515,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     specializeNumeric: options.specializeNumeric,
     _workerNumericUnits: workerNumericUnits,
     prepareStandaloneLoaders: options.prepareStandaloneLoaders,
+    networkedImports: options.networkedImports,
     ...(rendererRoute?.routed ? { rendererRoute: { targets: rendererRoute.targets, exactSites: rendererRoute.exactSites,
       postprocessingTransforms: rendererRoute.postprocessingTransforms,
       gpuComputationTransforms: rendererRoute.gpuComputationTransforms } } : {}),

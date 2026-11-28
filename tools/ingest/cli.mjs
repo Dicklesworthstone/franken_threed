@@ -24,6 +24,7 @@ Options:
   --out-dir <dir>       Alias for --build-app
   --pack-html <file>    Export emitted HTML as one file, alone or after --build-app
                        With --build-app, embeds discovered pinned Three.js loader resources
+  --networked-imports   With --pack-html, keep live absolute URL imports and source import maps
   --specialize-numeric Discover and compile guarded numeric updates in --build-app
   --route-webgpu-renderer Route WebGPURenderer to the general new WebGPU backend in --build-app
                        when the whole-graph route decision admits every construction site
@@ -80,6 +81,7 @@ async function main() {
   let transformModulePath = null;
   let buildAppDir = null;
   let packHtmlFile = null;
+  let networkedImports = false;
   let specializeNumeric = false;
   let routeWebGPURenderer = false;
   let routeWebGLRenderer = false;
@@ -117,6 +119,8 @@ async function main() {
         process.exit(1);
       }
       packHtmlFile = args[++i];
+    } else if (arg === "--networked-imports") {
+      networkedImports = true;
     } else if (arg === "--specialize-numeric") {
       specializeNumeric = true;
     } else if (arg === "--route-webgpu-renderer") {
@@ -185,6 +189,10 @@ async function main() {
   if (!entry) {
     console.error("Error: --entry <path> is required.");
     printHelp();
+    process.exit(1);
+  }
+  if (networkedImports && !packHtmlFile) {
+    console.error("Error: --networked-imports requires --pack-html.");
     process.exit(1);
   }
 
@@ -359,13 +367,14 @@ async function main() {
 
   async function exportHtml(htmlEntry, root = documentRoot) {
     const { packHtml } = await import("./pack_html.mjs");
-    const packed = packHtml(htmlEntry, packHtmlFile, root ? {documentRoot: root, rootDir: root} : {});
+    const packed = packHtml(htmlEntry, packHtmlFile, {networkedImports, ...(root ? {documentRoot: root, rootDir: root} : {})});
     console.log(`Single HTML exported to: ${packed.outputFile}`);
     console.log(
       `Embedded ${packed.moduleCount} modules and ${packed.assetCount} static assets (${packed.outputBytes} bytes).`,
     );
     console.log(
-      "Static resource graph only; application-created networking and host services are unchanged.",
+      networkedImports ? `Networked HTML with ${packed.liveImportSites} live module import sites.` :
+        "Static resource graph only; application-created networking and host services are unchanged.",
     );
     return packed;
   }
@@ -419,6 +428,7 @@ async function main() {
         routeWebGPURenderer,
         routeWebGLRenderer,
         prepareStandaloneLoaders: Boolean(packHtmlFile),
+        networkedImports,
       });
       if (appResult.rendererRoute) {
         const route = appResult.rendererRoute;

@@ -25,13 +25,14 @@ export function verifiedInspectorExtensionImports(code, ast) {
       if (url.type !== 'NewExpression' || url.callee.type !== 'Identifier' || url.callee.name !== 'URL' ||
           !property(url.arguments[0], 'url') || !property(url.arguments[1], 'url') ||
           url.arguments[1].object.type !== 'MetaProperty') return;
-      urls.set(node.id.name, url.arguments[0]);
+      urls.set(node.id.name, url);
     },
   });
   walk.simple(ast, {
     ImportExpression(node) {
-      const argument = node.source.type === 'Identifier' ? urls.get(node.source.name) : null;
-      if (!argument) return;
+      const url = node.source.type === 'Identifier' ? urls.get(node.source.name) : null;
+      if (!url) return;
+      const [argument, base] = url.arguments;
       imports.set(node.start, {
         classification: 'finite_set', specifier: null,
         candidates, specifiers: candidates, finite_set: candidates, finiteSet: candidates,
@@ -40,6 +41,7 @@ export function verifiedInspectorExtensionImports(code, ast) {
         // evaluates the getter and URL constructor once, preserves import(), and
         // avoids comparing a source-relative URL against a relocated chunk URL.
         url_argument_span: {start: argument.start, end: argument.end},
+        url_base_span: {start: base.start, end: base.end},
       });
     },
   });

@@ -12,6 +12,25 @@ URL for a given identity. Small modules keep their data URLs. If the hosting
 server supplies a Content Security Policy, it must allow the generated inline
 bootstrap and the module URL schemes used by the document.
 
+## Live Inspector extensions
+
+The r186 Inspector lets an application change an extension's URL at runtime.
+To embed its built-in extensions and keep that live import available, build a
+networked HTML page:
+
+```sh
+node tools/ingest/cli.mjs upstream/three.js/examples/webgpu_performance_renderbundle.html \
+  --build-app dist --pack-html renderbundle.html --networked-imports
+```
+
+Both built-ins still load on demand. A custom relative URL uses the original
+Settings module's location relative to the served page. Serve custom modules
+and their dependencies at those authored locations. Source import maps remain
+available to live plugins. The report labels this deployment `networked-html`
+and counts open absolute URL import sites. Strict standalone packing continues
+to require closed module imports. The packed page retains the source renderer
+and the Inspector's external TSL Graph editor service.
+
 ## Applications with origin-root URLs
 
 Declare the local directory that corresponds to the browser origin root when an

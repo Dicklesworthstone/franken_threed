@@ -639,6 +639,28 @@ export function f3dRollupPlugin(options = {}) {
             }
 
             const uniqueBranches = Array.from(new Set(candidates));
+            if (classified.runtime_fallback && options.networkedImports && options.documentUrl) {
+              // A Blob chunk cannot supply the authored Settings module base.
+              // Capture its logical URL once, keep the original selector and URL
+              // normalization, and give Rollup real lazy edges for the built-ins.
+              const documentPath = new URL(options.documentUrl).pathname;
+              const sourceUrl = new URL(referrerUrl);
+              const relative = path.posix.relative(path.posix.dirname(documentPath), sourceUrl.pathname);
+              const sourcePath = "./" + relative + sourceUrl.search + sourceUrl.hash;
+              const base = "__f3dInspectorModuleURL"; // unique in the hash-verified source
+              edits.push({type: "insert", pos: 0, priority: 1,
+                text: `const ${base} = new URL(${JSON.stringify(sourcePath)}, document.URL).href;\n`});
+              edits.push({type: "replace", pos: classified.url_base_span.start, end: classified.url_base_span.end,
+                priority: 2, text: base});
+              const href = node.source.name;
+              const builtins = uniqueBranches.map(value => {
+                const specifier = JSON.stringify(value);
+                return `${href} === new URL(${specifier}, ${base}).href ? import(${specifier}) : `;
+              }).join("");
+              edits.push({type: "replace", pos: node.start, end: node.end, priority: 2,
+                text: `(${builtins}import(new URL(${href}).href))`});
+              return;
+            }
             const specifierMap = new Map();
 
             for (const cand of uniqueBranches) {
@@ -1070,6 +1092,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
           packageRootUrl: options.packageRootUrl,
           retainedModuleUrls: options.retainedModuleUrls,
           prepareStandaloneLoaders: options.prepareStandaloneLoaders,
+          networkedImports: options.networkedImports,
           workerHostBindings: options.workerHostBindings,
           ...(isHtml ? { documentUrl: entryUrl } : {}),
         }),

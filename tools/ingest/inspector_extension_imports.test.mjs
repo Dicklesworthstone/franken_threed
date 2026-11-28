@@ -7,6 +7,7 @@ import test from 'node:test';
 import {analyzeModuleAst} from './ast_analyzer.mjs';
 import {buildModuleGraph} from './module_graph.mjs';
 import {buildApplication} from './build_application.mjs';
+import {packHtml} from './pack_html.mjs';
 
 const upstream = new URL('../../upstream/three.js/', import.meta.url);
 const settingsUrl = new URL('examples/jsm/inspector/tabs/Settings.js', upstream);
@@ -116,4 +117,41 @@ test('unknown runtime extension URLs and errors retain native import semantics a
   const throwing = {...record, active: false, get url() {throw failure;}};
   await assert.rejects(api.load(throwing), error => error === failure);
   await assert.rejects(api.load({...record, active: false, url: 'data:text/javascript,invalid%20module%20syntax'}), SyntaxError);
+});
+
+test('networked HTML embeds both builtin extensions and keeps a live import based at the authored Settings URL', async t => {
+  const f = fixture(), out = path.join(f.root, 'dist');
+  const result = await buildApplication(f.entry, out, {networkedImports: true});
+  const emitted = path.join(out, result.htmlFile);
+  assert.throws(() => packHtml(emitted, path.join(f.root, 'strict.html')), {code: 'DYNAMIC_IMPORT_OPEN'});
+  const packed = path.join(f.root, 'networked.html');
+  const report = packHtml(emitted, packed, {networkedImports: true});
+  assert.equal(report.deployment, 'networked-html');
+  assert.equal(report.liveImportSites, 1);
+  const html = fs.readFileSync(packed, 'utf8');
+  assert.ok(html.includes('"three/webgpu":"./src/three.js"'), 'a live module can still use the authored import map');
+  const map = JSON.parse(/<script type="importmap">([\s\S]*?)<\/script>/.exec(html)[1]);
+  const sources = Object.values(map.imports).map(url => Buffer.from(url.split(',')[1].split('#')[0], 'base64').toString());
+  for (const name of ['ColorGrading', 'TSLGraphEditor']) assert.ok(sources.some(source => source.includes('class ' + name)));
+  assert.ok(sources.every(source => !source.includes(f.root)), 'host build paths do not become runtime URLs');
+
+  const page = path.join(f.root, 'deployment', 'page.html');
+  const plugin = path.join(path.dirname(page), 'src', 'tabs', 'custom', 'plugin.mjs');
+  fs.mkdirSync(path.dirname(plugin), {recursive: true});
+  fs.writeFileSync(plugin, 'export class Plugin {init() {this.url = import.meta.url;}}');
+  const previous = globalThis.document;
+  t.after(() => {if (previous === undefined) delete globalThis.document; else globalThis.document = previous;});
+  globalThis.document = {URL: pathToFileURL(page).href};
+  fs.renameSync(path.join(f.root, 'src'), path.join(f.root, 'unavailable'));
+  const api = await import(pathToFileURL(path.join(out, result.entryFiles[0])).href);
+  globalThis.document.URL = pathToFileURL(path.join(f.root, 'moved', 'after-pushstate.html')).href;
+  const standard = api.records['Color Grading'];
+  standard.url = '../extensions/unused/../color-grading/ColorGrading.js';
+  await api.load(standard);
+  assert.equal(standard.tab.sameState, true);
+  let reads = 0;
+  const live = {...standard, active: false, get url() {reads++; return './custom/plugin.mjs?v=1#two';}};
+  await api.load(live);
+  assert.equal(reads, 1);
+  assert.equal(live.tab.url, pathToFileURL(plugin).href + '?v=1#two');
 });

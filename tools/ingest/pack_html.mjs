@@ -264,6 +264,7 @@ export function packHtml(
   {
     rootDir = path.dirname(path.resolve(entryPath)),
     documentRoot = null,
+    networkedImports = false,
     maxBytes = 64 * 1024 * 1024,
     maxFiles = 4096,
   } = {},
@@ -299,6 +300,7 @@ export function packHtml(
   const documentFactories = new Map(), documentNames = new Set(),
     documentBindings = new Set(), documentWorkerUses = new Set();
   let inputBytes = 0, workerBytes = 0, documentFetchUsed = false, documentFetchMutated = false;
+  let liveImportSites = 0;
   let documentRequestUsed = false, documentRequestMutated = false;
   function chargeWorker(encoded) {
     const size = Buffer.byteLength(encoded);
@@ -984,6 +986,20 @@ export function packHtml(
         importSource(node.source, importKind(node));
       },
       ImportExpression(node) {
+        // On the explicitly networked route the absolute URL returned by the
+        // native URL constructor can still be imported from a Blob/data module.
+        // A bare or relative open string would lose its original referrer.
+        const ref = node.source;
+        if (networkedImports && !worker && ref.type === "MemberExpression" &&
+            !ref.computed && ref.property.name === "href" && ref.object.type === "NewExpression" &&
+            ref.object.callee.type === "Identifier" && ref.object.callee.name === "URL" &&
+            !boundAt(ref.object, "URL") && !ref.object.arguments.some(arg => arg.type === "SpreadElement") &&
+            ref.object.arguments.length >= 1 && ref.object.arguments.length <= 2 &&
+            !ref.object.arguments.some(arg => arg.type === "MemberExpression" && arg.object.type === "MetaProperty")) {
+          uses("URL");
+          liveImportSites++;
+          return;
+        }
         importSource(node.source, importKind(node));
       },
       NewExpression(node) {
@@ -1200,7 +1216,10 @@ export function packHtml(
       .map((part) => `${part[1]}-${createHash(part[1]).update(output).digest("base64")}`)
       .join(" ");
   }
-  const replacements = [...mapRanges], blobTags = [];
+  // Live plugins can themselves import bare names through the document's
+  // original maps and scopes. Install the packed map first and retain those
+  // original maps in parser order on the networked profile.
+  const replacements = networkedImports ? [] : [...mapRanges], blobTags = [];
   let firstScript = html.length,
     inlineId = 0;
   for (const tag of tags) {
@@ -1380,7 +1399,9 @@ export function packHtml(
     ...(workers.size
       ? { workerCount: workers.size, workerScriptCount: workerModules.size + workerClassics.size }
       : {}),
-    staticResourceClosure: "modules-markup-css-static-module-assets-and-finite-document-fetches",
+    staticResourceClosure: networkedImports ? "embedded-static-resources-with-live-module-imports" :
+      "modules-markup-css-static-module-assets-and-finite-document-fetches",
+    ...(networkedImports ? {deployment: "networked-html", liveImportSites} : {}),
     runtimeNetworking: "unchanged-not-analyzed",
   };
 }

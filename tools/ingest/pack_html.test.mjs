@@ -25,6 +25,22 @@ const dataText = (url) => Buffer.from(url.split(",")[1].split("#")[0], "base64")
 const mapOf = (html) =>
   JSON.parse(/<script type="importmap">([\s\S]*?)<\/script>/.exec(html)[1]).imports;
 
+test("networked exports keep native absolute imports, their options and the original document maps", () => {
+  const sourceMap = '<script type="importmap">{"imports":{"shared":"./shared.mjs"},"scopes":{"./plugins/":{"shared":"./plugin-shared.mjs"}}}</script>';
+  const source = "export async function load(spec, options) {return import(new URL(spec, document.baseURI).href, options);}";
+  const files = {"index.html": sourceMap + '<script type="module" src="./entry.mjs"></script>', "entry.mjs": source};
+  const packed = build(files, {networkedImports: true});
+  assert.equal(packed.result.liveImportSites, 1);
+  assert.ok(packed.html.includes(sourceMap));
+  assert.ok(Object.values(mapOf(packed.html)).map(dataText).includes(source));
+  assert.throws(() => build(files));
+  for (const code of ["export const load = name => import(name);",
+    "export const load = (URL, name) => import(new URL(name).href);",
+    "export const load = name => import(new URL(name, import.meta.url).href);"]) {
+    assert.throws(() => build({...files, "entry.mjs": code}, {networkedImports: true}));
+  }
+});
+
 test("packs circular native ESM, live bindings, finite lazy imports and shared roots", () => {
   const f = build({
     "index.html":
@@ -364,8 +380,8 @@ for (const [label, files, code] of [
     { "app.mjs": `import 'https://example.com/module.mjs';` },
     "EXTERNAL_RESOURCE",
   ],
-  ["worker realm", { "app.mjs": `new Worker('./worker.mjs');` }, "HOST_RESOURCE"],
-  ["runtime fetch", { "app.mjs": `fetch('./bytes.bin');` }, "FETCH_URL"],
+  ["shared worker realm", { "app.mjs": `new SharedWorker('./worker.mjs');` }, "HOST_RESOURCE"],
+  ["live POST request", { "app.mjs": `fetch('./bytes.bin', {method:'POST'});` }, "FETCH_URL"],
   [
     "external base URL",
     {
